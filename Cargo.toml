@@ -1,0 +1,16 @@
+[package]
+name = "redscript-ide"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lspower = "1.1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "1"
+log = "0.4"
+redscript = { path = "../redscript/core", features = ["arc"] }
+redscript-compiler = { path = "../redscript/compiler" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dashmap = "4.0"
+ropey = "1.3"
