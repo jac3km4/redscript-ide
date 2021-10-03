@@ -49,15 +49,15 @@ impl Buffer {
     }
 
     pub fn get_pos(&self, line: u32, col: u32) -> Option<Pos> {
-        let line_start = self.contents.line_to_byte(line as usize);
+        let line_start = self.contents.line_to_char(line as usize);
         let byte_index = self.contents.char_to_byte(line_start + col as usize);
         Some(Pos::new(byte_index))
     }
 
     pub fn get_loc(&self, pos: Pos) -> Option<(u32, u32)> {
         let line = self.contents.byte_to_line(pos.into());
-        let col = self.contents.byte_to_char(pos.into()) - line;
-        Some((line as u32, col as u32 - 1))
+        let col = self.contents.byte_to_char(pos.into()) - self.contents.line_to_char(line);
+        Some((line as u32, col as u32))
     }
 
     pub fn contents(&self) -> &Rope {

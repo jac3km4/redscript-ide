@@ -38,17 +38,17 @@ async fn main() {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(from = "(Option<PathBuf>, PathBuf)")]
+#[serde(from = "(Option<PathBuf>, Option<PathBuf>)")]
 struct Config {
     script_cache_path: Option<PathBuf>,
-    game_dir: PathBuf,
+    game_dir: Option<PathBuf>,
 }
 
-impl From<(Option<PathBuf>, PathBuf)> for Config {
-    fn from((script_cache_path, game_dir): (Option<PathBuf>, PathBuf)) -> Self {
+impl From<(Option<PathBuf>, Option<PathBuf>)> for Config {
+    fn from((script_cache_path, game_dir): (Option<PathBuf>, Option<PathBuf>)) -> Self {
         Self {
             script_cache_path: script_cache_path.filter(|p| p.components().count() > 0),
-            game_dir,
+            game_dir: game_dir.filter(|p| p.components().count() > 0),
         }
     }
 }
@@ -80,9 +80,11 @@ impl Backend {
 
     async fn post_initialize(&self) -> Result<(), Error> {
         let conf = self.get_configuration().await?;
-        let path = conf
-            .script_cache_path
-            .unwrap_or_else(|| conf.game_dir.join("r6").join("cache").join("final.redscripts.bk"));
+        let path = conf.script_cache_path.map(Ok).unwrap_or_else(|| {
+            conf.game_dir
+                .map(|dir| dir.join("r6").join("cache").join("final.redscripts.bk"))
+                .ok_or_else(|| Error::ServerError("Missing configuration".to_string()))
+        })?;
 
         let bundle = ScriptBundle::load(&mut File::open(path)?)?;
         self.pool.set(bundle.pool).unwrap();
@@ -134,24 +136,30 @@ impl Backend {
         on_expr: impl for<'a> Fn(&'a Expr<TypedAst>, TypeId, &ConstantPool) -> Result<A, Error>,
     ) -> Result<Option<A>, Error> {
         let buf = self.buffers.get(&pos.text_document.uri).unwrap();
-        let mut needle = buf.get_pos(pos.position.line, pos.position.character).unwrap();
         let guard = self.state.read().await;
         let mut pool = guard.as_ref().unwrap().compiled_pool.clone();
         let mut copy = buf.contents().clone();
+        let mut needle = buf.get_pos(pos.position.line, pos.position.character).unwrap();
 
         // very dumb heuristic to fix common parse errors
-        // this removes the dot character inserts a semicolon at the end of the line if it's missing
+        // this removes the dot character and inserts a semicolon at the end of the line if it's missing
         if fix_parse_error {
-            let idx: usize = needle.into();
-            let mut insert_colon = None;
+            let idx: usize = (needle - 1).into();
 
             if copy.byte(idx) == b'.' {
+                needle = needle - 1;
+
                 for c in (0..idx).map(|i| copy.byte(i)).rev() {
                     needle = needle - 1;
-                    if ![b' ', b'\n', b'\r'].contains(&c) {
+                    if ![b' ', b'\n', b'\r', b'\t'].contains(&c) {
                         break;
                     }
                 }
+
+                let char_idx = copy.byte_to_char(idx);
+                copy.remove(char_idx..char_idx + 1);
+
+                let mut insert_colon = None;
 
                 for (i, c) in copy.bytes_at(idx).enumerate() {
                     if c == b';' {
@@ -167,25 +175,24 @@ impl Backend {
                     let char_idx = copy.byte_to_char(colon_idx);
                     copy.remove(char_idx..char_idx + 1);
                     copy.insert(char_idx, ";\n");
-                }
-                let char_idx = copy.byte_to_char(idx);
-                copy.remove(char_idx..char_idx + 1);
+                };
             }
         }
 
         // TODO: avoid copying the string
         match parser::parse_str(&copy.to_string()) {
             Ok(module) => {
-                let (functions, _, scope) =
-                    CompilationUnit::new(&mut pool)?.typecheck_parsed(vec![module], false, true)?;
+                let (functions, _) = CompilationUnit::new(&mut pool)?.typecheck_parsed(vec![module], false, true)?;
                 // TODO: should use binary search
-                if let Some(expr) = functions
+                if let Some((expr, scope)) = functions
                     .iter()
                     .find(|fun| fun.span.contains(needle))
-                    .and_then(|fun| util::find_in_seq(&fun.code.exprs, needle))
+                    .and_then(|fun| util::find_in_seq(&fun.code.exprs, needle).map(|e| (e, &fun.scope)))
                 {
                     let typ = type_of(expr, &scope, &pool)?;
                     return Ok(Some(on_expr(expr, typ, &pool)?));
+                } else {
+                    self.client.log_message(lsp::MessageType::Info, "Node not found").await;
                 }
             }
             Err(err) => {
@@ -223,6 +230,7 @@ impl Backend {
         Ok(matched.flatten())
     }
 
+    // TODO: use this instead of calculating everything in completion
     async fn completion_resolve(&self, item: lsp::CompletionItem) -> Result<lsp::CompletionItem, Error> {
         if let Some(idx_val) = item.data.as_ref().and_then(|x| x.as_u64()) {
             let guard = self.state.read().await;
@@ -364,10 +372,22 @@ impl Backend {
             let name = pool.definition_name(*idx)?;
             let pretty_name = name.split(";").next().unwrap_or(&name);
 
+            let mut snippet = String::new();
+            for (i, param_idx) in fun.parameters.iter().enumerate() {
+                let name = pool.definition_name(*param_idx)?;
+                if i != 0 {
+                    snippet.push_str(", ");
+                }
+                snippet.push_str(&format!("${{{}:{}}}", i + 1, name));
+            }
+            let detail = util::render_function(*idx, pool)?;
+
             let item = lsp::CompletionItem {
                 label: format!("{}(⠤)", pretty_name),
                 kind: Some(lsp::CompletionItemKind::Method),
-                data: Some(serde_json::to_value::<u32>(idx.clone().into())?),
+                insert_text: Some(format!("{}({})", pretty_name, snippet)),
+                insert_text_format: Some(lsp::InsertTextFormat::Snippet),
+                detail: Some(detail),
                 ..lsp::CompletionItem::default()
             };
             completions.push(item);
@@ -426,7 +446,15 @@ impl LanguageServer for Backend {
 
     async fn initialized(&self, _: lsp::InitializedParams) {
         match self.post_initialize().await {
-            Err(err) => self.client.log_message(lsp::MessageType::Error, err.to_string()).await,
+            Err(err) => {
+                let msg = lsp::ShowMessageParams {
+                    typ: lsp::MessageType::Error,
+                    message: err.to_string(),
+                };
+                self.client
+                    .send_custom_notification::<lsp::notification::ShowMessage>(msg)
+                    .await
+            }
             Ok(()) => {
                 self.client
                     .log_message(lsp::MessageType::Info, "Server initialized!")
