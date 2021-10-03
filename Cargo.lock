@@ -564,6 +564,7 @@ dependencies = [
 [[package]]
 name = "redscript"
 version = "0.3.4-dev"
+source = "git+https://github.com/jac3km4/redscript?branch=ide-features#834c591d1e806f12f8859c99512110e3891ab081"
 dependencies = [
  "byteorder",
  "crc32fast",
@@ -575,6 +576,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler"
 version = "0.3.4-dev"
+source = "git+https://github.com/jac3km4/redscript?branch=ide-features#834c591d1e806f12f8859c99512110e3891ab081"
 dependencies = [
  "hamt-sync",
  "log",
