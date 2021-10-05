@@ -508,9 +508,9 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d0b9745dc2debf507c8422de05d7226cc1f0644216dfdfead988f9b1ab32a7"
+checksum = "38bc8cc6a5f2e3655e0899c1b848643b2562f853f114bfec7be120678e3ace05"
 dependencies = [
  "proc-macro2",
 ]
@@ -564,7 +564,7 @@ dependencies = [
 [[package]]
 name = "redscript"
 version = "0.3.4-dev"
-source = "git+https://github.com/jac3km4/redscript?branch=ide-features#297654d8d874e3e927519165c5c2b423cf5c427b"
+source = "git+https://github.com/jac3km4/redscript?branch=ide-features#1519f52c9b32c059134164e644aa21f7ce29a3ce"
 dependencies = [
  "byteorder",
  "crc32fast",
@@ -576,7 +576,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler"
 version = "0.3.4-dev"
-source = "git+https://github.com/jac3km4/redscript?branch=ide-features#297654d8d874e3e927519165c5c2b423cf5c427b"
+source = "git+https://github.com/jac3km4/redscript?branch=ide-features#1519f52c9b32c059134164e644aa21f7ce29a3ce"
 dependencies = [
  "hamt-sync",
  "log",
