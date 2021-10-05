@@ -249,7 +249,7 @@ impl Backend {
                 }
                 snippet.push_str(&format!("${{{}:{}}}", i + 1, name));
             }
-            let detail = util::render_function(idx, pool)?;
+            let detail = util::render_function(idx, true, pool)?;
 
             let item = lsp::CompletionItem {
                 label: format!("{}(⠤)", pretty_name),
@@ -273,8 +273,8 @@ impl Backend {
         let matched = self
             .expr_at_location(params.text_document_position_params, true, |expr, typ, pool| {
                 let text = match expr {
-                    Expr::Call(Callable::Function(idx), _, _) => util::render_function(*idx, pool)?,
-                    Expr::MethodCall(_, idx, _, _) => util::render_function(*idx, pool)?,
+                    Expr::Call(Callable::Function(idx), _, _) => util::render_function(*idx, false, pool)?,
+                    Expr::MethodCall(_, idx, _, _) => util::render_function(*idx, false, pool)?,
                     _ => typ.pretty(pool)?.to_owned().deref().to_owned(),
                 };
                 let contents = lsp::HoverContents::Scalar(lsp::MarkedString::LanguageString(lsp::LanguageString {
@@ -380,7 +380,7 @@ impl Backend {
                 }
                 snippet.push_str(&format!("${{{}:{}}}", i + 1, name));
             }
-            let detail = util::render_function(*idx, pool)?;
+            let detail = util::render_function(*idx, true, pool)?;
 
             let item = lsp::CompletionItem {
                 label: format!("{}(⠤)", pretty_name),

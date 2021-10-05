@@ -59,9 +59,13 @@ pub fn find_in_expr<'a>(haystack: &'a Expr<TypedAst>, needle: Pos) -> Option<&'a
     }
 }
 
-pub fn render_function(idx: PoolIndex<Function>, pool: &ConstantPool) -> Result<String, Error> {
+pub fn render_function(idx: PoolIndex<Function>, short: bool, pool: &ConstantPool) -> Result<String, Error> {
     let name = pool.definition_name(idx)?;
-    let pretty_name = name.split(";").next().unwrap_or(&name);
+    let pretty_name = if short {
+        ""
+    } else {
+        name.split(";").next().unwrap_or(&name)
+    };
     let fun = pool.function(idx)?;
 
     let mut args = String::new();
