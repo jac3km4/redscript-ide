@@ -113,10 +113,10 @@ impl Backend {
         let path = self.workspace_path.get().unwrap();
         let files = Files::from_dir(path, SourceFilter::None)?;
 
-        match CompilationUnit::new(&mut compiled_pool)?.typecheck(&files, true, false) {
-            Ok((_, diagnostics)) => {
+        match CompilationUnit::new(&mut compiled_pool)?.compile_files(&files) {
+            Ok(diagnostics) => {
                 let state = ServerState { compiled_pool };
-                *self.state.write().await = Some(ServerState { ..state });
+                *self.state.write().await = Some(state);
 
                 self.publish_diagnostics(diagnostics, &files).await;
             }
@@ -182,7 +182,7 @@ impl Backend {
         // TODO: avoid copying the string
         match parser::parse_str(&copy.to_string()) {
             Ok(module) => {
-                let (functions, _) = CompilationUnit::new(&mut pool)?.typecheck_parsed(vec![module], false, true)?;
+                let (functions, _) = CompilationUnit::new(&mut pool)?.typecheck(vec![module], false, true)?;
                 // TODO: should use binary search
                 if let Some((expr, scope)) = functions
                     .iter()
