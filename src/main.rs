@@ -113,8 +113,8 @@ impl Backend {
         let path = self.workspace_path.get().unwrap();
         let files = Files::from_dir(path, SourceFilter::None)?;
 
-        match CompilationUnit::new(&mut compiled_pool)?.compile_files(&files) {
-            Ok(diagnostics) => {
+        match CompilationUnit::new(&mut compiled_pool)?.typecheck_files(&files, false, false) {
+            Ok((_, diagnostics)) => {
                 let state = ServerState { compiled_pool };
                 *self.state.write().await = Some(state);
 
