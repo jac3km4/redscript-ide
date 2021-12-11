@@ -2,8 +2,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("redscript error: {0}")]
-    ScriptError(#[from] redscript::error::Error),
+    #[error("compiler error: {0}")]
+    CompilerError(#[from] redscript_compiler::error::Error),
+    #[error("pool error: {0}")]
+    PoolError(#[from] redscript::bundle::PoolError),
     #[error("JsonRPC error: {0}")]
     JsonRpcError(#[from] lspower::jsonrpc::Error),
     #[error("JSON error: {0}")]

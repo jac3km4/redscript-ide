@@ -63,9 +63,9 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
 name = "crc32fast"
-version = "1.2.1"
+version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81156fece84ab6a9f2afdb109ce3ae577e42b1228441eded99bd77f627953b1a"
+checksum = "738c290dfaea84fc1ca15ad9c168d083b05a714e1efddd8edaab678dc28d2836"
 dependencies = [
  "cfg-if",
 ]
@@ -79,6 +79,12 @@ dependencies = [
  "cfg-if",
  "num_cpus",
 ]
+
+[[package]]
+name = "either"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e78d4f1cc4ae33bbfc157ed5d5a5ef3bc29227303d595861deb238fcec4e9457"
 
 [[package]]
 name = "enum-as-inner"
@@ -241,6 +247,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a5bbe824c507c5da5956355e86a746d82e0e1464f65d862cc5e71da70e94b2c"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "itertools"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9a9d19fa1e79b6215ff29b9d6880b706147f16e9b1dbb1e4e5947b5b02bc5e3"
+dependencies = [
+ "either",
 ]
 
 [[package]]
@@ -575,12 +590,13 @@ dependencies = [
 
 [[package]]
 name = "redscript"
-version = "0.4.0-RC1"
-source = "git+https://github.com/jac3km4/redscript?rev=0e6f3f6#0e6f3f6cb583d09410a1b13770ea03176200be7e"
+version = "0.4.0-RC2"
+source = "git+https://github.com/jac3km4/redscript?rev=v0.4.0-RC2#47bf58117d454cfae9464ccf7da5f599f160ab60"
 dependencies = [
  "byteorder",
  "crc32fast",
  "enum-as-inner",
+ "itertools",
  "modular-bitfield",
  "strum",
  "thiserror",
@@ -588,16 +604,18 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler"
-version = "0.4.0-RC1"
-source = "git+https://github.com/jac3km4/redscript?rev=0e6f3f6#0e6f3f6cb583d09410a1b13770ea03176200be7e"
+version = "0.4.0-RC2"
+source = "git+https://github.com/jac3km4/redscript?rev=v0.4.0-RC2#47bf58117d454cfae9464ccf7da5f599f160ab60"
 dependencies = [
  "enum-as-inner",
  "hamt-sync",
+ "itertools",
  "log",
  "peg",
  "redscript",
  "sequence_trie",
  "strum",
+ "thiserror",
  "walkdir",
 ]
 
@@ -625,6 +643,12 @@ checksum = "9150aff6deb25b20ed110889f070a678bcd1033e46e5e9d6fb1abeab17947f28"
 dependencies = [
  "smallvec",
 ]
+
+[[package]]
+name = "rustversion"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2cc38e8fa666e2de3c4aba7edeb5ffc5246c1c2ed0e3d17e560aeeba736b23f"
 
 [[package]]
 name = "ryu"
@@ -724,22 +748,23 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strum"
-version = "0.22.0"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7ac893c7d471c8a21f31cfe213ec4f6d9afeed25537c772e08ef3f005f8729e"
+checksum = "cae14b91c7d11c9a851d3fbc80a963198998c2a64eec840477fa92d8ce9b70bb"
 dependencies = [
  "strum_macros",
 ]
 
 [[package]]
 name = "strum_macros"
-version = "0.22.0"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "339f799d8b549e3744c7ac7feb216383e4005d94bdb22561b3ab8f3b808ae9fb"
+checksum = "5bb0dc7ee9c15cea6199cde9a127fa16a4c5819af85395457ad72d68edc85a38"
 dependencies = [
  "heck",
  "proc-macro2",
  "quote",
+ "rustversion",
  "syn",
 ]
 

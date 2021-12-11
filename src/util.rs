@@ -17,7 +17,7 @@ pub fn find_in_expr<'a>(haystack: &'a Expr<TypedAst>, needle: Pos) -> Option<&'a
             Expr::Declare(_, _, Some(expr), _) => find_in_expr(expr, needle),
             Expr::Cast(_, expr, _) => find_in_expr(expr, needle),
             Expr::Assign(_, expr, _) => find_in_expr(expr, needle),
-            Expr::Call(_, args, _) => find_in_seq(args, needle),
+            Expr::Call(_, _, args, _) => find_in_seq(args, needle),
             Expr::MethodCall(expr, _, args, _) => find_in_expr(expr, needle).or_else(|| find_in_seq(args, needle)),
             Expr::Member(expr, _, _) => find_in_expr(expr, needle),
             Expr::ArrayElem(expr, index, _) => find_in_expr(expr, needle).or_else(|| find_in_expr(index, needle)),
@@ -60,7 +60,7 @@ pub fn find_in_expr<'a>(haystack: &'a Expr<TypedAst>, needle: Pos) -> Option<&'a
 }
 
 pub fn render_function(idx: PoolIndex<Function>, short: bool, pool: &ConstantPool) -> Result<String, Error> {
-    let name = pool.definition_name(idx)?;
+    let name = pool.def_name(idx)?;
     let pretty_name = if short {
         ""
     } else {
@@ -70,9 +70,9 @@ pub fn render_function(idx: PoolIndex<Function>, short: bool, pool: &ConstantPoo
 
     let mut args = String::new();
     for (i, param_idx) in fun.parameters.iter().enumerate() {
-        let name = pool.definition_name(*param_idx)?;
+        let name = pool.def_name(*param_idx)?;
         let param = pool.parameter(*param_idx)?;
-        let type_name = TypeName::from_repr(&pool.definition_name(param.type_)?);
+        let type_name = TypeName::from_repr(&pool.def_name(param.type_)?);
         if i != 0 {
             args.push_str(", ");
         }
@@ -80,7 +80,7 @@ pub fn render_function(idx: PoolIndex<Function>, short: bool, pool: &ConstantPoo
     }
 
     let ret_type = if let Some(ret_idx) = fun.return_type {
-        TypeName::from_repr(&pool.definition_name(ret_idx)?).pretty()
+        TypeName::from_repr(&pool.def_name(ret_idx)?).pretty()
     } else {
         Ident::Static("Void")
     };

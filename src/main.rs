@@ -238,12 +238,12 @@ impl Backend {
             let idx = PoolIndex::new(idx_val as u32);
             let fun = pool.function(idx)?;
 
-            let name = pool.definition_name(idx)?;
+            let name = pool.def_name(idx)?;
             let pretty_name = name.split(";").next().unwrap_or(&name);
 
             let mut snippet = String::new();
             for (i, param_idx) in fun.parameters.iter().enumerate() {
-                let name = pool.definition_name(*param_idx)?;
+                let name = pool.def_name(*param_idx)?;
                 if i != 0 {
                     snippet.push_str(", ");
                 }
@@ -273,7 +273,7 @@ impl Backend {
         let matched = self
             .expr_at_location(params.text_document_position_params, true, |expr, typ, pool| {
                 let text = match expr {
-                    Expr::Call(Callable::Function(idx), _, _) => util::render_function(*idx, false, pool)?,
+                    Expr::Call(Callable::Function(idx), _, _, _) => util::render_function(*idx, false, pool)?,
                     Expr::MethodCall(_, idx, _, _) => util::render_function(*idx, false, pool)?,
                     _ => typ.pretty(pool)?.to_owned().deref().to_owned(),
                 };
@@ -350,10 +350,10 @@ impl Backend {
         if !is_static {
             for idx in &class.fields {
                 let field = pool.field(*idx)?;
-                let type_ = pool.definition_name(field.type_)?;
+                let type_ = pool.def_name(field.type_)?;
                 let type_name = TypeName::from_repr(&type_);
 
-                let name = pool.definition_name(*idx)?;
+                let name = pool.def_name(*idx)?;
                 let item = lsp::CompletionItem {
                     label: name.deref().to_owned(),
                     kind: Some(lsp::CompletionItemKind::Field),
@@ -369,12 +369,12 @@ impl Backend {
             if fun.flags.is_static() != is_static {
                 continue;
             }
-            let name = pool.definition_name(*idx)?;
+            let name = pool.def_name(*idx)?;
             let pretty_name = name.split(";").next().unwrap_or(&name);
 
             let mut snippet = String::new();
             for (i, param_idx) in fun.parameters.iter().enumerate() {
-                let name = pool.definition_name(*param_idx)?;
+                let name = pool.def_name(*param_idx)?;
                 if i != 0 {
                     snippet.push_str(", ");
                 }
@@ -405,7 +405,7 @@ impl Backend {
         let enum_ = pool.enum_(idx)?;
 
         for member in &enum_.members {
-            let name = pool.definition_name(*member)?;
+            let name = pool.def_name(*member)?;
             let item = lsp::CompletionItem {
                 label: name.deref().to_owned(),
                 kind: Some(lsp::CompletionItemKind::Field),
