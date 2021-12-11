@@ -5,12 +5,12 @@ use redscript_compiler::typechecker::TypedAst;
 
 use crate::error::Error;
 
-pub fn find_in_seq<'a>(haystack: &'a [Expr<TypedAst>], needle: Pos) -> Option<&'a Expr<TypedAst>> {
+pub fn find_in_seq(haystack: &[Expr<TypedAst>], needle: Pos) -> Option<&Expr<TypedAst>> {
     // TODO: use binary search
     haystack.iter().find_map(|expr| find_in_expr(expr, needle))
 }
 
-pub fn find_in_expr<'a>(haystack: &'a Expr<TypedAst>, needle: Pos) -> Option<&'a Expr<TypedAst>> {
+pub fn find_in_expr(haystack: &Expr<TypedAst>, needle: Pos) -> Option<&Expr<TypedAst>> {
     if haystack.span().contains(needle) {
         let res = match haystack {
             Expr::ArrayLit(exprs, _, _) => find_in_seq(exprs, needle),
@@ -53,7 +53,7 @@ pub fn find_in_expr<'a>(haystack: &'a Expr<TypedAst>, needle: Pos) -> Option<&'a
             Expr::UnOp(expr, _, _) => find_in_expr(expr, needle),
             _ => Some(haystack),
         };
-        res.or_else(|| Some(haystack))
+        res.or(Some(haystack))
     } else {
         None
     }
@@ -64,7 +64,7 @@ pub fn render_function(idx: PoolIndex<Function>, short: bool, pool: &ConstantPoo
     let pretty_name = if short {
         ""
     } else {
-        name.split(";").next().unwrap_or(&name)
+        name.split(';').next().unwrap_or(&name)
     };
     let fun = pool.function(idx)?;
 

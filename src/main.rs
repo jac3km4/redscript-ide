@@ -70,9 +70,9 @@ impl Backend {
 
     async fn initialize(&self, uri: Option<lsp::Url>) -> Result<(), Error> {
         let path = uri
-            .ok_or_else(|| Error::ServerError("No workspace open".to_owned()))?
+            .ok_or_else(|| Error::Server("No workspace open".to_owned()))?
             .to_file_path()
-            .map_err(|_| Error::ServerError("Invalid workspace path".to_owned()))?;
+            .map_err(|_| Error::Server("Invalid workspace path".to_owned()))?;
 
         self.workspace_path.set(path).unwrap();
         Ok(())
@@ -83,7 +83,7 @@ impl Backend {
         let path = conf.script_cache_path.map(Ok).unwrap_or_else(|| {
             conf.game_dir
                 .map(|dir| dir.join("r6").join("cache").join("final.redscripts.bk"))
-                .ok_or_else(|| Error::ServerError("Missing configuration".to_string()))
+                .ok_or_else(|| Error::Server("Missing configuration".to_string()))
         })?;
 
         let bundle = ScriptBundle::load(&mut File::open(path)?)?;
@@ -189,14 +189,14 @@ impl Backend {
                     .find(|fun| fun.span.contains(needle))
                     .and_then(|fun| util::find_in_seq(&fun.code.exprs, needle).map(|e| (e, &fun.scope)))
                 {
-                    let typ = type_of(expr, &scope, &pool)?;
+                    let typ = type_of(expr, scope, &pool)?;
                     return Ok(Some(on_expr(expr, typ, &pool)?));
                 } else {
-                    self.client.log_message(lsp::MessageType::Info, "Node not found").await;
+                    self.client.log_message(lsp::MessageType::INFO, "Node not found").await;
                 }
             }
             Err(err) => {
-                self.client.log_message(lsp::MessageType::Info, err).await;
+                self.client.log_message(lsp::MessageType::INFO, err).await;
             }
         }
         Ok(None)
@@ -205,21 +205,18 @@ impl Backend {
     async fn completion(&self, params: lsp::CompletionParams) -> Result<Option<lsp::CompletionResponse>, Error> {
         let matched = self
             .expr_at_location(params.text_document_position, true, |expr, typ, pool| {
-                let is_static = match expr {
-                    Expr::Ident(Reference::Symbol(_), _) => true,
-                    _ => false,
-                };
+                let is_static = matches!(expr, Expr::Ident(Reference::Symbol(_), _));
                 match typ.unwrapped() {
                     TypeId::Class(idx) => {
-                        let completions = Self::class_completions(*idx, is_static, &pool)?;
+                        let completions = Self::class_completions(*idx, is_static, pool)?;
                         Ok(Some(lsp::CompletionResponse::Array(completions)))
                     }
                     TypeId::Struct(idx) => {
-                        let completions = Self::class_completions(*idx, is_static, &pool)?;
+                        let completions = Self::class_completions(*idx, is_static, pool)?;
                         Ok(Some(lsp::CompletionResponse::Array(completions)))
                     }
                     TypeId::Enum(idx) if is_static => {
-                        let completions = Self::enum_completions(*idx, &pool)?;
+                        let completions = Self::enum_completions(*idx, pool)?;
                         Ok(Some(lsp::CompletionResponse::Array(completions)))
                     }
                     _ => Ok(None),
@@ -239,7 +236,7 @@ impl Backend {
             let fun = pool.function(idx)?;
 
             let name = pool.def_name(idx)?;
-            let pretty_name = name.split(";").next().unwrap_or(&name);
+            let pretty_name = name.split(';').next().unwrap_or(&name);
 
             let mut snippet = String::new();
             for (i, param_idx) in fun.parameters.iter().enumerate() {
@@ -253,9 +250,9 @@ impl Backend {
 
             let item = lsp::CompletionItem {
                 label: format!("{}(⠤)", pretty_name),
-                kind: Some(lsp::CompletionItemKind::Method),
+                kind: Some(lsp::CompletionItemKind::METHOD),
                 insert_text: Some(format!("{}({})", pretty_name, snippet)),
-                insert_text_format: Some(lsp::InsertTextFormat::Snippet),
+                insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
                 detail: Some(detail),
                 ..lsp::CompletionItem::default()
             };
@@ -304,11 +301,11 @@ impl Backend {
                 Diagnostic::MethodConflict(_, pos) => {
                     let msg = "Conflicting method replacement".to_owned();
                     let loc = files.lookup(pos).unwrap();
-                    (msg, lsp::DiagnosticSeverity::Warning, loc)
+                    (msg, lsp::DiagnosticSeverity::WARNING, loc)
                 }
                 Diagnostic::CompileError(msg, pos) => {
                     let loc = files.lookup(pos).unwrap();
-                    (msg, lsp::DiagnosticSeverity::Error, loc)
+                    (msg, lsp::DiagnosticSeverity::ERROR, loc)
                 }
             };
 
@@ -356,7 +353,7 @@ impl Backend {
                 let name = pool.def_name(*idx)?;
                 let item = lsp::CompletionItem {
                     label: name.deref().to_owned(),
-                    kind: Some(lsp::CompletionItemKind::Field),
+                    kind: Some(lsp::CompletionItemKind::FIELD),
                     detail: Some(type_name.pretty().to_owned().to_string()),
                     ..lsp::CompletionItem::default()
                 };
@@ -370,7 +367,7 @@ impl Backend {
                 continue;
             }
             let name = pool.def_name(*idx)?;
-            let pretty_name = name.split(";").next().unwrap_or(&name);
+            let pretty_name = name.split(';').next().unwrap_or(&name);
 
             let mut snippet = String::new();
             for (i, param_idx) in fun.parameters.iter().enumerate() {
@@ -384,9 +381,9 @@ impl Backend {
 
             let item = lsp::CompletionItem {
                 label: format!("{}(⠤)", pretty_name),
-                kind: Some(lsp::CompletionItemKind::Method),
+                kind: Some(lsp::CompletionItemKind::METHOD),
                 insert_text: Some(format!("{}({})", pretty_name, snippet)),
-                insert_text_format: Some(lsp::InsertTextFormat::Snippet),
+                insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
                 detail: Some(detail),
                 ..lsp::CompletionItem::default()
             };
@@ -408,7 +405,7 @@ impl Backend {
             let name = pool.def_name(*member)?;
             let item = lsp::CompletionItem {
                 label: name.deref().to_owned(),
-                kind: Some(lsp::CompletionItemKind::Field),
+                kind: Some(lsp::CompletionItemKind::FIELD),
                 ..lsp::CompletionItem::default()
             };
             completions.push(item);
@@ -430,7 +427,7 @@ impl LanguageServer for Backend {
 
         let capabilities = lsp::ServerCapabilities {
             text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
-                lsp::TextDocumentSyncKind::Incremental,
+                lsp::TextDocumentSyncKind::INCREMENTAL,
             )),
             completion_provider: Some(completion),
             hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
@@ -448,7 +445,7 @@ impl LanguageServer for Backend {
         match self.post_initialize().await {
             Err(err) => {
                 let msg = lsp::ShowMessageParams {
-                    typ: lsp::MessageType::Error,
+                    typ: lsp::MessageType::ERROR,
                     message: err.to_string(),
                 };
                 self.client
@@ -457,7 +454,7 @@ impl LanguageServer for Backend {
             }
             Ok(()) => {
                 self.client
-                    .log_message(lsp::MessageType::Info, "Server initialized!")
+                    .log_message(lsp::MessageType::INFO, "Server initialized!")
                     .await
             }
         }
@@ -480,7 +477,7 @@ impl LanguageServer for Backend {
 
     async fn did_save(&self, _params: lsp::DidSaveTextDocumentParams) {
         if let Err(err) = self.typecheck_workspace().await {
-            self.client.log_message(lsp::MessageType::Error, err.to_string()).await;
+            self.client.log_message(lsp::MessageType::ERROR, err.to_string()).await;
         }
     }
 
