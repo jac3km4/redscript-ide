@@ -275,7 +275,7 @@ impl Backend {
                     _ => typ.pretty(pool)?.to_owned().deref().to_owned(),
                 };
                 let contents = lsp::HoverContents::Scalar(lsp::MarkedString::LanguageString(lsp::LanguageString {
-                    language: "swift".to_owned(),
+                    language: "redscript".to_owned(),
                     value: text,
                 }));
                 let span = expr.span();
