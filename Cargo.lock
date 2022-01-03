@@ -75,6 +75,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b799062aaf67eb976af3bdca031ee6f846d2f0a5710ddbb0d2efee33f3cc4760"
+dependencies = [
+ "cfg-if",
+ "num_cpus",
+ "parking_lot",
+]
+
+[[package]]
 name = "either"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -300,7 +311,7 @@ dependencies = [
  "async-trait",
  "auto_impl",
  "bytes",
- "dashmap",
+ "dashmap 4.0.2",
  "futures",
  "httparse",
  "log",
@@ -600,7 +611,7 @@ dependencies = [
 name = "redscript-ide"
 version = "0.1.0"
 dependencies = [
- "dashmap",
+ "dashmap 5.0.0",
  "log",
  "lspower",
  "redscript",
