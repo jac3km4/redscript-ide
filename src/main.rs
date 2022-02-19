@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use buffers::Buffers;
 use error::Error;
+use lspower::lsp::MessageType;
 use lspower::{jsonrpc, lsp, Client, LanguageServer, LspService, Server};
 use redscript::ast::{Expr, TypeName};
 use redscript::bundle::{ConstantPool, PoolIndex, ScriptBundle};
@@ -108,24 +109,27 @@ impl Backend {
     }
 
     async fn typecheck_workspace(&self) -> Result<(), Error> {
-        let mut compiled_pool = self.pool.get().unwrap().clone();
+        if let Some(mut compiled_pool) = self.pool.get().cloned() {
+            let path = self.workspace_path.get().unwrap();
+            let files = Files::from_dir(path, SourceFilter::None)?;
 
-        let path = self.workspace_path.get().unwrap();
-        let files = Files::from_dir(path, SourceFilter::None)?;
+            match CompilationUnit::new(&mut compiled_pool)?.typecheck_files(&files, false, false) {
+                Ok((_, diagnostics)) => {
+                    let state = ServerState { compiled_pool };
+                    *self.state.write().await = Some(state);
 
-        match CompilationUnit::new(&mut compiled_pool)?.typecheck_files(&files, false, false) {
-            Ok((_, diagnostics)) => {
-                let state = ServerState { compiled_pool };
-                *self.state.write().await = Some(state);
-
-                self.publish_diagnostics(diagnostics, &files).await;
+                    self.publish_diagnostics(diagnostics, &files).await;
+                }
+                Err(err) => {
+                    let diagnostic = Diagnostic::from_error(err)?;
+                    self.publish_diagnostics(vec![diagnostic], &files).await;
+                }
             }
-            Err(err) => {
-                let diagnostic = Diagnostic::from_error(err)?;
-                self.publish_diagnostics(vec![diagnostic], &files).await;
-            }
+        } else {
+            self.client
+                .log_message(MessageType::WARNING, "Project not initialized")
+                .await;
         }
-
         Ok(())
     }
 
@@ -135,11 +139,15 @@ impl Backend {
         fix_parse_error: bool,
         on_expr: impl for<'a> Fn(&'a Expr<TypedAst>, TypeId, &ConstantPool) -> Result<A, Error>,
     ) -> Result<Option<A>, Error> {
-        let buf = self.buffers.get(&pos.text_document.uri).unwrap();
-        let guard = self.state.read().await;
-        let mut pool = guard.as_ref().unwrap().compiled_pool.clone();
+        let buf = self
+            .buffers
+            .get(&pos.text_document.uri)
+            .expect("No buffer found for URI");
+        let mut pool = self.get_cloned_pool().await?;
         let mut copy = buf.contents().clone();
-        let mut needle = buf.get_pos(pos.position.line, pos.position.character).unwrap();
+        let mut needle = buf
+            .get_pos(pos.position.line, pos.position.character)
+            .expect("Position outside of the buffer");
 
         // very dumb heuristic to fix common parse errors
         // this removes the dot character and inserts a semicolon at the end of the line if it's missing
@@ -230,8 +238,7 @@ impl Backend {
     // TODO: use this instead of calculating everything in completion
     async fn completion_resolve(&self, item: lsp::CompletionItem) -> Result<lsp::CompletionItem, Error> {
         if let Some(idx_val) = item.data.as_ref().and_then(|x| x.as_u64()) {
-            let guard = self.state.read().await;
-            let pool = &guard.as_ref().unwrap().compiled_pool;
+            let pool = self.get_cloned_pool().await?;
             let idx = PoolIndex::new(idx_val as u32);
             let fun = pool.function(idx)?;
 
@@ -246,7 +253,7 @@ impl Backend {
                 }
                 snippet.push_str(&format!("${{{}:{}}}", i + 1, name));
             }
-            let detail = util::render_function(idx, true, pool)?;
+            let detail = util::render_function(idx, true, &pool)?;
 
             let item = lsp::CompletionItem {
                 label: format!("{}(⠤)", pretty_name),
@@ -266,7 +273,7 @@ impl Backend {
         let buf = self
             .buffers
             .get(&params.text_document_position_params.text_document.uri)
-            .unwrap();
+            .expect("No buffer found for URI");
         let matched = self
             .expr_at_location(params.text_document_position_params, true, |expr, typ, pool| {
                 let text = match expr {
@@ -412,6 +419,24 @@ impl Backend {
         }
         Ok(completions)
     }
+
+    async fn get_cloned_pool(&self) -> Result<ConstantPool, Error> {
+        let guard = self.state.read().await;
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| Error::Server("Server not initialized".to_owned()))?;
+        Ok(state.compiled_pool.clone())
+    }
+
+    async fn notify_error(&self, message: String) {
+        let msg = lsp::ShowMessageParams {
+            typ: lsp::MessageType::ERROR,
+            message,
+        };
+        self.client
+            .send_custom_notification::<lsp::notification::ShowMessage>(msg)
+            .await
+    }
 }
 
 #[lspower::async_trait]
@@ -443,15 +468,7 @@ impl LanguageServer for Backend {
 
     async fn initialized(&self, _: lsp::InitializedParams) {
         match self.post_initialize().await {
-            Err(err) => {
-                let msg = lsp::ShowMessageParams {
-                    typ: lsp::MessageType::ERROR,
-                    message: err.to_string(),
-                };
-                self.client
-                    .send_custom_notification::<lsp::notification::ShowMessage>(msg)
-                    .await
-            }
+            Err(err) => self.notify_error(err.to_string()).await,
             Ok(()) => {
                 self.client
                     .log_message(lsp::MessageType::INFO, "Server initialized!")
