@@ -310,6 +310,10 @@ impl Backend {
                     let loc = files.lookup(pos).unwrap();
                     (msg, lsp::DiagnosticSeverity::WARNING, loc)
                 }
+                Diagnostic::Deprecation(msg, pos) => {
+                    let loc = files.lookup(pos).unwrap();
+                    (msg, lsp::DiagnosticSeverity::WARNING, loc)
+                }
                 Diagnostic::CompileError(msg, pos) => {
                     let loc = files.lookup(pos).unwrap();
                     (msg, lsp::DiagnosticSeverity::ERROR, loc)
