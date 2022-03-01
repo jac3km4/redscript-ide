@@ -17,9 +17,9 @@ ropey = "1.3"
 git = "https://github.com/jac3km4/redscript"
 package = "redscript"
 features = ["arc"]
-rev = "v0.5.1"
+rev = "8151972"
 
 [dependencies.redscript-compiler]
 git = "https://github.com/jac3km4/redscript"
 package = "redscript-compiler"
-rev = "v0.5.1"
+rev = "8151972"
