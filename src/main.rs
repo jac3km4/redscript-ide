@@ -113,7 +113,7 @@ impl Backend {
             let path = self.workspace_path.get().unwrap();
             let files = Files::from_dir(path, SourceFilter::None)?;
 
-            match CompilationUnit::new(&mut compiled_pool)?.typecheck_files(&files, false, false) {
+            match CompilationUnit::new_with_defaults(&mut compiled_pool)?.typecheck_files(&files, false, false) {
                 Ok((_, diagnostics)) => {
                     let state = ServerState { compiled_pool };
                     *self.state.write().await = Some(state);
@@ -190,7 +190,8 @@ impl Backend {
         // TODO: avoid copying the string
         match parser::parse_str(&copy.to_string()) {
             Ok(module) => {
-                let (functions, _) = CompilationUnit::new(&mut pool)?.typecheck(vec![module], false, true)?;
+                let (functions, _) =
+                    CompilationUnit::new_with_defaults(&mut pool)?.typecheck(vec![module], false, true)?;
                 // TODO: should use binary search
                 if let Some((expr, scope)) = functions
                     .iter()
@@ -305,12 +306,22 @@ impl Backend {
 
         for diagnostic in diagnostics {
             let (msg, severity, loc) = match diagnostic {
+                Diagnostic::Deprecation(msg, pos) => {
+                    let loc = files.lookup(pos).unwrap();
+                    (msg, lsp::DiagnosticSeverity::WARNING, loc)
+                }
                 Diagnostic::MethodConflict(_, pos) => {
                     let msg = "Conflicting method replacement".to_owned();
                     let loc = files.lookup(pos).unwrap();
                     (msg, lsp::DiagnosticSeverity::WARNING, loc)
                 }
-                Diagnostic::Deprecation(msg, pos) => {
+                Diagnostic::UnusedLocal(pos) => {
+                    let msg = "Unused variable".to_owned();
+                    let loc = files.lookup(pos).unwrap();
+                    (msg, lsp::DiagnosticSeverity::WARNING, loc)
+                }
+                Diagnostic::MissingReturn(pos) => {
+                    let msg = "Function might not return a value".to_owned();
                     let loc = files.lookup(pos).unwrap();
                     (msg, lsp::DiagnosticSeverity::WARNING, loc)
                 }
