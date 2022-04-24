@@ -11,11 +11,12 @@ use lspower::{jsonrpc, lsp, Client, LanguageServer, LspService, Server};
 use redscript::ast::{Expr, TypeName};
 use redscript::bundle::{ConstantPool, PoolIndex, ScriptBundle};
 use redscript::definition::{Class, Enum};
+use redscript_compiler::diagnostics::Diagnostic;
 use redscript_compiler::parser;
 use redscript_compiler::scope::{Reference, TypeId};
 use redscript_compiler::source_map::{Files, SourceFilter};
 use redscript_compiler::typechecker::{type_of, Callable, TypedAst};
-use redscript_compiler::unit::{CompilationUnit, Diagnostic};
+use redscript_compiler::unit::CompilationUnit;
 use serde::Deserialize;
 use tokio::sync::{OnceCell, RwLock};
 
@@ -305,31 +306,13 @@ impl Backend {
         let mut messages: HashMap<PathBuf, Vec<lsp::Diagnostic>> = HashMap::with_capacity(diagnostics.len());
 
         for diagnostic in diagnostics {
-            let (msg, severity, loc) = match diagnostic {
-                Diagnostic::Deprecation(msg, pos) => {
-                    let loc = files.lookup(pos).unwrap();
-                    (msg, lsp::DiagnosticSeverity::WARNING, loc)
-                }
-                Diagnostic::MethodConflict(_, pos) => {
-                    let msg = "Conflicting method replacement".to_owned();
-                    let loc = files.lookup(pos).unwrap();
-                    (msg, lsp::DiagnosticSeverity::WARNING, loc)
-                }
-                Diagnostic::UnusedLocal(pos) => {
-                    let msg = "Unused variable".to_owned();
-                    let loc = files.lookup(pos).unwrap();
-                    (msg, lsp::DiagnosticSeverity::WARNING, loc)
-                }
-                Diagnostic::MissingReturn(pos) => {
-                    let msg = "Function might not return a value".to_owned();
-                    let loc = files.lookup(pos).unwrap();
-                    (msg, lsp::DiagnosticSeverity::WARNING, loc)
-                }
-                Diagnostic::CompileError(msg, pos) => {
-                    let loc = files.lookup(pos).unwrap();
-                    (msg, lsp::DiagnosticSeverity::ERROR, loc)
-                }
+            let msg = diagnostic.to_string();
+            let severity = if diagnostic.is_fatal() {
+                lsp::DiagnosticSeverity::ERROR
+            } else {
+                lsp::DiagnosticSeverity::WARNING
             };
+            let loc = files.lookup(diagnostic.span()).unwrap();
 
             let range = lsp::Range::new(
                 lsp::Position::new(loc.start.line as u32, loc.start.col as u32),
