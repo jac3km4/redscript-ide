@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use redscript::ast::{Expr, Ident, Pos, TypeName};
 use redscript::bundle::{ConstantPool, PoolIndex};
 use redscript::definition::Function;
@@ -6,8 +8,9 @@ use redscript_compiler::typechecker::TypedAst;
 use crate::error::Error;
 
 pub fn find_in_seq(haystack: &[Expr<TypedAst>], needle: Pos) -> Option<&Expr<TypedAst>> {
-    // TODO: use binary search
-    haystack.iter().find_map(|expr| find_in_expr(expr, needle))
+    let index = haystack.binary_search_by(|expr| expr.span().compare_pos(needle)).ok()?;
+    let expr = haystack.get(index)?;
+    find_in_expr(expr, needle)
 }
 
 pub fn find_in_expr(haystack: &Expr<TypedAst>, needle: Pos) -> Option<&Expr<TypedAst>> {
@@ -74,15 +77,15 @@ pub fn render_function(idx: PoolIndex<Function>, short: bool, pool: &ConstantPoo
         let param = pool.parameter(*param_idx)?;
         let type_name = TypeName::from_repr(&pool.def_name(param.type_)?);
         if i != 0 {
-            args.push_str(", ");
+            write!(args, ", ").unwrap();
         }
-        args.push_str(&format!("{}: {}", name, type_name.pretty()));
+        write!(args, "{}: {}", name, type_name.pretty()).unwrap();
     }
 
     let ret_type = if let Some(ret_idx) = fun.return_type {
         TypeName::from_repr(&pool.def_name(ret_idx)?).pretty()
     } else {
-        Ident::Static("Void")
+        Ident::from_static("Void")
     };
 
     Ok(format!("{}({}) -> {}", pretty_name, args, ret_type))

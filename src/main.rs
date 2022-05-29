@@ -1,5 +1,6 @@
 #![feature(once_cell)]
 use std::collections::{hash_map, HashMap};
+use std::fmt::Write;
 use std::fs::File;
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -193,11 +194,11 @@ impl Backend {
             Ok(module) => {
                 let (functions, _) =
                     CompilationUnit::new_with_defaults(&mut pool)?.typecheck(vec![module], false, true)?;
-                // TODO: should use binary search
                 if let Some((expr, scope)) = functions
-                    .iter()
-                    .find(|fun| fun.span.contains(needle))
-                    .and_then(|fun| util::find_in_seq(&fun.code.exprs, needle).map(|e| (e, &fun.scope)))
+                    .binary_search_by(|fun| fun.span.compare_pos(needle))
+                    .ok()
+                    .and_then(|idx| functions.get(idx))
+                    .and_then(|fun| util::find_in_seq(&fun.code.exprs, needle).map(|expr| (expr, &fun.scope)))
                 {
                     let typ = type_of(expr, scope, &pool)?;
                     return Ok(Some(on_expr(expr, typ, &pool)?));
@@ -251,9 +252,9 @@ impl Backend {
             for (i, param_idx) in fun.parameters.iter().enumerate() {
                 let name = pool.def_name(*param_idx)?;
                 if i != 0 {
-                    snippet.push_str(", ");
+                    write!(snippet, ", ").unwrap();
                 }
-                snippet.push_str(&format!("${{{}:{}}}", i + 1, name));
+                write!(snippet, "${{{}:{}}}", i + 1, name).unwrap();
             }
             let detail = util::render_function(idx, true, &pool)?;
 
@@ -281,7 +282,7 @@ impl Backend {
                 let text = match expr {
                     Expr::Call(Callable::Function(idx), _, _, _) => util::render_function(*idx, false, pool)?,
                     Expr::MethodCall(_, idx, _, _) => util::render_function(*idx, false, pool)?,
-                    _ => typ.pretty(pool)?.to_owned().deref().to_owned(),
+                    _ => typ.pretty(pool)?.deref().to_owned(),
                 };
                 let contents = lsp::HoverContents::Scalar(lsp::MarkedString::LanguageString(lsp::LanguageString {
                     language: "redscript".to_owned(),
@@ -378,9 +379,9 @@ impl Backend {
             for (i, param_idx) in fun.parameters.iter().enumerate() {
                 let name = pool.def_name(*param_idx)?;
                 if i != 0 {
-                    snippet.push_str(", ");
+                    write!(snippet, ", ").unwrap();
                 }
-                snippet.push_str(&format!("${{{}:{}}}", i + 1, name));
+                write!(snippet, "${{{}:{}}}", i + 1, name).unwrap();
             }
             let detail = util::render_function(*idx, true, pool)?;
 
