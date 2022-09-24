@@ -10,16 +10,16 @@ thiserror = "1"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-dashmap = "5.3"
-ropey = "1.4"
+dashmap = "5.4"
+ropey = "1.5"
 
 [dependencies.redscript]
 git = "https://github.com/jac3km4/redscript"
 package = "redscript"
 features = ["arc"]
-rev = "v0.5.5"
+rev = "f5334c6"
 
 [dependencies.redscript-compiler]
 git = "https://github.com/jac3km4/redscript"
 package = "redscript-compiler"
-rev = "v0.5.5"
+rev = "f5334c6"
