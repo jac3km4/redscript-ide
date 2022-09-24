@@ -1,4 +1,3 @@
-#![feature(once_cell)]
 use std::collections::{hash_map, HashMap};
 use std::fmt::Write;
 use std::fs::File;
@@ -73,7 +72,7 @@ impl Backend {
 
     async fn initialize(&self, uri: Option<lsp::Url>) -> Result<(), Error> {
         let path = uri
-            .ok_or_else(|| Error::Server("No workspace open".to_owned()))?
+            .ok_or_else(|| Error::Server("No workspace open, redscript extension requires a workspace".to_owned()))?
             .to_file_path()
             .map_err(|_| Error::Server("Invalid workspace path".to_owned()))?;
 
@@ -85,8 +84,24 @@ impl Backend {
         let conf = self.get_configuration().await?;
         let path = conf.script_cache_path.map(Ok).unwrap_or_else(|| {
             conf.game_dir
-                .map(|dir| dir.join("r6").join("cache").join("final.redscripts.bk"))
-                .ok_or_else(|| Error::Server("Missing configuration".to_string()))
+                .ok_or_else(|| Error::Server("Missing redscript extension configuration".to_string()))
+                .and_then(|dir| {
+                    let default_bk = dir.join("r6").join("cache").join("modded").join("final.redscripts.bk");
+                    default_bk
+                        .exists()
+                        .then_some(default_bk)
+                        .or_else(|| {
+                            let fallback = dir.join("r6").join("cache").join("final.redscripts.bk");
+                            fallback.exists().then_some(fallback)
+                        })
+                        .or_else(|| {
+                            let fallback = dir.join("r6").join("cache").join("final.redscripts");
+                            fallback.exists().then_some(fallback)
+                        })
+                        .ok_or_else(|| {
+                            Error::Server(format!("final.redscripts file could not be found in {}", dir.display()))
+                        })
+                })
         })?;
 
         let bundle = ScriptBundle::load(&mut File::open(path)?)?;
