@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+
+env:
+  CARGO_INCREMENTAL: 0 # Incremental not supported by our caching
+  CARGO_TERM_COLOR: always # GH action logs support terminal colors
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse # New format as of 2023-03-09
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: redscript-ide
+      - run: cargo clippy -- -Dwarnings
+      - name: Archive artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          path: |
+            target/release/redscript-ide.exe
