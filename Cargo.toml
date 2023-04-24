@@ -1,7 +1,9 @@
 [package]
 name = "redscript-ide"
 version = "0.1.2"
+rust-version = "1.69"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 lspower = "1"
@@ -18,9 +20,12 @@ toml = "0.7"
 git = "https://github.com/jac3km4/redscript"
 package = "redscript"
 features = ["arc"]
-rev = "7235206"
+rev = "v0.5.11"
 
 [dependencies.redscript-compiler]
 git = "https://github.com/jac3km4/redscript"
 package = "redscript-compiler"
-rev = "7235206"
+rev = "v0.5.11"
+
+[profile.release]
+lto = "thin"
