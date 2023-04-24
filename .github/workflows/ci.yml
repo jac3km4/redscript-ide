@@ -20,6 +20,7 @@ jobs:
         with:
           shared-key: redscript-ide
       - run: cargo clippy -- -Dwarnings
+      - run: cargo build --release
       - name: Archive artifacts
         uses: actions/upload-artifact@v2
         with:
