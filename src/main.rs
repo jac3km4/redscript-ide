@@ -2,7 +2,7 @@ use std::collections::{hash_map, HashMap};
 use std::fmt::Write;
 use std::fs::{self, File};
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use buffers::Buffers;
 use error::Error;
@@ -50,7 +50,7 @@ struct DotRedscript {
 }
 
 impl DotRedscript {
-    pub fn load(root_dir: &PathBuf) -> Result<Self, String> {
+    pub fn load(root_dir: &Path) -> Result<Self, String> {
         let path = root_dir.join(DOT_REDSCRIPT);
         let contents = fs::read_to_string(path).map_err(|err| match err.kind() {
             std::io::ErrorKind::NotFound => format!("{DOT_REDSCRIPT} not present"),
@@ -278,11 +278,10 @@ impl Backend {
                 {
                     let typ = type_of(expr, scope, &pool)?;
                     return Ok(Some(on_expr(expr, typ, &pool)?));
-                } else {
-                    self.client
-                        .log_message(lsp::MessageType::INFO, "Node not found")
-                        .await;
                 }
+                self.client
+                    .log_message(lsp::MessageType::INFO, "Node not found")
+                    .await;
             }
             Err(err) => {
                 self.client.log_message(lsp::MessageType::INFO, err).await;
@@ -299,11 +298,7 @@ impl Backend {
             .expr_at_location(params.text_document_position, true, |expr, typ, pool| {
                 let is_static = matches!(expr, Expr::Ident(Reference::Symbol(_), _));
                 match typ.unwrapped() {
-                    TypeId::Class(idx) => {
-                        let completions = Self::class_completions(*idx, is_static, pool)?;
-                        Ok(Some(lsp::CompletionResponse::Array(completions)))
-                    }
-                    TypeId::Struct(idx) => {
+                    TypeId::Class(idx) | TypeId::Struct(idx) => {
                         let completions = Self::class_completions(*idx, is_static, pool)?;
                         Ok(Some(lsp::CompletionResponse::Array(completions)))
                     }
@@ -534,7 +529,7 @@ impl Backend {
         };
         self.client
             .send_custom_notification::<lsp::notification::ShowMessage>(msg)
-            .await
+            .await;
     }
 }
 
@@ -574,7 +569,7 @@ impl LanguageServer for Backend {
             Ok(()) => {
                 self.client
                     .log_message(lsp::MessageType::INFO, "Server initialized!")
-                    .await
+                    .await;
             }
         }
     }

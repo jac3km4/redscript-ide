@@ -19,19 +19,19 @@ pub fn find_in_expr(haystack: &Expr<TypedAst>, needle: Pos) -> Option<&Expr<Type
     if haystack.span().contains(needle) {
         let res = match haystack {
             Expr::ArrayLit(exprs, _, _) => find_in_seq(exprs, needle),
-            Expr::Declare(_, _, Some(expr), _) => find_in_expr(expr, needle),
-            Expr::Cast(_, expr, _) => find_in_expr(expr, needle),
-            Expr::Assign(_, expr, _) => find_in_expr(expr, needle),
-            Expr::Call(_, _, args, _) => find_in_seq(args, needle),
             Expr::MethodCall(expr, _, args, _) => {
                 find_in_expr(expr, needle).or_else(|| find_in_seq(args, needle))
             }
-            Expr::Member(expr, _, _) => find_in_expr(expr, needle),
             Expr::ArrayElem(expr, index, _) => {
                 find_in_expr(expr, needle).or_else(|| find_in_expr(index, needle))
             }
-            Expr::New(_, args, _) => find_in_seq(args, needle),
-            Expr::Return(Some(expr), _) => find_in_expr(expr, needle),
+            Expr::Call(_, _, args, _) | Expr::New(_, args, _) => find_in_seq(args, needle),
+            Expr::Declare(_, _, Some(expr), _)
+            | Expr::Cast(_, expr, _)
+            | Expr::Assign(_, expr, _)
+            | Expr::Member(expr, _, _)
+            | Expr::Return(Some(expr), _)
+            | Expr::UnOp(expr, _, _) => find_in_expr(expr, needle),
             Expr::Seq(seq) => seq.exprs.iter().find_map(|expr| find_in_expr(expr, needle)),
             Expr::Switch(expr, cases, Some(default), _) => find_in_expr(expr, needle)
                 .or_else(|| {
@@ -63,7 +63,6 @@ pub fn find_in_expr(haystack: &Expr<TypedAst>, needle: Pos) -> Option<&Expr<Type
             Expr::BinOp(lhs, rhs, _, _) => {
                 find_in_expr(lhs, needle).or_else(|| find_in_expr(rhs, needle))
             }
-            Expr::UnOp(expr, _, _) => find_in_expr(expr, needle),
             _ => Some(haystack),
         };
         res.or(Some(haystack))
