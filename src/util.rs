@@ -8,7 +8,9 @@ use redscript_compiler::typechecker::TypedAst;
 use crate::error::Error;
 
 pub fn find_in_seq(haystack: &[Expr<TypedAst>], needle: Pos) -> Option<&Expr<TypedAst>> {
-    let index = haystack.binary_search_by(|expr| expr.span().compare_pos(needle)).ok()?;
+    let index = haystack
+        .binary_search_by(|expr| expr.span().compare_pos(needle))
+        .ok()?;
     let expr = haystack.get(index)?;
     find_in_expr(expr, needle)
 }
@@ -21,38 +23,46 @@ pub fn find_in_expr(haystack: &Expr<TypedAst>, needle: Pos) -> Option<&Expr<Type
             Expr::Cast(_, expr, _) => find_in_expr(expr, needle),
             Expr::Assign(_, expr, _) => find_in_expr(expr, needle),
             Expr::Call(_, _, args, _) => find_in_seq(args, needle),
-            Expr::MethodCall(expr, _, args, _) => find_in_expr(expr, needle).or_else(|| find_in_seq(args, needle)),
+            Expr::MethodCall(expr, _, args, _) => {
+                find_in_expr(expr, needle).or_else(|| find_in_seq(args, needle))
+            }
             Expr::Member(expr, _, _) => find_in_expr(expr, needle),
-            Expr::ArrayElem(expr, index, _) => find_in_expr(expr, needle).or_else(|| find_in_expr(index, needle)),
+            Expr::ArrayElem(expr, index, _) => {
+                find_in_expr(expr, needle).or_else(|| find_in_expr(index, needle))
+            }
             Expr::New(_, args, _) => find_in_seq(args, needle),
             Expr::Return(Some(expr), _) => find_in_expr(expr, needle),
             Expr::Seq(seq) => seq.exprs.iter().find_map(|expr| find_in_expr(expr, needle)),
             Expr::Switch(expr, cases, Some(default), _) => find_in_expr(expr, needle)
                 .or_else(|| {
                     cases.iter().find_map(|case| {
-                        find_in_expr(&case.matcher, needle).or_else(|| find_in_seq(&case.body.exprs, needle))
+                        find_in_expr(&case.matcher, needle)
+                            .or_else(|| find_in_seq(&case.body.exprs, needle))
                     })
                 })
                 .or_else(|| find_in_seq(&default.exprs, needle)),
             Expr::Switch(expr, cases, None, _) => find_in_expr(expr, needle).or_else(|| {
                 cases.iter().find_map(|case| {
-                    find_in_expr(&case.matcher, needle).or_else(|| find_in_seq(&case.body.exprs, needle))
+                    find_in_expr(&case.matcher, needle)
+                        .or_else(|| find_in_seq(&case.body.exprs, needle))
                 })
             }),
             Expr::If(expr, if_, Some(else_), _) => find_in_expr(expr, needle)
                 .or_else(|| find_in_seq(&if_.exprs, needle))
                 .or_else(|| find_in_seq(&else_.exprs, needle)),
-            Expr::If(expr, if_, None, _) => find_in_expr(expr, needle).or_else(|| find_in_seq(&if_.exprs, needle)),
+            Expr::If(expr, if_, None, _) => {
+                find_in_expr(expr, needle).or_else(|| find_in_seq(&if_.exprs, needle))
+            }
             Expr::Conditional(expr, true_, false_, _) => find_in_expr(expr, needle)
                 .or_else(|| find_in_expr(true_, needle))
                 .or_else(|| find_in_expr(false_, needle)),
-            Expr::While(expr, seq, _) => {
-                find_in_expr(expr, needle).or_else(|| seq.exprs.iter().find_map(|arg| find_in_expr(arg, needle)))
+            Expr::While(expr, seq, _) => find_in_expr(expr, needle)
+                .or_else(|| seq.exprs.iter().find_map(|arg| find_in_expr(arg, needle))),
+            Expr::ForIn(_, expr, seq, _) => find_in_expr(expr, needle)
+                .or_else(|| seq.exprs.iter().find_map(|arg| find_in_expr(arg, needle))),
+            Expr::BinOp(lhs, rhs, _, _) => {
+                find_in_expr(lhs, needle).or_else(|| find_in_expr(rhs, needle))
             }
-            Expr::ForIn(_, expr, seq, _) => {
-                find_in_expr(expr, needle).or_else(|| seq.exprs.iter().find_map(|arg| find_in_expr(arg, needle)))
-            }
-            Expr::BinOp(lhs, rhs, _, _) => find_in_expr(lhs, needle).or_else(|| find_in_expr(rhs, needle)),
             Expr::UnOp(expr, _, _) => find_in_expr(expr, needle),
             _ => Some(haystack),
         };
@@ -62,7 +72,11 @@ pub fn find_in_expr(haystack: &Expr<TypedAst>, needle: Pos) -> Option<&Expr<Type
     }
 }
 
-pub fn render_function(idx: PoolIndex<Function>, short: bool, pool: &ConstantPool) -> Result<String, Error> {
+pub fn render_function(
+    idx: PoolIndex<Function>,
+    short: bool,
+    pool: &ConstantPool,
+) -> Result<String, Error> {
     let name = pool.def_name(idx)?;
     let pretty_name = if short {
         ""

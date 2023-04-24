@@ -1,6 +1,6 @@
 use std::collections::{hash_map, HashMap};
 use std::fmt::Write;
-use std::fs::{File, self};
+use std::fs::{self, File};
 use std::ops::Deref;
 use std::path::PathBuf;
 
@@ -38,23 +38,27 @@ async fn main() {
         workspace_path: OnceCell::new(),
         buffers: Buffers::default(),
     });
-    Server::new(stdin, stdout).interleave(messages).serve(service).await;
+    Server::new(stdin, stdout)
+        .interleave(messages)
+        .serve(service)
+        .await;
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct DotRedscript {
-   redscript_dir: Option<PathBuf>
+    redscript_dir: Option<PathBuf>,
 }
 
 impl DotRedscript {
     pub fn load(root_dir: &PathBuf) -> Result<Self, String> {
         let path = root_dir.join(DOT_REDSCRIPT);
         let contents = fs::read_to_string(path).map_err(|err| match err.kind() {
-            std::io::ErrorKind::NotFound => format!("{DOT_REDSCRIPT} not present").to_owned(),
+            std::io::ErrorKind::NotFound => format!("{DOT_REDSCRIPT} not present"),
             _ => err.to_string(),
         })?;
 
-        let dr = toml::from_str(&contents).map_err(|err| format!("{DOT_REDSCRIPT} parse error: {err}"))?;
+        let dr = toml::from_str(&contents)
+            .map_err(|err| format!("{DOT_REDSCRIPT} parse error: {err}"))?;
         Ok(dr)
     }
 }
@@ -88,11 +92,16 @@ struct ServerState {
 }
 
 impl Backend {
-    const CONFIG_FIELDS: &'static [&'static str] = &["redscript.scriptCachePath", "redscript.gameDir"];
+    const CONFIG_FIELDS: &'static [&'static str] =
+        &["redscript.scriptCachePath", "redscript.gameDir"];
 
     async fn initialize(&self, uri: Option<lsp::Url>) -> Result<(), Error> {
         let mut path = uri
-            .ok_or_else(|| Error::Server("No workspace open, redscript extension requires a workspace".to_owned()))?
+            .ok_or_else(|| {
+                Error::Server(
+                    "No workspace open, redscript extension requires a workspace".to_owned(),
+                )
+            })?
             .to_file_path()
             .map_err(|_| Error::Server("Invalid workspace path".to_owned()))?;
 
@@ -106,9 +115,10 @@ impl Backend {
             } else {
                 path.join(redscript_dir)
             };
-            path = new_path.try_exists()
-                .map_err(|err| Error::Server(format!("Invalid redscript dir ({err})").to_owned()))?
-                .then(|| new_path)
+            path = new_path
+                .try_exists()
+                .map_err(|err| Error::Server(format!("Invalid redscript dir ({err})")))?
+                .then_some(new_path)
                 .ok_or_else(|| Error::Server("Redscript dir does not exist".to_owned()))?;
         }
         self.workspace_path.set(path).unwrap();
@@ -119,9 +129,15 @@ impl Backend {
         let conf = self.get_configuration().await?;
         let path = conf.script_cache_path.map(Ok).unwrap_or_else(|| {
             conf.game_dir
-                .ok_or_else(|| Error::Server("Missing redscript extension configuration".to_string()))
+                .ok_or_else(|| {
+                    Error::Server("Missing redscript extension configuration".to_string())
+                })
                 .and_then(|dir| {
-                    let default_bk = dir.join("r6").join("cache").join("modded").join("final.redscripts.bk");
+                    let default_bk = dir
+                        .join("r6")
+                        .join("cache")
+                        .join("modded")
+                        .join("final.redscripts.bk");
                     default_bk
                         .exists()
                         .then_some(default_bk)
@@ -134,7 +150,10 @@ impl Backend {
                             fallback.exists().then_some(fallback)
                         })
                         .ok_or_else(|| {
-                            Error::Server(format!("final.redscripts file could not be found in {}", dir.display()))
+                            Error::Server(format!(
+                                "final.redscripts file could not be found in {}",
+                                dir.display()
+                            ))
                         })
                 })
         })?;
@@ -165,7 +184,9 @@ impl Backend {
             let path = self.workspace_path.get().unwrap();
             let files = Files::from_dir(path, SourceFilter::None)?;
 
-            match CompilationUnit::new_with_defaults(&mut compiled_pool)?.typecheck_files(&files, false, false) {
+            match CompilationUnit::new_with_defaults(&mut compiled_pool)?
+                .typecheck_files(&files, false, false)
+            {
                 Ok((_, diagnostics)) => {
                     let state = ServerState { compiled_pool };
                     *self.state.write().await = Some(state);
@@ -242,18 +263,25 @@ impl Backend {
         // TODO: avoid copying the string
         match parser::parse_str(&copy.to_string()) {
             Ok(module) => {
-                let (functions, _) =
-                    CompilationUnit::new_with_defaults(&mut pool)?.typecheck(vec![module], false, true)?;
+                let (functions, _) = CompilationUnit::new_with_defaults(&mut pool)?.typecheck(
+                    vec![module],
+                    false,
+                    true,
+                )?;
                 if let Some((expr, scope)) = functions
                     .binary_search_by(|fun| fun.span.compare_pos(needle))
                     .ok()
                     .and_then(|idx| functions.get(idx))
-                    .and_then(|fun| util::find_in_seq(&fun.code.exprs, needle).map(|expr| (expr, &fun.scope)))
+                    .and_then(|fun| {
+                        util::find_in_seq(&fun.code.exprs, needle).map(|expr| (expr, &fun.scope))
+                    })
                 {
                     let typ = type_of(expr, scope, &pool)?;
                     return Ok(Some(on_expr(expr, typ, &pool)?));
                 } else {
-                    self.client.log_message(lsp::MessageType::INFO, "Node not found").await;
+                    self.client
+                        .log_message(lsp::MessageType::INFO, "Node not found")
+                        .await;
                 }
             }
             Err(err) => {
@@ -263,7 +291,10 @@ impl Backend {
         Ok(None)
     }
 
-    async fn completion(&self, params: lsp::CompletionParams) -> Result<Option<lsp::CompletionResponse>, Error> {
+    async fn completion(
+        &self,
+        params: lsp::CompletionParams,
+    ) -> Result<Option<lsp::CompletionResponse>, Error> {
         let matched = self
             .expr_at_location(params.text_document_position, true, |expr, typ, pool| {
                 let is_static = matches!(expr, Expr::Ident(Reference::Symbol(_), _));
@@ -289,8 +320,11 @@ impl Backend {
     }
 
     // TODO: use this instead of calculating everything in completion
-    async fn completion_resolve(&self, item: lsp::CompletionItem) -> Result<lsp::CompletionItem, Error> {
-        if let Some(idx_val) = item.data.as_ref().and_then(|x| x.as_u64()) {
+    async fn completion_resolve(
+        &self,
+        item: lsp::CompletionItem,
+    ) -> Result<lsp::CompletionItem, Error> {
+        if let Some(idx_val) = item.data.as_ref().and_then(serde_json::Value::as_u64) {
             let pool = self.get_cloned_pool().await?;
             let idx = PoolIndex::new(idx_val as u32);
             let fun = pool.function(idx)?;
@@ -328,33 +362,45 @@ impl Backend {
             .get(&params.text_document_position_params.text_document.uri)
             .expect("No buffer found for URI");
         let matched = self
-            .expr_at_location(params.text_document_position_params, true, |expr, typ, pool| {
-                let text = match expr {
-                    Expr::Call(Callable::Function(idx), _, _, _) => util::render_function(*idx, false, pool)?,
-                    Expr::MethodCall(_, idx, _, _) => util::render_function(*idx, false, pool)?,
-                    _ => typ.pretty(pool)?.deref().to_owned(),
-                };
-                let contents = lsp::HoverContents::Scalar(lsp::MarkedString::LanguageString(lsp::LanguageString {
-                    language: "redscript".to_owned(),
-                    value: text,
-                }));
-                let span = expr.span();
-                let start = buf.get_loc(span.low).unwrap();
-                let end = buf.get_loc(span.high).unwrap();
-                let range = lsp::Range::new(lsp::Position::new(start.0, start.1), lsp::Position::new(end.0, end.1));
+            .expr_at_location(
+                params.text_document_position_params,
+                true,
+                |expr, typ, pool| {
+                    let text = match expr {
+                        Expr::Call(Callable::Function(idx), _, _, _) => {
+                            util::render_function(*idx, false, pool)?
+                        }
+                        Expr::MethodCall(_, idx, _, _) => util::render_function(*idx, false, pool)?,
+                        _ => typ.pretty(pool)?.deref().to_owned(),
+                    };
+                    let contents = lsp::HoverContents::Scalar(lsp::MarkedString::LanguageString(
+                        lsp::LanguageString {
+                            language: "redscript".to_owned(),
+                            value: text,
+                        },
+                    ));
+                    let span = expr.span();
+                    let start = buf.get_loc(span.low).unwrap();
+                    let end = buf.get_loc(span.high).unwrap();
+                    let range = lsp::Range::new(
+                        lsp::Position::new(start.0, start.1),
+                        lsp::Position::new(end.0, end.1),
+                    );
 
-                let hover = lsp::Hover {
-                    contents,
-                    range: Some(range),
-                };
-                Ok(Some(hover))
-            })
+                    let hover = lsp::Hover {
+                        contents,
+                        range: Some(range),
+                    };
+                    Ok(Some(hover))
+                },
+            )
             .await?;
         Ok(matched.flatten())
     }
 
     async fn publish_diagnostics(&self, diagnostics: Vec<Diagnostic>, files: &Files) {
-        let mut messages: HashMap<PathBuf, Vec<lsp::Diagnostic>> = HashMap::with_capacity(diagnostics.len());
+        let mut messages: HashMap<PathBuf, Vec<lsp::Diagnostic>> =
+            HashMap::with_capacity(diagnostics.len());
 
         for diagnostic in diagnostics {
             let msg = diagnostic.to_string();
@@ -370,7 +416,8 @@ impl Backend {
                 lsp::Position::new(loc.end.line as u32, loc.end.col as u32),
             );
             let source = Some("redscript".to_owned());
-            let diagnostic = lsp::Diagnostic::new(range, Some(severity), None, source, msg, None, None);
+            let diagnostic =
+                lsp::Diagnostic::new(range, Some(severity), None, source, msg, None, None);
             match messages.entry(loc.file.path().to_owned()) {
                 hash_map::Entry::Occupied(mut entry) => {
                     entry.get_mut().push(diagnostic);
@@ -410,7 +457,7 @@ impl Backend {
                 let item = lsp::CompletionItem {
                     label: name.deref().to_owned(),
                     kind: Some(lsp::CompletionItemKind::FIELD),
-                    detail: Some(type_name.pretty().to_owned().to_string()),
+                    detail: Some(type_name.pretty().clone().to_string()),
                     ..lsp::CompletionItem::default()
                 };
                 completions.push(item);
@@ -453,7 +500,10 @@ impl Backend {
         Ok(completions)
     }
 
-    fn enum_completions(idx: PoolIndex<Enum>, pool: &ConstantPool) -> Result<Vec<lsp::CompletionItem>, Error> {
+    fn enum_completions(
+        idx: PoolIndex<Enum>,
+        pool: &ConstantPool,
+    ) -> Result<Vec<lsp::CompletionItem>, Error> {
         let mut completions = vec![];
         let enum_ = pool.enum_(idx)?;
 
@@ -490,7 +540,10 @@ impl Backend {
 
 #[lspower::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, params: lsp::InitializeParams) -> jsonrpc::Result<lsp::InitializeResult> {
+    async fn initialize(
+        &self,
+        params: lsp::InitializeParams,
+    ) -> jsonrpc::Result<lsp::InitializeResult> {
         self.initialize(params.root_uri).await?;
 
         let completion = lsp::CompletionOptions {
@@ -537,21 +590,29 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: lsp::DidChangeTextDocumentParams) {
         for change in params.content_changes {
-            self.buffers.update(&params.text_document.uri, change)
+            self.buffers.update(&params.text_document.uri, change);
         }
     }
 
     async fn did_save(&self, _params: lsp::DidSaveTextDocumentParams) {
         if let Err(err) = self.typecheck_workspace().await {
-            self.client.log_message(lsp::MessageType::ERROR, err.to_string()).await;
+            self.client
+                .log_message(lsp::MessageType::ERROR, err.to_string())
+                .await;
         }
     }
 
-    async fn completion(&self, params: lsp::CompletionParams) -> jsonrpc::Result<Option<lsp::CompletionResponse>> {
+    async fn completion(
+        &self,
+        params: lsp::CompletionParams,
+    ) -> jsonrpc::Result<Option<lsp::CompletionResponse>> {
         Ok(self.completion(params).await?)
     }
 
-    async fn completion_resolve(&self, item: lsp::CompletionItem) -> jsonrpc::Result<lsp::CompletionItem> {
+    async fn completion_resolve(
+        &self,
+        item: lsp::CompletionItem,
+    ) -> jsonrpc::Result<lsp::CompletionItem> {
         Ok(self.completion_resolve(item).await?)
     }
 

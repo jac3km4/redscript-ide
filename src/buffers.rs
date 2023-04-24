@@ -37,8 +37,10 @@ impl Buffer {
     pub fn update(&mut self, change: lsp::TextDocumentContentChangeEvent) {
         match change.range {
             Some(range) => {
-                let start = self.contents.line_to_char(range.start.line as usize) + range.start.character as usize;
-                let end = self.contents.line_to_char(range.end.line as usize) + range.end.character as usize;
+                let start = self.contents.line_to_char(range.start.line as usize)
+                    + range.start.character as usize;
+                let end = self.contents.line_to_char(range.end.line as usize)
+                    + range.end.character as usize;
                 self.contents.remove(start..end);
                 self.contents.insert(start, &change.text);
             }
