@@ -11,7 +11,8 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse # New format as of 2023-03-09
 
 jobs:
-  build:
+  lint:
+    name: Run clippy
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v3
@@ -19,10 +20,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: redscript-ide
+          key: clippy
       - run: cargo clippy -- -Dwarnings
-      - run: cargo build --release
-      - name: Archive artifacts
-        uses: actions/upload-artifact@v2
+
+  build:
+    name: Build an artifact
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            target/release/redscript-ide.exe
+          shared-key: redscript-ide
+          key: build
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v2
+        with:
+          path: target/release/redscript-ide.exe
