@@ -1,6 +1,6 @@
 use std::collections::{hash_map, HashMap};
 use std::fmt::Write;
-use std::fs::File;
+use std::fs::{File, self};
 use std::ops::Deref;
 use std::path::PathBuf;
 
@@ -24,6 +24,8 @@ mod buffers;
 mod error;
 mod util;
 
+const DOT_REDSCRIPT: &str = ".redscript-ide";
+
 #[tokio::main]
 async fn main() {
     let stdin = tokio::io::stdin();
@@ -37,6 +39,24 @@ async fn main() {
         buffers: Buffers::default(),
     });
     Server::new(stdin, stdout).interleave(messages).serve(service).await;
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DotRedscript {
+   redscript_dir: Option<PathBuf>
+}
+
+impl DotRedscript {
+    pub fn load(root_dir: &PathBuf) -> Result<Self, String> {
+        let path = root_dir.join(DOT_REDSCRIPT);
+        let contents = fs::read_to_string(path).map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => format!("{DOT_REDSCRIPT} not present").to_owned(),
+            _ => err.to_string(),
+        })?;
+
+        let dr = toml::from_str(&contents).map_err(|err| format!("{DOT_REDSCRIPT} parse error: {err}"))?;
+        Ok(dr)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,11 +91,26 @@ impl Backend {
     const CONFIG_FIELDS: &'static [&'static str] = &["redscript.scriptCachePath", "redscript.gameDir"];
 
     async fn initialize(&self, uri: Option<lsp::Url>) -> Result<(), Error> {
-        let path = uri
+        let mut path = uri
             .ok_or_else(|| Error::Server("No workspace open, redscript extension requires a workspace".to_owned()))?
             .to_file_path()
             .map_err(|_| Error::Server("Invalid workspace path".to_owned()))?;
 
+        let dot_redscript = DotRedscript::load(&path).unwrap_or_else(|err| {
+            log::info!("Using defaults for {DOT_REDSCRIPT} ({err})");
+            DotRedscript::default()
+        });
+        if let Some(redscript_dir) = dot_redscript.redscript_dir {
+            let new_path = if redscript_dir.is_absolute() {
+                redscript_dir
+            } else {
+                path.join(redscript_dir)
+            };
+            path = new_path.try_exists()
+                .map_err(|err| Error::Server(format!("Invalid redscript dir ({err})").to_owned()))?
+                .then(|| new_path)
+                .ok_or_else(|| Error::Server("Redscript dir does not exist".to_owned()))?;
+        }
         self.workspace_path.set(path).unwrap();
         Ok(())
     }
