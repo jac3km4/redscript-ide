@@ -1,6 +1,6 @@
 [package]
 name = "redscript-ide"
-version = "0.1.2"
+version = "0.1.3"
 rust-version = "1.69"
 edition = "2021"
 license = "MIT"
@@ -26,6 +26,10 @@ rev = "v0.5.14"
 git = "https://github.com/jac3km4/redscript"
 package = "redscript-compiler"
 rev = "v0.5.14"
+
+[workspace.metadata.release]
+pre-release-commit-message = "chore: release {{version}}"
+publish = false
 
 [profile.release]
 lto = "thin"
