@@ -20,12 +20,12 @@ toml = "0.7"
 git = "https://github.com/jac3km4/redscript"
 package = "redscript"
 features = ["arc"]
-rev = "v0.5.11"
+rev = "v0.5.14"
 
 [dependencies.redscript-compiler]
 git = "https://github.com/jac3km4/redscript"
 package = "redscript-compiler"
-rev = "v0.5.11"
+rev = "v0.5.14"
 
 [profile.release]
 lto = "thin"

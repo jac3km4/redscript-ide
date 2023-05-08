@@ -182,7 +182,7 @@ impl Backend {
     async fn typecheck_workspace(&self) -> Result<(), Error> {
         if let Some(mut compiled_pool) = self.pool.get().cloned() {
             let path = self.workspace_path.get().unwrap();
-            let files = Files::from_dir(path, SourceFilter::None)?;
+            let files = Files::from_dir(path, &SourceFilter::None)?;
 
             match CompilationUnit::new_with_defaults(&mut compiled_pool)?
                 .typecheck_files(&files, false, false)
