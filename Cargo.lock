@@ -3,6 +3,17 @@
 version = 3
 
 [[package]]
+name = "ahash"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c99f64d1e06488f620f932677e24bc6e2897582980441ae90a671415bd7ec2f"
+dependencies = [
+ "cfg-if",
+ "once_cell",
+ "version_check",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.71"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -236,6 +247,15 @@ name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
+
+[[package]]
+name = "hashbrown"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43a3c133739dddd0d2990f9a4bdf8eb4b21ef50e4851ca85ab661199821d510e"
+dependencies = [
+ "ahash",
+]
 
 [[package]]
 name = "hashbrown"
@@ -592,12 +612,13 @@ dependencies = [
 [[package]]
 name = "redscript"
 version = "0.5.14"
-source = "git+https://github.com/jac3km4/redscript?rev=v0.5.14#dc2dcd5fae0b41889cff6ebd5ed54e9dfa566fd5"
+source = "git+https://github.com/jac3km4/redscript?rev=2aff597#2aff597224fcf6ff3cd0a45e6d751e8795936a5f"
 dependencies = [
  "byteorder",
  "crc32fast",
  "enum-as-inner",
  "flexstr",
+ "hashbrown 0.13.2",
  "itertools",
  "log",
  "modular-bitfield",
@@ -608,11 +629,12 @@ dependencies = [
 [[package]]
 name = "redscript-compiler"
 version = "0.5.14"
-source = "git+https://github.com/jac3km4/redscript?rev=v0.5.14#dc2dcd5fae0b41889cff6ebd5ed54e9dfa566fd5"
+source = "git+https://github.com/jac3km4/redscript?rev=2aff597#2aff597224fcf6ff3cd0a45e6d751e8795936a5f"
 dependencies = [
  "enum-as-inner",
  "flexstr",
  "hamt-sync",
+ "hashbrown 0.13.2",
  "itertools",
  "log",
  "peg",

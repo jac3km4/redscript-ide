@@ -259,6 +259,7 @@ impl Backend {
             Ok(module) => {
                 let (functions, _) = CompilationUnit::new_with_defaults(&mut pool)?.typecheck(
                     vec![module],
+                    &Files::default(),
                     false,
                     true,
                 )?;

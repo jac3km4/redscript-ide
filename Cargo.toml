@@ -20,12 +20,12 @@ toml = "0.7"
 git = "https://github.com/jac3km4/redscript"
 package = "redscript"
 features = ["arc"]
-rev = "v0.5.14"
+rev = "2aff597"
 
 [dependencies.redscript-compiler]
 git = "https://github.com/jac3km4/redscript"
 package = "redscript-compiler"
-rev = "v0.5.14"
+rev = "2aff597"
 
 [workspace.metadata.release]
 pre-release-commit-message = "chore: release {{version}}"
