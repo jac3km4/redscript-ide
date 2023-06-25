@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "redscript-ide"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dashmap 5.4.0",
  "log",
