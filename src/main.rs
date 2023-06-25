@@ -1,12 +1,12 @@
 use std::collections::{hash_map, HashMap};
-use std::fmt::Write;
+use std::fmt::{self, Write};
 use std::fs::{self, File};
+use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use buffers::Buffers;
 use error::Error;
-use lspower::lsp::MessageType;
 use lspower::{jsonrpc, lsp, Client, LanguageServer, LspService, Server};
 use redscript::ast::{Expr, TypeName};
 use redscript::bundle::{ConstantPool, PoolIndex, ScriptBundle};
@@ -50,16 +50,14 @@ struct DotRedscript {
 }
 
 impl DotRedscript {
-    pub fn load(root_dir: &Path) -> Result<Self, String> {
+    pub fn load(root_dir: &Path) -> Result<Option<Self>, Error> {
         let path = root_dir.join(DOT_REDSCRIPT);
-        let contents = fs::read_to_string(path).map_err(|err| match err.kind() {
-            std::io::ErrorKind::NotFound => format!("{DOT_REDSCRIPT} not present"),
-            _ => err.to_string(),
-        })?;
-
-        let dr = toml::from_str(&contents)
-            .map_err(|err| format!("{DOT_REDSCRIPT} parse error: {err}"))?;
-        Ok(dr)
+        let contents = match fs::read_to_string(path) {
+            Ok(res) => res,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(Error::Other(err.into())),
+        };
+        toml::from_str(&contents).map_err(Error::DotRedscriptParseError)
     }
 }
 
@@ -97,18 +95,11 @@ impl Backend {
 
     async fn initialize(&self, uri: Option<lsp::Url>) -> Result<(), Error> {
         let mut path = uri
-            .ok_or_else(|| {
-                Error::Server(
-                    "No workspace open, redscript extension requires a workspace".to_owned(),
-                )
-            })?
+            .ok_or(Error::NoWorkspaceOpen)?
             .to_file_path()
-            .map_err(|_| Error::Server("Invalid workspace path".to_owned()))?;
+            .map_err(|_| Error::NonFileUri)?;
 
-        let dot_redscript = DotRedscript::load(&path).unwrap_or_else(|err| {
-            log::info!("Using defaults for {DOT_REDSCRIPT} ({err})");
-            DotRedscript::default()
-        });
+        let dot_redscript = DotRedscript::load(&path)?.unwrap_or_default();
         if let Some(redscript_dir) = dot_redscript.redscript_dir {
             let new_path = if redscript_dir.is_absolute() {
                 redscript_dir
@@ -117,11 +108,14 @@ impl Backend {
             };
             path = new_path
                 .try_exists()
-                .map_err(|err| Error::Server(format!("Invalid redscript dir ({err})")))?
-                .then_some(new_path)
-                .ok_or_else(|| Error::Server("Redscript dir does not exist".to_owned()))?;
+                .map_err(|_| Error::InvalidRedscriptSourceDir(new_path.clone()))?
+                .then_some(new_path.clone())
+                .ok_or_else(|| Error::InvalidRedscriptSourceDir(new_path))?;
         }
-        self.workspace_path.set(path).unwrap();
+        if let Err(err) = self.workspace_path.set(path) {
+            self.log_error(format!("redscript LS is being initialized twice! ({err})"))
+                .await;
+        }
         Ok(())
     }
 
@@ -129,9 +123,7 @@ impl Backend {
         let conf = self.get_configuration().await?;
         let path = conf.script_cache_path.map(Ok).unwrap_or_else(|| {
             conf.game_dir
-                .ok_or_else(|| {
-                    Error::Server("Missing redscript extension configuration".to_string())
-                })
+                .ok_or(Error::MissingConfiguration)
                 .and_then(|dir| {
                     let default_bk = dir
                         .join("r6")
@@ -149,19 +141,19 @@ impl Backend {
                             let fallback = dir.join("r6").join("cache").join("final.redscripts");
                             fallback.exists().then_some(fallback)
                         })
-                        .ok_or_else(|| {
-                            Error::Server(format!(
-                                "final.redscripts file could not be found in {}",
-                                dir.display()
-                            ))
-                        })
+                        .ok_or_else(|| Error::RedscriptCacheNotFound(dir))
                 })
         })?;
 
         let bundle = ScriptBundle::load(&mut File::open(path)?)?;
         self.pool.set(bundle.pool).unwrap();
 
-        self.typecheck_workspace().await?;
+        if let Some(path) = self.workspace_path.get() {
+            if let Err(err) = self.typecheck_workspace(path).await {
+                self.log_info(format!("initial typecheck reported an error: {err}"))
+                    .await;
+            }
+        }
         Ok(())
     }
 
@@ -169,19 +161,23 @@ impl Backend {
         let items = Self::CONFIG_FIELDS
             .iter()
             .map(|str| lsp::ConfigurationItem {
-                section: Some(str.deref().to_owned()),
+                section: Some((*str).to_owned()),
                 scope_uri: None,
             })
             .collect();
-        let conf_json = self.client.configuration(items).await?;
+        let conf_json = self
+            .client
+            .configuration(items)
+            .await
+            .map_err(|err| Error::Other(err.into()))?;
 
-        let config: Config = serde_json::from_value(serde_json::Value::Array(conf_json))?;
+        let config = serde_json::from_value(serde_json::Value::Array(conf_json))
+            .map_err(|err| Error::Other(err.into()))?;
         Ok(config)
     }
 
-    async fn typecheck_workspace(&self) -> Result<(), Error> {
+    async fn typecheck_workspace(&self, path: &Path) -> Result<(), Error> {
         if let Some(mut compiled_pool) = self.pool.get().cloned() {
-            let path = self.workspace_path.get().unwrap();
             let files = Files::from_dir(path, &SourceFilter::None)?;
 
             match CompilationUnit::new_with_defaults(&mut compiled_pool)?
@@ -199,9 +195,7 @@ impl Backend {
                 }
             }
         } else {
-            self.client
-                .log_message(MessageType::WARNING, "Project not initialized")
-                .await;
+            self.log_error("project not initialized".to_owned()).await;
         }
         Ok(())
     }
@@ -215,12 +209,12 @@ impl Backend {
         let buf = self
             .buffers
             .get(&pos.text_document.uri)
-            .expect("No buffer found for URI");
+            .expect("no buffer found for URI");
         let mut pool = self.get_cloned_pool().await?;
         let mut copy = buf.contents().clone();
         let mut needle = buf
             .get_pos(pos.position.line, pos.position.character)
-            .expect("Position outside of the buffer");
+            .expect("position outside of the buffer");
 
         // very dumb heuristic to fix common parse errors
         // this removes the dot character and inserts a semicolon at the end of the line if it's missing
@@ -279,12 +273,10 @@ impl Backend {
                     let typ = type_of(expr, scope, &pool)?;
                     return Ok(Some(on_expr(expr, typ, &pool)?));
                 }
-                self.client
-                    .log_message(lsp::MessageType::INFO, "Node not found")
-                    .await;
             }
             Err(err) => {
-                self.client.log_message(lsp::MessageType::INFO, err).await;
+                self.log_info(format!("encountered a parse error: {err}"))
+                    .await;
             }
         }
         Ok(None)
@@ -516,20 +508,36 @@ impl Backend {
 
     async fn get_cloned_pool(&self) -> Result<ConstantPool, Error> {
         let guard = self.state.read().await;
-        let state = guard
-            .as_ref()
-            .ok_or_else(|| Error::Server("Server not initialized".to_owned()))?;
+        let state = guard.as_ref().ok_or(Error::ServerNotInitialized)?;
         Ok(state.compiled_pool.clone())
     }
 
-    async fn notify_error(&self, message: String) {
+    async fn spawn_error_popup(&self, message: String) {
         let msg = lsp::ShowMessageParams {
             typ: lsp::MessageType::ERROR,
-            message,
+            message: message.clone(),
         };
+        self.log_error(message).await;
         self.client
             .send_custom_notification::<lsp::notification::ShowMessage>(msg)
             .await;
+    }
+
+    async fn resolve_workspace(&self, url: &lsp::Url) -> Option<PathBuf> {
+        let path = url.to_file_path().ok()?;
+        let folders = self.client.workspace_folders().await.ok()??;
+        folders.iter().find_map(|folder| {
+            let folder = folder.uri.to_file_path().ok()?;
+            path.starts_with(&folder).then_some(folder)
+        })
+    }
+
+    async fn log_info(&self, msg: impl fmt::Display) {
+        self.client.log_message(lsp::MessageType::INFO, msg).await;
+    }
+
+    async fn log_error(&self, msg: impl fmt::Display) {
+        self.client.log_message(lsp::MessageType::ERROR, msg).await;
     }
 }
 
@@ -539,7 +547,9 @@ impl LanguageServer for Backend {
         &self,
         params: lsp::InitializeParams,
     ) -> jsonrpc::Result<lsp::InitializeResult> {
-        self.initialize(params.root_uri).await?;
+        if let Err(err) = self.initialize(params.root_uri).await {
+            self.spawn_error_popup(err.to_string()).await;
+        }
 
         let completion = lsp::CompletionOptions {
             trigger_characters: Some(vec![".".to_owned()]),
@@ -565,12 +575,8 @@ impl LanguageServer for Backend {
 
     async fn initialized(&self, _: lsp::InitializedParams) {
         match self.post_initialize().await {
-            Err(err) => self.notify_error(err.to_string()).await,
-            Ok(()) => {
-                self.client
-                    .log_message(lsp::MessageType::INFO, "Server initialized!")
-                    .await;
-            }
+            Err(err) => self.spawn_error_popup(err.to_string()).await,
+            Ok(()) => self.log_info("redscript server initialized!").await,
         }
     }
 
@@ -589,10 +595,12 @@ impl LanguageServer for Backend {
         }
     }
 
-    async fn did_save(&self, _params: lsp::DidSaveTextDocumentParams) {
-        if let Err(err) = self.typecheck_workspace().await {
-            self.client
-                .log_message(lsp::MessageType::ERROR, err.to_string())
+    async fn did_save(&self, params: lsp::DidSaveTextDocumentParams) {
+        let Some(workspace) =
+            self.resolve_workspace(&params.text_document.uri).await else { return };
+
+        if let Err(err) = self.typecheck_workspace(&workspace).await {
+            self.log_info(format!("typecheck reported an error: {err}"))
                 .await;
         }
     }
