@@ -597,8 +597,9 @@ impl LanguageServer for Backend {
     }
 
     async fn did_save(&self, params: lsp::DidSaveTextDocumentParams) {
-        let Some(workspace) =
-            self.resolve_workspace(&params.text_document.uri).await else { return };
+        let Some(workspace) = self.resolve_workspace(&params.text_document.uri).await else {
+            return;
+        };
 
         if let Err(err) = self.typecheck_workspace(&workspace).await {
             self.log_info(format!("typecheck reported an error: {err}"))

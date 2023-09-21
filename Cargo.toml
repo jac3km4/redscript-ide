@@ -14,18 +14,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dashmap = "5"
 ropey = "1"
-toml = "0.7"
+toml = "0.8"
 
 [dependencies.redscript]
 git = "https://github.com/jac3km4/redscript"
 package = "redscript"
 features = ["arc"]
-rev = "2aff597"
+rev = "0c64ff2"
 
 [dependencies.redscript-compiler]
 git = "https://github.com/jac3km4/redscript"
 package = "redscript-compiler"
-rev = "2aff597"
+rev = "0c64ff2"
 
 [workspace.metadata.release]
 pre-release-commit-message = "chore: release {{version}}"
