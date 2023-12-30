@@ -183,15 +183,15 @@ impl Backend {
             match CompilationUnit::new_with_defaults(&mut compiled_pool)?
                 .typecheck_files(&files, false, false)
             {
-                Ok((_, diagnostics)) => {
+                Ok(output) => {
                     let state = ServerState { compiled_pool };
                     *self.state.write().await = Some(state);
 
-                    self.publish_diagnostics(diagnostics, &files).await;
+                    self.publish_diagnostics(output.diagnostics(), &files).await;
                 }
                 Err(err) => {
                     let diagnostic = Diagnostic::from_error(err)?;
-                    self.publish_diagnostics(vec![diagnostic], &files).await;
+                    self.publish_diagnostics(&[diagnostic], &files).await;
                 }
             }
         } else {
@@ -257,16 +257,17 @@ impl Backend {
         // TODO: avoid copying the string
         match parser::parse_str(&copy.to_string()) {
             Ok(module) => {
-                let (functions, _) = CompilationUnit::new_with_defaults(&mut pool)?.typecheck(
+                let output = CompilationUnit::new_with_defaults(&mut pool)?.typecheck(
                     vec![module],
                     &Files::default(),
                     false,
                     true,
                 )?;
-                if let Some((expr, scope)) = functions
+                if let Some((expr, scope)) = output
+                    .functions()
                     .binary_search_by(|fun| fun.span.compare_pos(needle))
                     .ok()
-                    .and_then(|idx| functions.get(idx))
+                    .and_then(|idx| output.functions().get(idx))
                     .and_then(|fun| {
                         util::find_in_seq(&fun.code.exprs, needle).map(|expr| (expr, &fun.scope))
                     })
@@ -386,12 +387,16 @@ impl Backend {
         Ok(matched.flatten())
     }
 
-    async fn publish_diagnostics(&self, diagnostics: Vec<Diagnostic>, files: &Files) {
+    async fn publish_diagnostics<'a, I>(&self, diagnostics: I, files: &Files)
+    where
+        I: IntoIterator,
+        I::IntoIter: ExactSizeIterator<Item = &'a Diagnostic>,
+    {
+        let diagnostics = diagnostics.into_iter();
         let mut messages: HashMap<PathBuf, Vec<lsp::Diagnostic>> =
             HashMap::with_capacity(diagnostics.len());
 
         for diagnostic in diagnostics {
-            let msg = diagnostic.to_string();
             let severity = if diagnostic.is_fatal() {
                 lsp::DiagnosticSeverity::ERROR
             } else {
@@ -404,6 +409,7 @@ impl Backend {
                 lsp::Position::new(loc.end.line as u32, loc.end.col as u32),
             );
             let source = Some("redscript".to_owned());
+            let msg = diagnostic.to_string();
             let diagnostic =
                 lsp::Diagnostic::new(range, Some(severity), None, source, msg, None, None);
             match messages.entry(loc.file.path().to_owned()) {
