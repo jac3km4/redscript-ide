@@ -19,7 +19,7 @@ pub enum Error {
     #[error("redscript cache file not found at {0}, the extension is configured incorrectly")]
     RedscriptCacheNotFound(PathBuf),
     #[error("parsing the .redscript file at {0} failed")]
-    DotRedscriptParseError(toml::de::Error),
+    DotRedscriptParseFailure(toml::de::Error),
     #[error("attempted to access the server while it was not initialized")]
     ServerNotInitialized,
     #[error("unexpected error: {0}")]

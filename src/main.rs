@@ -10,18 +10,21 @@ use error::Error;
 use lspower::{jsonrpc, lsp, Client, LanguageServer, LspService, Server};
 use redscript::ast::{Expr, TypeName};
 use redscript::bundle::{ConstantPool, PoolIndex, ScriptBundle};
-use redscript::definition::{Class, Enum};
+use redscript::definition::{Class, Enum, Function};
 use redscript_compiler::diagnostics::Diagnostic;
 use redscript_compiler::parser;
 use redscript_compiler::scope::{Reference, TypeId};
 use redscript_compiler::source_map::{Files, SourceFilter};
-use redscript_compiler::typechecker::{type_of, Callable, TypedAst};
-use redscript_compiler::unit::CompilationUnit;
+use redscript_compiler::symbol::Symbol;
+use redscript_compiler::typechecker::{type_of, Callable, Member, TypedAst};
+use redscript_compiler::unit::{CompilationUnit, TypecheckOutput};
 use serde::Deserialize;
+use source_links::SourceLinks;
 use tokio::sync::{OnceCell, RwLock};
 
 mod buffers;
 mod error;
+mod source_links;
 mod util;
 
 const DOT_REDSCRIPT: &str = ".redscript-ide";
@@ -33,6 +36,7 @@ async fn main() {
 
     let (service, messages) = LspService::new(|client| Backend {
         client,
+        config: OnceCell::new(),
         state: RwLock::new(None),
         pool: OnceCell::new(),
         workspace_path: OnceCell::new(),
@@ -57,7 +61,7 @@ impl DotRedscript {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(Error::Other(err.into())),
         };
-        toml::from_str(&contents).map_err(Error::DotRedscriptParseError)
+        toml::from_str(&contents).map_err(Error::DotRedscriptParseFailure)
     }
 }
 
@@ -79,6 +83,7 @@ impl From<(Option<PathBuf>, Option<PathBuf>)> for Config {
 
 struct Backend {
     client: Client,
+    config: OnceCell<Config>,
     pool: OnceCell<ConstantPool>,
     workspace_path: OnceCell<PathBuf>,
     state: RwLock<Option<ServerState>>,
@@ -87,6 +92,16 @@ struct Backend {
 
 struct ServerState {
     compiled_pool: ConstantPool,
+    source_links: SourceLinks,
+}
+
+impl ServerState {
+    pub fn new(compiled_pool: ConstantPool, files: &Files, output: &TypecheckOutput) -> Self {
+        Self {
+            source_links: SourceLinks::new(&compiled_pool, output, files),
+            compiled_pool,
+        }
+    }
 }
 
 impl Backend {
@@ -120,33 +135,42 @@ impl Backend {
     }
 
     async fn post_initialize(&self) -> Result<(), Error> {
-        let conf = self.get_configuration().await?;
-        let path = conf.script_cache_path.map(Ok).unwrap_or_else(|| {
-            conf.game_dir
-                .ok_or(Error::MissingConfiguration)
-                .and_then(|dir| {
-                    let default_bk = dir
-                        .join("r6")
-                        .join("cache")
-                        .join("modded")
-                        .join("final.redscripts.bk");
-                    default_bk
-                        .exists()
-                        .then_some(default_bk)
-                        .or_else(|| {
-                            let fallback = dir.join("r6").join("cache").join("final.redscripts.bk");
-                            fallback.exists().then_some(fallback)
-                        })
-                        .or_else(|| {
-                            let fallback = dir.join("r6").join("cache").join("final.redscripts");
-                            fallback.exists().then_some(fallback)
-                        })
-                        .ok_or_else(|| Error::RedscriptCacheNotFound(dir))
-                })
-        })?;
+        let config = self.get_configuration().await?;
+        let path = config
+            .script_cache_path
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| {
+                config
+                    .game_dir
+                    .as_ref()
+                    .ok_or(Error::MissingConfiguration)
+                    .and_then(|dir| {
+                        let default_bk = dir
+                            .join("r6")
+                            .join("cache")
+                            .join("modded")
+                            .join("final.redscripts.bk");
+                        default_bk
+                            .exists()
+                            .then_some(default_bk)
+                            .or_else(|| {
+                                let fallback =
+                                    dir.join("r6").join("cache").join("final.redscripts.bk");
+                                fallback.exists().then_some(fallback)
+                            })
+                            .or_else(|| {
+                                let fallback =
+                                    dir.join("r6").join("cache").join("final.redscripts");
+                                fallback.exists().then_some(fallback)
+                            })
+                            .ok_or_else(|| Error::RedscriptCacheNotFound(dir.to_owned()))
+                    })
+            })?;
 
         let bundle = ScriptBundle::load(&mut File::open(path)?)?;
         self.pool.set(bundle.pool).unwrap();
+        self.config.set(config).unwrap();
 
         if let Some(path) = self.workspace_path.get() {
             if let Err(err) = self.typecheck_workspace(path).await {
@@ -184,7 +208,7 @@ impl Backend {
                 .typecheck_files(&files, false, false)
             {
                 Ok(output) => {
-                    let state = ServerState { compiled_pool };
+                    let state = ServerState::new(compiled_pool, &files, &output);
                     *self.state.write().await = Some(state);
 
                     self.publish_diagnostics(output.diagnostics(), &files).await;
@@ -513,6 +537,92 @@ impl Backend {
         Ok(completions)
     }
 
+    async fn goto_definition(
+        &self,
+        params: lsp::GotoDefinitionParams,
+    ) -> jsonrpc::Result<Option<lsp::GotoDefinitionResponse>> {
+        fn try_create_redmod_link(
+            idx: PoolIndex<Function>,
+            pool: &ConstantPool,
+            config: &Config,
+        ) -> Option<lsp::GotoDefinitionResponse> {
+            let source = pool.function(idx).ok()?.source.as_ref()?;
+            if source.file == PoolIndex::DEFAULT_SOURCE {
+                return None;
+            };
+            let file = pool.definition(source.file).ok()?.value.as_source_file()?;
+            let path = config
+                .game_dir
+                .as_ref()?
+                .join("tools")
+                .join("redmod")
+                .join("scripts")
+                .join(&file.path);
+            if path.exists() {
+                Some(create_response(&path, source.line))
+            } else {
+                None
+            }
+        }
+
+        fn create_response(path: &Path, line: u32) -> lsp::GotoDefinitionResponse {
+            lsp::GotoDefinitionResponse::Scalar(lsp::Location {
+                uri: lsp::Url::from_file_path(path).unwrap(),
+                range: lsp::Range::new(lsp::Position::new(line, 0), lsp::Position::new(line, 0)),
+            })
+        }
+
+        let state = self.state.read().await;
+        let Some(state) = state.as_ref() else {
+            return Ok(None);
+        };
+
+        let matched = self
+            .expr_at_location(
+                params.text_document_position_params,
+                false,
+                |expr, _, pool| {
+                    let idx = match expr {
+                        Expr::Ident(Reference::Symbol(sym), _) => match sym {
+                            Symbol::Class(idx, _) | Symbol::Struct(idx, _) => idx.cast(),
+                            Symbol::Enum(idx) => idx.cast(),
+                            Symbol::Functions(_) => return Ok(None),
+                        },
+                        &Expr::Call(Callable::Function(idx), _, _, _)
+                        | &Expr::MethodCall(_, idx, _, _) => {
+                            if let Some(resp) = self
+                                .config
+                                .get()
+                                .and_then(|conf| try_create_redmod_link(idx, pool, conf))
+                            {
+                                return Ok(Some(resp));
+                            };
+                            idx.cast()
+                        }
+                        Expr::New(typ, _, _) => match typ {
+                            TypeId::Class(idx) | TypeId::Struct(idx) => idx.cast(),
+                            _ => return Ok(None),
+                        },
+                        Expr::Member(_, Member::ClassField(idx) | Member::StructField(idx), _) => {
+                            idx.cast()
+                        }
+                        Expr::Member(_, Member::EnumMember(idx, _), _) => idx.cast(),
+                        _ => return Ok(None),
+                    };
+                    let Some(item) = state
+                        .source_links
+                        .get_link_key(idx, pool)
+                        .and_then(|key| state.source_links.get(key))
+                    else {
+                        return Ok(None);
+                    };
+                    Ok(Some(create_response(item.path(), item.line() as u32)))
+                },
+            )
+            .await?;
+        Ok(matched.flatten())
+    }
+
     async fn get_cloned_pool(&self) -> Result<ConstantPool, Error> {
         let guard = self.state.read().await;
         let state = guard.as_ref().ok_or(Error::ServerNotInitialized)?;
@@ -570,6 +680,7 @@ impl LanguageServer for Backend {
             )),
             completion_provider: Some(completion),
             hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+            definition_provider: Some(lsp::OneOf::Left(true)),
             ..lsp::ServerCapabilities::default()
         };
 
@@ -629,5 +740,12 @@ impl LanguageServer for Backend {
 
     async fn hover(&self, params: lsp::HoverParams) -> jsonrpc::Result<Option<lsp::Hover>> {
         Ok(self.hover(params).await?)
+    }
+
+    async fn goto_definition(
+        &self,
+        params: lsp::GotoDefinitionParams,
+    ) -> jsonrpc::Result<Option<lsp::GotoDefinitionResponse>> {
+        self.goto_definition(params).await
     }
 }

@@ -352,6 +352,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "intaglio"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa3eb1c7e05b0f9ddc99a1e9f186a434fa0bfd0087d6369acf5f2814731ab610"
+
+[[package]]
 name = "itertools"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -706,6 +712,7 @@ name = "redscript-ide"
 version = "0.1.6"
 dependencies = [
  "dashmap 5.5.3",
+ "intaglio",
  "log",
  "lspower",
  "redscript",
