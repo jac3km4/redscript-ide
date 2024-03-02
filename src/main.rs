@@ -18,6 +18,7 @@ use redscript_compiler::source_map::{Files, SourceFilter};
 use redscript_compiler::symbol::Symbol;
 use redscript_compiler::typechecker::{type_of, Callable, Member, TypedAst};
 use redscript_compiler::unit::{CompilationUnit, TypecheckOutput};
+use redscript_formatter::{FormatSettings, Formattable};
 use serde::Deserialize;
 use source_links::SourceLinks;
 use tokio::sync::{OnceCell, RwLock};
@@ -540,7 +541,7 @@ impl Backend {
     async fn goto_definition(
         &self,
         params: lsp::GotoDefinitionParams,
-    ) -> jsonrpc::Result<Option<lsp::GotoDefinitionResponse>> {
+    ) -> Result<Option<lsp::GotoDefinitionResponse>, Error> {
         fn try_create_redmod_link(
             idx: PoolIndex<Function>,
             pool: &ConstantPool,
@@ -623,6 +624,47 @@ impl Backend {
         Ok(matched.flatten())
     }
 
+    async fn format(
+        &self,
+        params: lsp::DocumentFormattingParams,
+    ) -> Result<Option<Vec<lsp::TextEdit>>, Error> {
+        let uri = params.text_document.uri;
+        let buf = self.buffers.get(&uri).expect("no buffer found for URI");
+        let path = uri.to_file_path().map_err(|_| Error::NonFileUri)?;
+        let contents = buf.contents();
+        let mut map = redscript_ast::SourceMap::new();
+        let id = map.add(path, contents.to_string());
+
+        let (module, errors) = redscript_parser::parse_module(map.get(id).unwrap().source(), id);
+        if let (Some(module), []) = (module, &errors[..]) {
+            let settings = FormatSettings {
+                indent: params.options.tab_size as u16,
+                ..Default::default()
+            };
+            let last_line = contents.len_lines() - 1;
+            let edit = lsp::TextEdit::new(
+                lsp::Range::new(
+                    lsp::Position::new(0, 0),
+                    lsp::Position::new(
+                        last_line as u32,
+                        contents.chars_at(contents.line_to_char(last_line)).count() as u32,
+                    ),
+                ),
+                module.display(&settings).to_string(),
+            );
+            return Ok(Some(vec![edit]));
+        };
+
+        let mut msg = String::new();
+        for err in errors {
+            writeln!(msg, "{}", err.pretty(&map)).unwrap();
+        }
+        self.spawn_error_popup(format!("formatting failed:\n{msg}"))
+            .await;
+
+        Ok(None)
+    }
+
     async fn get_cloned_pool(&self) -> Result<ConstantPool, Error> {
         let guard = self.state.read().await;
         let state = guard.as_ref().ok_or(Error::ServerNotInitialized)?;
@@ -681,6 +723,7 @@ impl LanguageServer for Backend {
             completion_provider: Some(completion),
             hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
             definition_provider: Some(lsp::OneOf::Left(true)),
+            document_formatting_provider: Some(lsp::OneOf::Left(true)),
             ..lsp::ServerCapabilities::default()
         };
 
@@ -746,6 +789,13 @@ impl LanguageServer for Backend {
         &self,
         params: lsp::GotoDefinitionParams,
     ) -> jsonrpc::Result<Option<lsp::GotoDefinitionResponse>> {
-        self.goto_definition(params).await
+        Ok(self.goto_definition(params).await?)
+    }
+
+    async fn formatting(
+        &self,
+        params: lsp::DocumentFormattingParams,
+    ) -> jsonrpc::Result<Option<Vec<lsp::TextEdit>>> {
+        Ok(self.format(params).await?)
     }
 }

@@ -27,6 +27,18 @@ rev = "19c42a2"
 git = "https://github.com/jac3km4/redscript"
 rev = "19c42a2"
 
+[dependencies.redscript-ast]
+git = "https://github.com/jac3km4/redscript-syntax"
+rev = "024e95f"
+
+[dependencies.redscript-parser]
+git = "https://github.com/jac3km4/redscript-syntax"
+rev = "024e95f"
+
+[dependencies.redscript-formatter]
+git = "https://github.com/jac3km4/redscript-syntax"
+rev = "024e95f"
+
 [lints.rust]
 warnings = "deny"
 future-incompatible = "deny"
@@ -60,4 +72,5 @@ pre-release-commit-message = "chore: release {{version}}"
 publish = false
 
 [profile.release]
-lto = "thin"
+lto = true
+codegen-units = 1
