@@ -21,7 +21,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: redscript-ide
+          shared-key: release
       - run: cargo build --release
       - env:
           GH_TOKEN: ${{ github.token }}
