@@ -1,6 +1,6 @@
 [package]
 name = "redscript-ide"
-version = "0.1.14"
+version = "0.1.15"
 rust-version = "1.75"
 edition = "2021"
 license = "MIT"
