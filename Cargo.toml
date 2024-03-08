@@ -21,23 +21,23 @@ intaglio = { version = "1", features = ["path"] }
 git = "https://github.com/jac3km4/redscript"
 default-features = false
 features = ["arc"]
-rev = "19c42a2"
+rev = "568650f"
 
 [dependencies.redscript-compiler]
 git = "https://github.com/jac3km4/redscript"
-rev = "19c42a2"
+rev = "568650f"
 
 [dependencies.redscript-ast]
 git = "https://github.com/jac3km4/redscript-syntax"
-rev = "37c8e8a"
+rev = "2671344"
 
 [dependencies.redscript-parser]
 git = "https://github.com/jac3km4/redscript-syntax"
-rev = "37c8e8a"
+rev = "2671344"
 
 [dependencies.redscript-formatter]
 git = "https://github.com/jac3km4/redscript-syntax"
-rev = "37c8e8a"
+rev = "2671344"
 
 [lints.rust]
 warnings = "deny"
