@@ -24,14 +24,32 @@ jobs:
 
   build:
     name: Build an artifact
-    runs-on: windows-latest
+    strategy:
+      matrix:
+        os:
+          - windows-latest
+          - macos-14
+          - macos-latest
+          - ubuntu-latest
+        key:
+          - release
+          - release-apple-silicon
+          - release-apple-intel
+          - release-ubuntu
+        artifact:
+          - artifact
+          - artifact-apple-silicon
+          - artifact-apple-intel
+          - release-ubuntu
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release
+          shared-key: ${{ matrix.key }}
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
           path: target/release/redscript-ide.exe
+          name: ${{ matrix.artifact }}
