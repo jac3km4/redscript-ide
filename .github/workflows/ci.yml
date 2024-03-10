@@ -35,16 +35,16 @@ jobs:
         include:
           - os: windows-latest
             name: Windows
-            artifact: redscript-ide.exe
+            triplet: x86_64-pc-windows-msvc
           - os: macos-14
             name: MacOS Silicon
-            artifact: redscript-ide-macos-silicon
+            triplet: aarch64-apple-darwin
           - os: macos-latest
             name: MacOS Intel
-            artifact: redscript-ide-macos-intel
+            triplet: x86_64-apple-darwin
           - os: ubuntu-latest
             name: Linux
-            artifact: redscript-ide-linux
+            triplet: x86_64-unknown-linux-gnu
     with:
       os: ${{ matrix.os }}
-      artifact: ${{ matrix.artifact }}
+      triplet: ${{ matrix.triplet }}
