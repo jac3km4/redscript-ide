@@ -24,3 +24,4 @@ jobs:
         with:
           path: target/release/${{ inputs.artifact }}
           name: artifact-${{ inputs.os }}
+          if-no-files-found: error
