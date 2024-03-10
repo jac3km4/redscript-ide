@@ -23,7 +23,8 @@ jobs:
       - run: cargo clippy -- -Dwarnings
 
   build:
-    name: Build an artifact
+    name: Build and upload an artifact for ${{ matrix.name }}
+    uses: ./.github/workflows/build.yml
     strategy:
       matrix:
         os:
@@ -31,25 +32,19 @@ jobs:
           - macos-14
           - macos-latest
           - ubuntu-latest
-        key:
-          - release
-          - release-apple-silicon
-          - release-apple-intel
-          - release-ubuntu
-        artifact:
-          - artifact
-          - artifact-apple-silicon
-          - artifact-apple-intel
-          - release-ubuntu
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ${{ matrix.key }}
-      - run: cargo build --release
-      - uses: actions/upload-artifact@v4
-        with:
-          path: target/release/redscript-ide.exe
-          name: ${{ matrix.artifact }}
+        include:
+          - os: windows-latest
+            name: Windows
+            artifact: redscript-ide.exe
+          - os: macos-14
+            name: MacOS Silicon
+            artifact: redscript-ide-macos-silicon
+          - os: macos-latest
+            name: MacOS Intel
+            artifact: redscript-ide-macos-intel
+          - os: ubuntu-latest
+            name: Linux
+            artifact: redscript-ide-linux
+    with:
+      os: ${{ matrix.os }}
+      artifact: ${{ matrix.artifact }}

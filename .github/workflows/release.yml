@@ -11,18 +11,42 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse # New format as of 2023-03-09
 
 jobs:
+  prepare:
+    name: Build and upload a release artifact for ${{ matrix.name }}
+    uses: ./.github/workflows/build.yml
+    strategy:
+      matrix:
+        os:
+          - windows-latest
+          - macos-14
+          - macos-latest
+          - ubuntu-latest
+        include:
+          - os: windows-latest
+            name: Windows
+            artifact: redscript-ide.exe
+          - os: macos-14
+            name: MacOS Silicon
+            artifact: redscript-ide-macos-silicon
+          - os: macos-latest
+            name: MacOS Intel
+            artifact: redscript-ide-macos-intel
+          - os: ubuntu-latest
+            name: Linux
+            artifact: redscript-ide-linux
+    with:
+      os: ${{ matrix.os }}
+      artifact: ${{ matrix.artifact }}
   publish:
-    name: Build, release, and upload artifacts
+    name: Release artifacts
     runs-on: windows-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
         with:
-          shared-key: release
-      - run: cargo build --release
+          path: binaries
+          merge-multiple: true
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create ${{  github.ref_name }} --generate-notes $(Resolve-Path -Relative -Path ./target/release/redscript-ide.exe)
+        run: gh release create ${{  github.ref_name }} --generate-notes $(Resolve-Path -Relative -Path ./binaries/*)
