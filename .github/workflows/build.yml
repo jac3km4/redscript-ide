@@ -19,11 +19,18 @@ jobs:
       - run: cargo build --release
       - name: Rename binary to differentiate between OS
         if: ${{ inputs.os == 'windows-latest' }}
-        run: Rename-Item -Path ./target/release/redscript-ide.exe -NewName ./target/release/redscript-ide-${{ inputs.triplet }}
+        run: Rename-Item -Path ./target/release/redscript-ide.exe -NewName ./target/release/redscript-ide-${{ inputs.triplet }}.exe
       - name: Rename binary to differentiate between OS
         if: ${{ inputs.os != 'windows-latest' }}
         run: mv ./target/release/redscript-ide ./target/release/redscript-ide-${{ inputs.triplet }}
       - uses: actions/upload-artifact@v4
+        if: ${{ inputs.os == 'windows-latest' }}
+        with:
+          path: target/release/redscript-ide-${{ inputs.triplet }}.exe
+          name: artifact-${{ inputs.os }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.os != 'windows-latest' }}
         with:
           path: target/release/redscript-ide-${{ inputs.triplet }}
           name: artifact-${{ inputs.os }}
