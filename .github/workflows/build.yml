@@ -18,7 +18,7 @@ jobs:
           shared-key: release-${{ inputs.os }}
       - run: cargo build --release
       - name: Rename binary to differentiate between OS
-        if: ${{ inputs.artifact != 'windows-latest'}}
+        if: ${{ inputs.os != 'windows-latest' }}
         run: mv ./target/release/redscript-ide ${{ inputs.artifact }}
       - uses: actions/upload-artifact@v4
         with:
