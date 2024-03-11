@@ -19,7 +19,7 @@ jobs:
       - run: cargo build --release
       - name: Rename binary to differentiate between OS
         if: ${{ inputs.os == 'windows-latest' }}
-        run: Rename-Item -Path ./target/release/redscript-ide.exe ./target/release/redscript-ide-${{ inputs.triplet }}.exe
+        run: Rename-Item -Path .\target\release\redscript-ide.exe -NewName redscript-ide-${{ inputs.triplet }}.exe
       - name: Rename binary to differentiate between OS
         if: ${{ inputs.os != 'windows-latest' }}
         run: mv ./target/release/redscript-ide ./target/release/redscript-ide-${{ inputs.triplet }}
