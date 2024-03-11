@@ -1,0 +1,39 @@
+on:
+  workflow_call:
+    inputs:
+      os:
+        required: true
+        type: string
+      triplet:
+        required: true
+        type: string
+jobs:
+  build:
+    runs-on: ${{ inputs.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ inputs.os }}
+      - run: cargo build --release
+      - name: Rename Windows binary to differentiate between OS
+        if: ${{ inputs.os == 'windows-latest' }}
+        run: Rename-Item -Path .\target\release\redscript-ide.exe -NewName redscript-ide-${{ inputs.triplet }}.exe
+      - name: Rename non-Windows binary to differentiate between OS
+        if: ${{ inputs.os != 'windows-latest' }}
+        run: mv ./target/release/redscript-ide ./target/release/redscript-ide-${{ inputs.triplet }}
+      - uses: actions/upload-artifact@v4
+        name: Upload Windows artifact
+        if: ${{ inputs.os == 'windows-latest' }}
+        with:
+          path: target/release/redscript-ide-${{ inputs.triplet }}.exe
+          name: artifact-${{ inputs.os }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        name: Upload non-Windows artifact
+        if: ${{ inputs.os != 'windows-latest' }}
+        with:
+          path: target/release/redscript-ide-${{ inputs.triplet }}
+          name: artifact-${{ inputs.os }}
+          if-no-files-found: error

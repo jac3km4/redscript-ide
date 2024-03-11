@@ -15,7 +15,7 @@ jobs:
     name: Run clippy
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -23,15 +23,28 @@ jobs:
       - run: cargo clippy -- -Dwarnings
 
   build:
-    name: Build an artifact
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release
-      - run: cargo build --release
-      - uses: actions/upload-artifact@v3
-        with:
-          path: target/release/redscript-ide.exe
+    name: Build and upload an artifact for ${{ matrix.name }}
+    uses: ./.github/workflows/build.yml
+    strategy:
+      matrix:
+        os:
+          - windows-latest
+          - macos-14
+          - macos-latest
+          - ubuntu-latest
+        include:
+          - os: windows-latest
+            name: Windows
+            triplet: x86_64-pc-windows-msvc
+          - os: macos-14
+            name: MacOS Silicon
+            triplet: aarch64-apple-darwin
+          - os: macos-latest
+            name: MacOS Intel
+            triplet: x86_64-apple-darwin
+          - os: ubuntu-latest
+            name: Linux
+            triplet: x86_64-unknown-linux-gnu
+    with:
+      os: ${{ matrix.os }}
+      triplet: ${{ matrix.triplet }}
