@@ -13,7 +13,7 @@ env:
 jobs:
   prepare:
     name: Build and upload a release artifact for ${{ matrix.name }}
-    uses: ./.github/workflows/build.yml
+    uses: ./.github/workflows/shared/build.yml
     strategy:
       matrix:
         os:
@@ -39,14 +39,11 @@ jobs:
       triplet: ${{ matrix.triplet }}
   publish:
     name: Release artifacts
+    needs: prepare
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: NathanFirmo/wait-for-other-job@v1.1.1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          job: prepare
       - uses: actions/download-artifact@v4
         with:
           path: binaries
