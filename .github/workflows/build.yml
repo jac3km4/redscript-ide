@@ -17,17 +17,14 @@ jobs:
         with:
           shared-key: release-${{ inputs.os }}
       - run: cargo build --release
-      - name: Rename Windows binary to differentiate between OS
-        if: ${{ inputs.os == 'windows-latest' }}
-        run: Rename-Item -Path .\target\release\redscript-ide.exe -NewName redscript-ide-${{ inputs.triplet }}.exe
-      - name: Rename non-Windows binary to differentiate between OS
+      - name: Append system triplet to binary name
         if: ${{ inputs.os != 'windows-latest' }}
         run: mv ./target/release/redscript-ide ./target/release/redscript-ide-${{ inputs.triplet }}
       - uses: actions/upload-artifact@v4
         name: Upload Windows artifact
         if: ${{ inputs.os == 'windows-latest' }}
         with:
-          path: target/release/redscript-ide-${{ inputs.triplet }}.exe
+          path: target/release/redscript-ide.exe
           name: artifact-${{ inputs.os }}
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
