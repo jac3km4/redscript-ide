@@ -29,15 +29,15 @@ rev = "v0.5.19"
 
 [dependencies.redscript-ast]
 git = "https://github.com/jac3km4/redscript-syntax"
-rev = "682c13a"
+rev = "c501cbc"
 
 [dependencies.redscript-parser]
 git = "https://github.com/jac3km4/redscript-syntax"
-rev = "682c13a"
+rev = "c501cbc"
 
 [dependencies.redscript-formatter]
 git = "https://github.com/jac3km4/redscript-syntax"
-rev = "682c13a"
+rev = "c501cbc"
 
 [lints.rust]
 warnings = "deny"
