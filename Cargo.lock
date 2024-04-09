@@ -745,7 +745,7 @@ dependencies = [
 [[package]]
 name = "redscript-ast"
 version = "0.1.0"
-source = "git+https://github.com/jac3km4/redscript-syntax?rev=c501cbc#c501cbc040ed2be582df3405fd890e24d547121c"
+source = "git+https://github.com/jac3km4/redscript-syntax?rev=8e223a7#8e223a780114a807c0efe267411c829416c22935"
 dependencies = [
  "bitflags 2.5.0",
  "chumsky",
@@ -774,7 +774,7 @@ dependencies = [
 [[package]]
 name = "redscript-formatter"
 version = "0.1.0"
-source = "git+https://github.com/jac3km4/redscript-syntax?rev=c501cbc#c501cbc040ed2be582df3405fd890e24d547121c"
+source = "git+https://github.com/jac3km4/redscript-syntax?rev=8e223a7#8e223a780114a807c0efe267411c829416c22935"
 dependencies = [
  "pretty_dtoa",
  "redscript-ast",
@@ -804,7 +804,7 @@ dependencies = [
 [[package]]
 name = "redscript-parser"
 version = "0.1.0"
-source = "git+https://github.com/jac3km4/redscript-syntax?rev=c501cbc#c501cbc040ed2be582df3405fd890e24d547121c"
+source = "git+https://github.com/jac3km4/redscript-syntax?rev=8e223a7#8e223a780114a807c0efe267411c829416c22935"
 dependencies = [
  "chumsky",
  "redscript-ast",
