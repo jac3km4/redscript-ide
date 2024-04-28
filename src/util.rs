@@ -3,11 +3,12 @@ use std::fmt::Write;
 use redscript::ast::{Expr, Ident, Pos, TypeName};
 use redscript::bundle::{ConstantPool, PoolIndex};
 use redscript::definition::Function;
+use redscript_compiler::scope::{Reference, Value};
 use redscript_compiler::typechecker::TypedAst;
 
 use crate::error::Error;
 
-pub fn find_in_seq(haystack: &[Expr<TypedAst>], needle: Pos) -> Option<&Expr<TypedAst>> {
+pub fn find_in_seq(haystack: &[Expr<TypedAst>], needle: Pos) -> Option<CowExpr<'_>> {
     let index = haystack
         .binary_search_by(|expr| expr.span().compare_pos(needle))
         .ok()?;
@@ -15,7 +16,7 @@ pub fn find_in_seq(haystack: &[Expr<TypedAst>], needle: Pos) -> Option<&Expr<Typ
     find_in_expr(expr, needle)
 }
 
-pub fn find_in_expr(haystack: &Expr<TypedAst>, needle: Pos) -> Option<&Expr<TypedAst>> {
+pub fn find_in_expr(haystack: &Expr<TypedAst>, needle: Pos) -> Option<CowExpr<'_>> {
     if haystack.span().contains(needle) {
         let res = match haystack {
             Expr::ArrayLit(exprs, _, _) => find_in_seq(exprs, needle),
@@ -26,8 +27,17 @@ pub fn find_in_expr(haystack: &Expr<TypedAst>, needle: Pos) -> Option<&Expr<Type
                 find_in_expr(expr, needle).or_else(|| find_in_expr(index, needle))
             }
             Expr::Call(_, _, args, _) | Expr::New(_, args, _) => find_in_seq(args, needle),
-            Expr::Declare(_, _, Some(expr), _)
-            | Expr::Cast(_, expr, _)
+            Expr::Declare(_, _, Some(expr), _) if expr.span().contains(needle) => {
+                find_in_expr(expr, needle)
+            }
+            // treat declarations as references
+            &Expr::Declare(name, _, _, span) => {
+                return Some(CowExpr::Owned(Expr::Ident(
+                    Reference::Value(Value::Local(name)),
+                    span,
+                )))
+            }
+            Expr::Cast(_, expr, _)
             | Expr::Assign(_, expr, _)
             | Expr::Member(expr, _, _)
             | Expr::Return(Some(expr), _)
@@ -63,9 +73,9 @@ pub fn find_in_expr(haystack: &Expr<TypedAst>, needle: Pos) -> Option<&Expr<Type
             Expr::BinOp(lhs, rhs, _, _) => {
                 find_in_expr(lhs, needle).or_else(|| find_in_expr(rhs, needle))
             }
-            _ => Some(haystack),
+            _ => Some(CowExpr::Borrowed(haystack)),
         };
-        res.or(Some(haystack))
+        res.or(Some(CowExpr::Borrowed(haystack)))
     } else {
         None
     }
@@ -102,4 +112,19 @@ pub fn render_function(
     };
 
     Ok(format!("{}({}) -> {}", pretty_name, args, ret_type))
+}
+
+#[derive(Debug)]
+pub enum CowExpr<'a> {
+    Owned(Expr<TypedAst>),
+    Borrowed(&'a Expr<TypedAst>),
+}
+
+impl AsRef<Expr<TypedAst>> for CowExpr<'_> {
+    fn as_ref(&self) -> &Expr<TypedAst> {
+        match self {
+            CowExpr::Owned(expr) => expr,
+            CowExpr::Borrowed(expr) => expr,
+        }
+    }
 }

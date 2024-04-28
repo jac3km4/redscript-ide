@@ -297,8 +297,8 @@ impl Backend {
                         util::find_in_seq(&fun.code.exprs, needle).map(|expr| (expr, &fun.scope))
                     })
                 {
-                    let typ = type_of(expr, scope, &pool)?;
-                    return Ok(Some(on_expr(expr, typ, &pool)?));
+                    let typ = type_of(expr.as_ref(), scope, &pool)?;
+                    return Ok(Some(on_expr(expr.as_ref(), typ, &pool)?));
                 }
             }
             Err(err) => {
