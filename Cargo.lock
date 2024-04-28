@@ -132,9 +132,9 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
 name = "chumsky"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9c28d4e5dd9a9262a38b231153591da6ce1471b818233f4727985d3dd0ed93c"
+checksum = "c7b80276986f86789dc56ca6542d53bba9cda3c66091ebbe7bd96fc1bdf20f1f"
 dependencies = [
  "hashbrown",
  "regex-automata",
@@ -728,7 +728,7 @@ dependencies = [
 [[package]]
 name = "redscript"
 version = "0.5.19"
-source = "git+https://github.com/jac3km4/redscript?rev=v0.5.19#fbdc1492b80a73ba5a4b4de372b012ab0ce6f589"
+source = "git+https://github.com/jac3km4/redscript?rev=c4fae7b#c4fae7b2ab93bfe422f63039fd61766482b1853b"
 dependencies = [
  "byteorder",
  "crc32fast",
@@ -745,7 +745,7 @@ dependencies = [
 [[package]]
 name = "redscript-ast"
 version = "0.1.0"
-source = "git+https://github.com/jac3km4/redscript-syntax?rev=8e223a7#8e223a780114a807c0efe267411c829416c22935"
+source = "git+https://github.com/jac3km4/redscript-syntax?rev=0c16811#0c168113be1d638952d0cef9c58dd85e47ace6a8"
 dependencies = [
  "bitflags 2.5.0",
  "chumsky",
@@ -755,7 +755,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler"
 version = "0.5.19"
-source = "git+https://github.com/jac3km4/redscript?rev=v0.5.19#fbdc1492b80a73ba5a4b4de372b012ab0ce6f589"
+source = "git+https://github.com/jac3km4/redscript?rev=c4fae7b#c4fae7b2ab93bfe422f63039fd61766482b1853b"
 dependencies = [
  "enum-as-inner",
  "flexstr",
@@ -774,7 +774,7 @@ dependencies = [
 [[package]]
 name = "redscript-formatter"
 version = "0.1.0"
-source = "git+https://github.com/jac3km4/redscript-syntax?rev=8e223a7#8e223a780114a807c0efe267411c829416c22935"
+source = "git+https://github.com/jac3km4/redscript-syntax?rev=0c16811#0c168113be1d638952d0cef9c58dd85e47ace6a8"
 dependencies = [
  "pretty_dtoa",
  "redscript-ast",
@@ -804,7 +804,7 @@ dependencies = [
 [[package]]
 name = "redscript-parser"
 version = "0.1.0"
-source = "git+https://github.com/jac3km4/redscript-syntax?rev=8e223a7#8e223a780114a807c0efe267411c829416c22935"
+source = "git+https://github.com/jac3km4/redscript-syntax?rev=0c16811#0c168113be1d638952d0cef9c58dd85e47ace6a8"
 dependencies = [
  "chumsky",
  "redscript-ast",
