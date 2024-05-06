@@ -14,7 +14,7 @@ use redscript::definition::{Class, Enum, Function};
 use redscript_compiler::diagnostics::Diagnostic;
 use redscript_compiler::parser;
 use redscript_compiler::scope::{Reference, TypeId};
-use redscript_compiler::source_map::{Files, SourceFilter};
+use redscript_compiler::source_map::Files;
 use redscript_compiler::symbol::Symbol;
 use redscript_compiler::typechecker::{type_of, Callable, Member, TypedAst};
 use redscript_compiler::unit::{CompilationUnit, TypecheckOutput};
@@ -40,7 +40,7 @@ async fn main() {
         config: OnceCell::new(),
         state: RwLock::new(None),
         pool: OnceCell::new(),
-        workspace_path: OnceCell::new(),
+        workspace_folders: RwLock::new(HashMap::new()),
         buffers: Buffers::default(),
     });
     Server::new(stdin, stdout)
@@ -86,7 +86,7 @@ struct Backend {
     client: Client,
     config: OnceCell<Config>,
     pool: OnceCell<ConstantPool>,
-    workspace_path: OnceCell<PathBuf>,
+    workspace_folders: RwLock<HashMap<PathBuf, PathBuf>>,
     state: RwLock<Option<ServerState>>,
     buffers: Buffers,
 }
@@ -109,29 +109,18 @@ impl Backend {
     const CONFIG_FIELDS: &'static [&'static str] =
         &["redscript.scriptCachePath", "redscript.gameDir"];
 
-    async fn initialize(&self, uri: Option<lsp::Url>) -> Result<(), Error> {
-        let mut path = uri
-            .ok_or(Error::NoWorkspaceOpen)?
-            .to_file_path()
-            .map_err(|_| Error::NonFileUri)?;
+    async fn add_workspace_folder(&self, dir: PathBuf) -> Result<(), Error> {
+        let dot_redscript = DotRedscript::load(&dir)?.unwrap_or_default();
+        let source_dir = dot_redscript.redscript_dir.map_or_else(
+            || dir.clone(),
+            |p| if p.is_absolute() { p } else { dir.join(p) },
+        );
+        let source_dir = match source_dir.try_exists() {
+            Ok(true) => source_dir,
+            _ => return Err(Error::InvalidRedscriptSourceDir(source_dir)),
+        };
 
-        let dot_redscript = DotRedscript::load(&path)?.unwrap_or_default();
-        if let Some(redscript_dir) = dot_redscript.redscript_dir {
-            let new_path = if redscript_dir.is_absolute() {
-                redscript_dir
-            } else {
-                path.join(redscript_dir)
-            };
-            path = new_path
-                .try_exists()
-                .map_err(|_| Error::InvalidRedscriptSourceDir(new_path.clone()))?
-                .then_some(new_path.clone())
-                .ok_or_else(|| Error::InvalidRedscriptSourceDir(new_path))?;
-        }
-        if let Err(err) = self.workspace_path.set(path) {
-            self.log_error(format!("redscript LS is being initialized twice! ({err})"))
-                .await;
-        }
+        self.workspace_folders.write().await.insert(dir, source_dir);
         Ok(())
     }
 
@@ -173,12 +162,11 @@ impl Backend {
         self.pool.set(bundle.pool).unwrap();
         self.config.set(config).unwrap();
 
-        if let Some(path) = self.workspace_path.get() {
-            if let Err(err) = self.typecheck_workspace(path).await {
-                self.log_info(format!("initial typecheck reported an error: {err}"))
-                    .await;
-            }
+        if let Err(err) = self.typecheck_workspace().await {
+            self.log_info(format!("initial typecheck reported an error: {err}"))
+                .await;
         }
+
         Ok(())
     }
 
@@ -201,10 +189,10 @@ impl Backend {
         Ok(config)
     }
 
-    async fn typecheck_workspace(&self, path: &Path) -> Result<(), Error> {
-        if let Some(mut compiled_pool) = self.pool.get().cloned() {
-            let files = Files::from_dir(path, &SourceFilter::None)?;
+    async fn typecheck_workspace(&self) -> Result<(), Error> {
+        let files = Files::from_dirs(self.workspace_folders.read().await.values())?;
 
+        if let Some(mut compiled_pool) = self.pool.get().cloned() {
             match CompilationUnit::new_with_defaults(&mut compiled_pool)?
                 .typecheck_files(&files, false, false)
             {
@@ -682,13 +670,27 @@ impl Backend {
             .await;
     }
 
-    async fn resolve_workspace(&self, url: &lsp::Url) -> Option<PathBuf> {
-        let path = url.to_file_path().ok()?;
-        let folders = self.client.workspace_folders().await.ok()??;
-        folders.iter().find_map(|folder| {
-            let folder = folder.uri.to_file_path().ok()?;
-            path.starts_with(&folder).then_some(folder)
-        })
+    async fn did_change_workspace_folders(
+        &self,
+        params: lsp::DidChangeWorkspaceFoldersParams,
+    ) -> Result<(), Error> {
+        let mut guard = self.workspace_folders.write().await;
+
+        for removed in params.event.removed {
+            let Ok(path) = removed.uri.to_file_path() else {
+                continue;
+            };
+            guard.remove(&path);
+        }
+
+        for added in params.event.added {
+            let Ok(path) = added.uri.to_file_path() else {
+                continue;
+            };
+            self.add_workspace_folder(path).await?;
+        }
+
+        Ok(())
     }
 
     async fn log_info(&self, msg: impl fmt::Display) {
@@ -706,8 +708,15 @@ impl LanguageServer for Backend {
         &self,
         params: lsp::InitializeParams,
     ) -> jsonrpc::Result<lsp::InitializeResult> {
-        if let Err(err) = self.initialize(params.root_uri).await {
-            self.spawn_error_popup(err.to_string()).await;
+        for dir in params
+            .workspace_folders
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|dir| dir.uri.to_file_path().ok())
+        {
+            if let Err(err) = self.add_workspace_folder(dir).await {
+                self.spawn_error_popup(err.to_string()).await;
+            }
         }
 
         let completion = lsp::CompletionOptions {
@@ -724,6 +733,13 @@ impl LanguageServer for Backend {
             hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
             definition_provider: Some(lsp::OneOf::Left(true)),
             document_formatting_provider: Some(lsp::OneOf::Left(true)),
+            workspace: Some(lsp::WorkspaceServerCapabilities {
+                workspace_folders: Some(lsp::WorkspaceFoldersServerCapabilities {
+                    supported: Some(true),
+                    change_notifications: Some(lsp::OneOf::Left(true)),
+                }),
+                file_operations: None,
+            }),
             ..lsp::ServerCapabilities::default()
         };
 
@@ -756,12 +772,8 @@ impl LanguageServer for Backend {
         }
     }
 
-    async fn did_save(&self, params: lsp::DidSaveTextDocumentParams) {
-        let Some(workspace) = self.resolve_workspace(&params.text_document.uri).await else {
-            return;
-        };
-
-        if let Err(err) = self.typecheck_workspace(&workspace).await {
+    async fn did_save(&self, _params: lsp::DidSaveTextDocumentParams) {
+        if let Err(err) = self.typecheck_workspace().await {
             self.log_info(format!("typecheck reported an error: {err}"))
                 .await;
         }
@@ -797,5 +809,11 @@ impl LanguageServer for Backend {
         params: lsp::DocumentFormattingParams,
     ) -> jsonrpc::Result<Option<Vec<lsp::TextEdit>>> {
         Ok(self.format(params).await?)
+    }
+
+    async fn did_change_workspace_folders(&self, params: lsp::DidChangeWorkspaceFoldersParams) {
+        if let Err(err) = self.did_change_workspace_folders(params).await {
+            self.spawn_error_popup(err.to_string()).await;
+        }
     }
 }
