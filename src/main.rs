@@ -674,13 +674,11 @@ impl Backend {
         &self,
         params: lsp::DidChangeWorkspaceFoldersParams,
     ) -> Result<(), Error> {
-        let mut guard = self.workspace_folders.write().await;
-
         for removed in params.event.removed {
             let Ok(path) = removed.uri.to_file_path() else {
                 continue;
             };
-            guard.remove(&path);
+            self.workspace_folders.write().await.remove(&path);
         }
 
         for added in params.event.added {
