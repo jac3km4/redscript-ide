@@ -10,7 +10,7 @@ use error::Error;
 use lspower::{jsonrpc, lsp, Client, LanguageServer, LspService, Server};
 use redscript::ast::{Expr, TypeName};
 use redscript::bundle::{ConstantPool, PoolIndex, ScriptBundle};
-use redscript::definition::{Class, Enum, Function};
+use redscript::definition::{Class, Enum, Function, Type};
 use redscript_compiler::diagnostics::Diagnostic;
 use redscript_compiler::parser;
 use redscript_compiler::scope::{Reference, TypeId};
@@ -306,7 +306,8 @@ impl Backend {
                 let is_static = matches!(expr, Expr::Ident(Reference::Symbol(_), _));
                 match typ.unwrapped() {
                     TypeId::Class(idx) | TypeId::Struct(idx) => {
-                        let completions = Self::class_completions(*idx, is_static, pool)?;
+                        let completions =
+                            Self::class_completions(*idx, *idx, typ, is_static, pool)?;
                         Ok(Some(lsp::CompletionResponse::Array(completions)))
                     }
                     TypeId::Enum(idx) if is_static => {
@@ -448,6 +449,8 @@ impl Backend {
 
     fn class_completions(
         idx: PoolIndex<Class>,
+        initial_idx: PoolIndex<Class>,
+        typ: TypeId,
         is_static: bool,
         pool: &ConstantPool,
     ) -> Result<Vec<lsp::CompletionItem>, Error> {
@@ -473,14 +476,41 @@ impl Backend {
 
         for idx in &class.functions {
             let fun = pool.function(*idx)?;
-            if fun.flags.is_static() != is_static {
+
+            let has_static_receiver = (|| {
+                let def = pool.definition(initial_idx).ok()?;
+                let param = fun.parameters.first()?;
+                let param = pool.parameter(*param).ok()?;
+                let res = match (&typ, pool.type_(param.type_).ok()?) {
+                    (TypeId::Ref(_), &Type::Ref(inner))
+                    | (TypeId::WeakRef(_), &Type::WeakRef(inner))
+                    | (TypeId::ScriptRef(_), &Type::ScriptRef(inner)) => {
+                        pool.definition(inner).ok()?.name == def.name
+                    }
+                    (TypeId::Struct(_), Type::Class) => {
+                        pool.definition(param.type_).ok()?.name == def.name
+                    }
+                    _ => false,
+                };
+                Some(res)
+            })()
+            .is_some_and(|test| test && fun.flags.is_static());
+
+            if (is_static || !has_static_receiver) && fun.flags.is_static() != is_static {
                 continue;
             }
             let name = pool.def_name(*idx)?;
             let pretty_name = name.split(';').next().unwrap_or(&name);
 
             let mut snippet = String::new();
-            for (i, param_idx) in fun.parameters.iter().enumerate() {
+
+            let params = if has_static_receiver {
+                &fun.parameters[1..]
+            } else {
+                &fun.parameters
+            };
+
+            for (i, param_idx) in params.iter().enumerate() {
                 let name = pool.def_name(*param_idx)?;
                 if i != 0 {
                     write!(snippet, ", ").unwrap();
@@ -501,7 +531,7 @@ impl Backend {
         }
 
         if !class.base.is_undefined() {
-            let base = Self::class_completions(class.base, is_static, pool)?;
+            let base = Self::class_completions(class.base, initial_idx, typ, is_static, pool)?;
             completions.extend(base);
         }
         Ok(completions)
