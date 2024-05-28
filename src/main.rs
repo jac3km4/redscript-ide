@@ -504,7 +504,7 @@ impl Backend {
 
             let mut snippet = String::new();
 
-            let params = if has_static_receiver {
+            let params = if has_static_receiver && !is_static {
                 &fun.parameters[1..]
             } else {
                 &fun.parameters
