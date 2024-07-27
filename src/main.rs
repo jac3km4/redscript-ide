@@ -618,10 +618,7 @@ impl Backend {
                             };
                             idx.cast()
                         }
-                        Expr::New(typ, _, _) => match typ {
-                            TypeId::Class(idx) | TypeId::Struct(idx) => idx.cast(),
-                            _ => return Ok(None),
-                        },
+                        Expr::New(TypeId::Class(idx) | TypeId::Struct(idx), _, _) => idx.cast(),
                         Expr::Member(_, Member::ClassField(idx) | Member::StructField(idx), _) => {
                             idx.cast()
                         }
