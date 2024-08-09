@@ -18,7 +18,7 @@ use redscript_compiler::source_map::Files;
 use redscript_compiler::symbol::Symbol;
 use redscript_compiler::typechecker::{type_of, Callable, Member, TypedAst};
 use redscript_compiler::unit::{CompilationUnit, TypecheckOutput};
-use redscript_formatter::FormatSettings;
+use redscript_formatter::{format_document, FormatSettings};
 use serde::Deserialize;
 use source_links::SourceLinks;
 use tokio::sync::{OnceCell, RwLock};
@@ -162,7 +162,8 @@ impl Backend {
         self.pool.set(bundle.pool).unwrap();
         self.config.set(config).unwrap();
 
-        if let Err(err) = self.typecheck_workspace().await {
+        let files = Files::from_dirs(self.workspace_folders.read().await.values())?;
+        if let Err(err) = self.typecheck_workspace(&files).await {
             self.log_info(format!("initial typecheck reported an error: {err}"))
                 .await;
         }
@@ -189,9 +190,7 @@ impl Backend {
         Ok(config)
     }
 
-    async fn typecheck_workspace(&self) -> Result<(), Error> {
-        let files = Files::from_dirs(self.workspace_folders.read().await.values())?;
-
+    async fn typecheck_workspace(&self, files: &Files) -> Result<(), Error> {
         if let Some(mut compiled_pool) = self.pool.get().cloned() {
             match CompilationUnit::new_with_defaults(&mut compiled_pool)?
                 .typecheck_files(&files, false, false)
@@ -208,7 +207,7 @@ impl Backend {
                 }
             }
         } else {
-            self.log_error("project not initialized".to_owned()).await;
+            self.log_error("project not initialized").await;
         }
         Ok(())
     }
@@ -655,7 +654,7 @@ impl Backend {
             indent: params.options.tab_size as u16,
             ..Default::default()
         };
-        let (module, errors) = redscript_formatter::format(file.source(), id, &settings);
+        let (module, errors) = format_document(file.source(), id, &settings);
         if let (Some(module), []) = (module, &errors[..]) {
             let last_line = contents.len_lines() - 1;
             let edit = lsp::TextEdit::new(
@@ -717,6 +716,17 @@ impl Backend {
         }
 
         Ok(())
+    }
+
+    async fn resolve_workspace(&self, url: &lsp::Url) -> Result<Files, Error> {
+        let folders = self.workspace_folders.read().await;
+        let path = url.to_file_path().map_err(|_| Error::NonFileUri)?;
+        let is_workspace_file = folders.iter().any(|(folder, _)| path.starts_with(folder));
+        if is_workspace_file {
+            Ok(Files::from_dirs(folders.values())?)
+        } else {
+            Ok(Files::from_files([path])?)
+        }
     }
 
     async fn log_info(&self, msg: impl fmt::Display) {
@@ -799,7 +809,12 @@ impl LanguageServer for Backend {
     }
 
     async fn did_save(&self, _params: lsp::DidSaveTextDocumentParams) {
-        if let Err(err) = self.typecheck_workspace().await {
+        if let Err(err) = (|| async {
+            let files = self.resolve_workspace(&_params.text_document.uri).await?;
+            self.typecheck_workspace(&files).await
+        })()
+        .await
+        {
             self.log_info(format!("typecheck reported an error: {err}"))
                 .await;
         }
