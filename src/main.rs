@@ -193,17 +193,17 @@ impl Backend {
     async fn typecheck_workspace(&self, files: &Files) -> Result<(), Error> {
         if let Some(mut compiled_pool) = self.pool.get().cloned() {
             match CompilationUnit::new_with_defaults(&mut compiled_pool)?
-                .typecheck_files(&files, false, false)
+                .typecheck_files(files, false, false)
             {
                 Ok(output) => {
-                    let state = ServerState::new(compiled_pool, &files, &output);
+                    let state = ServerState::new(compiled_pool, files, &output);
                     *self.state.write().await = Some(state);
 
-                    self.publish_diagnostics(output.diagnostics(), &files).await;
+                    self.publish_diagnostics(output.diagnostics(), files).await;
                 }
                 Err(err) => {
                     let diagnostic = Diagnostic::from_error(err)?;
-                    self.publish_diagnostics(&[diagnostic], &files).await;
+                    self.publish_diagnostics(&[diagnostic], files).await;
                 }
             }
         } else {
@@ -809,10 +809,10 @@ impl LanguageServer for Backend {
     }
 
     async fn did_save(&self, _params: lsp::DidSaveTextDocumentParams) {
-        if let Err(err) = (|| async {
+        if let Err(err) = async {
             let files = self.resolve_workspace(&_params.text_document.uri).await?;
             self.typecheck_workspace(&files).await
-        })()
+        }
         .await
         {
             self.log_info(format!("typecheck reported an error: {err}"))
