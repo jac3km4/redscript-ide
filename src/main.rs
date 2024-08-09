@@ -18,7 +18,7 @@ use redscript_compiler::source_map::Files;
 use redscript_compiler::symbol::Symbol;
 use redscript_compiler::typechecker::{type_of, Callable, Member, TypedAst};
 use redscript_compiler::unit::{CompilationUnit, TypecheckOutput};
-use redscript_formatter::{FormatSettings, Formattable};
+use redscript_formatter::FormatSettings;
 use serde::Deserialize;
 use source_links::SourceLinks;
 use tokio::sync::{OnceCell, RwLock};
@@ -649,13 +649,14 @@ impl Backend {
         let contents = buf.contents();
         let mut map = redscript_ast::SourceMap::new();
         let id = map.add(path, contents.to_string());
+        let file = map.get(id).unwrap();
 
-        let (module, errors) = redscript_parser::parse_module(map.get(id).unwrap().source(), id);
+        let settings = FormatSettings {
+            indent: params.options.tab_size as u16,
+            ..Default::default()
+        };
+        let (module, errors) = redscript_formatter::format(file.source(), id, &settings);
         if let (Some(module), []) = (module, &errors[..]) {
-            let settings = FormatSettings {
-                indent: params.options.tab_size as u16,
-                ..Default::default()
-            };
             let last_line = contents.len_lines() - 1;
             let edit = lsp::TextEdit::new(
                 lsp::Range::new(
@@ -665,7 +666,7 @@ impl Backend {
                         contents.chars_at(contents.line_to_char(last_line)).count() as u32,
                     ),
                 ),
-                module.display(&settings).to_string(),
+                module.to_string(),
             );
             return Ok(Some(vec![edit]));
         };
