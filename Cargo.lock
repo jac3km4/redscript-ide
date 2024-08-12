@@ -754,7 +754,7 @@ dependencies = [
 [[package]]
 name = "redscript"
 version = "0.5.25"
-source = "git+https://github.com/jac3km4/redscript?rev=6b79caf#6b79cafa7224966f0faebd4269854659cb51ed56"
+source = "git+https://github.com/jac3km4/redscript?rev=e6ede96#e6ede968bd1461ec2f3b4af5428f1ca8ebf9eb77"
 dependencies = [
  "byteorder",
  "crc32fast",
@@ -781,7 +781,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler"
 version = "0.5.25"
-source = "git+https://github.com/jac3km4/redscript?rev=6b79caf#6b79cafa7224966f0faebd4269854659cb51ed56"
+source = "git+https://github.com/jac3km4/redscript?rev=e6ede96#e6ede968bd1461ec2f3b4af5428f1ca8ebf9eb77"
 dependencies = [
  "enum-as-inner",
  "flexstr",
