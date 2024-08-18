@@ -754,7 +754,7 @@ dependencies = [
 [[package]]
 name = "redscript"
 version = "0.5.25"
-source = "git+https://github.com/jac3km4/redscript?rev=e6ede96#e6ede968bd1461ec2f3b4af5428f1ca8ebf9eb77"
+source = "git+https://github.com/jac3km4/redscript?rev=f60cf70#f60cf701cf8f1951e552a1948c09587b4872e273"
 dependencies = [
  "byteorder",
  "crc32fast",
@@ -771,7 +771,7 @@ dependencies = [
 [[package]]
 name = "redscript-ast"
 version = "0.1.0"
-source = "git+https://github.com/jac3km4/redscript-syntax?rev=9690bc2#9690bc2340c1b1bbbd562ed22f93e5808d516bd4"
+source = "git+https://github.com/jac3km4/redscript-syntax?rev=43a4f27#43a4f2757104ddb15d5e915636bb0997ff688370"
 dependencies = [
  "bitflags 2.6.0",
  "chumsky",
@@ -781,7 +781,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler"
 version = "0.5.25"
-source = "git+https://github.com/jac3km4/redscript?rev=e6ede96#e6ede968bd1461ec2f3b4af5428f1ca8ebf9eb77"
+source = "git+https://github.com/jac3km4/redscript?rev=f60cf70#f60cf701cf8f1951e552a1948c09587b4872e273"
 dependencies = [
  "enum-as-inner",
  "flexstr",
@@ -800,7 +800,7 @@ dependencies = [
 [[package]]
 name = "redscript-formatter"
 version = "0.1.0"
-source = "git+https://github.com/jac3km4/redscript-syntax?rev=9690bc2#9690bc2340c1b1bbbd562ed22f93e5808d516bd4"
+source = "git+https://github.com/jac3km4/redscript-syntax?rev=43a4f27#43a4f2757104ddb15d5e915636bb0997ff688370"
 dependencies = [
  "pretty_dtoa",
  "redscript-ast",
@@ -831,7 +831,7 @@ dependencies = [
 [[package]]
 name = "redscript-parser"
 version = "0.1.0"
-source = "git+https://github.com/jac3km4/redscript-syntax?rev=9690bc2#9690bc2340c1b1bbbd562ed22f93e5808d516bd4"
+source = "git+https://github.com/jac3km4/redscript-syntax?rev=43a4f27#43a4f2757104ddb15d5e915636bb0997ff688370"
 dependencies = [
  "chumsky",
  "redscript-ast",
