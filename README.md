@@ -11,6 +11,8 @@ Language server for [redscript](https://github.com/jac3km4/redscript)
 - debugger (requires [redscript-dap](https://github.com/jac3km4/redscript-dap))
 - hooks for external tools
 
+![ide-gif](https://user-images.githubusercontent.com/11986158/135734766-b5423e2c-cf47-4836-97ba-5c771cef7cf2.gif)
+
 ## configuration
 The language server will attempt to load a TOML file named `.redscript-ide` from every workspace folder.
 This file can contain some configuration options:
@@ -23,5 +25,3 @@ This file can contain some configuration options:
     # another available variable is {workspace_dir} which refers to the workspace directory that contains the checked file
     create_file = "{game_dir}\\red4ext\\plugins\\RedHotTools\\.hot-scripts"
     ```
-
-![ide-gif](https://user-images.githubusercontent.com/11986158/135734766-b5423e2c-cf47-4836-97ba-5c771cef7cf2.gif)
