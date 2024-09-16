@@ -16,6 +16,7 @@ dashmap = "6"
 ropey = "1"
 toml = "0.8"
 intaglio = { version = "1", features = ["path"] }
+tinytemplate = "1"
 
 [dependencies.redscript]
 git = "https://github.com/jac3km4/redscript"

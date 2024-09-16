@@ -19,8 +19,9 @@ use redscript_compiler::symbol::Symbol;
 use redscript_compiler::typechecker::{type_of, Callable, Member, TypedAst};
 use redscript_compiler::unit::{CompilationUnit, TypecheckOutput};
 use redscript_formatter::{format_document, FormatSettings};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use source_links::SourceLinks;
+use tinytemplate::TinyTemplate;
 use tokio::sync::{OnceCell, RwLock};
 
 mod buffers;
@@ -41,6 +42,7 @@ async fn main() {
         state: RwLock::new(None),
         pool: OnceCell::new(),
         workspace_folders: RwLock::new(HashMap::new()),
+        hooks: RwLock::new(Hooks::default()),
         buffers: Buffers::default(),
     });
     Server::new(stdin, stdout)
@@ -49,9 +51,27 @@ async fn main() {
         .await;
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Serialize)]
+struct PathContext {
+    game_dir: Option<PathBuf>,
+    workspace_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Hook {
+    CreateFile(String),
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Hooks {
+    successful_check: Vec<Hook>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct DotRedscript {
     redscript_dir: Option<PathBuf>,
+    hooks: Hooks,
 }
 
 impl DotRedscript {
@@ -88,6 +108,7 @@ struct Backend {
     pool: OnceCell<ConstantPool>,
     workspace_folders: RwLock<HashMap<PathBuf, PathBuf>>,
     state: RwLock<Option<ServerState>>,
+    hooks: RwLock<Hooks>,
     buffers: Buffers,
 }
 
@@ -109,8 +130,48 @@ impl Backend {
     const CONFIG_FIELDS: &'static [&'static str] =
         &["redscript.scriptCachePath", "redscript.gameDir"];
 
-    async fn add_workspace_folder(&self, dir: PathBuf) -> Result<(), Error> {
+    async fn load_dot_redscript(&self, dir: PathBuf) -> Result<DotRedscript, Error> {
         let dot_redscript = DotRedscript::load(&dir)?.unwrap_or_default();
+
+        let mut hooks = self.hooks.write().await;
+        hooks
+            .successful_check
+            .extend(dot_redscript.hooks.successful_check.iter().cloned());
+
+        Ok(dot_redscript)
+    }
+
+    async fn execute_hooks(&self, hooks: &[Hook], workspace_dir: PathBuf) {
+        let context = PathContext {
+            game_dir: self.config.get().and_then(|conf| conf.game_dir.clone()),
+            workspace_dir,
+        };
+        for hook in hooks {
+            self.execute_hook(hook, &context).await;
+        }
+    }
+
+    async fn execute_hook(&self, hook: &Hook, ctx: &PathContext) {
+        match hook {
+            Hook::CreateFile(path) => {
+                let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = (|| {
+                    let mut template = TinyTemplate::new();
+                    template.add_template("path", path)?;
+                    let path = template.render("path", &ctx)?;
+                    File::create(path)?;
+                    Ok(())
+                })(
+                );
+
+                if let Err(err) = result {
+                    self.log_error(format!("failed to run hook: {}", err)).await;
+                }
+            }
+        }
+    }
+
+    async fn add_workspace_folder(&self, dir: PathBuf) -> Result<(), Error> {
+        let dot_redscript = self.load_dot_redscript(dir.clone()).await?;
         let source_dir = dot_redscript.redscript_dir.map_or_else(
             || dir.clone(),
             |p| if p.is_absolute() { p } else { dir.join(p) },
@@ -190,9 +251,9 @@ impl Backend {
         Ok(config)
     }
 
-    async fn typecheck_workspace(&self, files: &Files) -> Result<(), Error> {
+    async fn typecheck_workspace(&self, files: &Files) -> Result<TypecheckOutcome, Error> {
         if let Some(mut compiled_pool) = self.pool.get().cloned() {
-            match CompilationUnit::new_with_defaults(&mut compiled_pool)?
+            let is_fatal = match CompilationUnit::new_with_defaults(&mut compiled_pool)?
                 .typecheck_files(files, false, false)
             {
                 Ok(output) => {
@@ -200,16 +261,24 @@ impl Backend {
                     *self.state.write().await = Some(state);
 
                     self.publish_diagnostics(output.diagnostics(), files).await;
+                    output.diagnostics().iter().any(Diagnostic::is_fatal)
                 }
                 Err(err) => {
                     let diagnostic = Diagnostic::from_error(err)?;
+                    let is_fatal = diagnostic.is_fatal();
                     self.publish_diagnostics(&[diagnostic], files).await;
+                    is_fatal
                 }
+            };
+            if is_fatal {
+                Ok(TypecheckOutcome::Failed)
+            } else {
+                Ok(TypecheckOutcome::Succeeded)
             }
         } else {
             self.log_error("project not initialized").await;
+            Ok(TypecheckOutcome::NotReady)
         }
-        Ok(())
     }
 
     async fn expr_at_location<A>(
@@ -718,14 +787,14 @@ impl Backend {
         Ok(())
     }
 
-    async fn resolve_workspace(&self, url: &lsp::Url) -> Result<Files, Error> {
+    async fn resolve_file_workspace(&self, url: &lsp::Url) -> Result<FileResolution, Error> {
         let folders = self.workspace_folders.read().await;
         let path = url.to_file_path().map_err(|_| Error::NonFileUri)?;
-        let is_workspace_file = folders.iter().any(|(folder, _)| path.starts_with(folder));
-        if is_workspace_file {
-            Ok(Files::from_dirs(folders.values())?)
+        if let Some((root, _)) = folders.iter().find(|(folder, _)| path.starts_with(folder)) {
+            let files = Files::from_dirs(folders.values())?;
+            Ok(FileResolution::Workspace(files, root.clone()))
         } else {
-            Ok(Files::from_files([path])?)
+            Ok(FileResolution::NonWorkspace(Files::from_files([path])?))
         }
     }
 
@@ -808,15 +877,25 @@ impl LanguageServer for Backend {
         }
     }
 
-    async fn did_save(&self, _params: lsp::DidSaveTextDocumentParams) {
-        if let Err(err) = async {
-            let files = self.resolve_workspace(&_params.text_document.uri).await?;
-            self.typecheck_workspace(&files).await
+    async fn did_save(&self, params: lsp::DidSaveTextDocumentParams) {
+        let result = async {
+            let outcome = self
+                .resolve_file_workspace(&params.text_document.uri)
+                .await?;
+            let res = self.typecheck_workspace(outcome.files()).await?;
+            Ok::<_, Error>((res, outcome))
         }
-        .await
-        {
-            self.log_info(format!("typecheck reported an error: {err}"))
-                .await;
+        .await;
+        match result {
+            Ok((TypecheckOutcome::Succeeded, FileResolution::Workspace(_, root))) => {
+                self.execute_hooks(&self.hooks.read().await.successful_check, root)
+                    .await;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                self.log_info(format!("typecheck reported an error: {err}"))
+                    .await;
+            }
         }
     }
 
@@ -856,5 +935,54 @@ impl LanguageServer for Backend {
         if let Err(err) = self.did_change_workspace_folders(params).await {
             self.spawn_error_popup(err.to_string()).await;
         }
+    }
+}
+
+#[derive(Debug)]
+enum TypecheckOutcome {
+    Failed,
+    Succeeded,
+    NotReady,
+}
+
+#[derive(Debug)]
+enum FileResolution {
+    Workspace(Files, PathBuf),
+    NonWorkspace(Files),
+}
+
+impl FileResolution {
+    pub fn files(&self) -> &Files {
+        match self {
+            Self::Workspace(files, _) | Self::NonWorkspace(files) => files,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_dot_redscript() {
+        let input = r#"
+        redscript_dir = "r6"
+
+        [[hooks.successful_check]]
+        create_file = "/foo/bar"
+
+        [[hooks.successful_check]]
+        create_file = "/bar"
+        "#;
+
+        let res: DotRedscript = toml::from_str(input).unwrap();
+        assert_eq!(res.redscript_dir, Some(PathBuf::from("r6")));
+        assert_eq!(
+            res.hooks.successful_check,
+            vec![
+                Hook::CreateFile("/foo/bar".to_owned()),
+                Hook::CreateFile("/bar".to_owned())
+            ]
+        );
     }
 }
