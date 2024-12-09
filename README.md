@@ -71,7 +71,7 @@ This file can contain some configuration options:
   Add the snippet below to your [`languages.toml`](https://docs.helix-editor.com/languages.html)
   and replace the paths, analogously to the Neovim setup:
   ```toml
-  [[languages]]
+  [language-server.redscript-ide]
   command = "/path/to/redscript-ide"
   config = { game_dir = "/path/to/cyberpunk2077" }
 
