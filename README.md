@@ -88,6 +88,7 @@ This file can contain some configuration options:
   name = "redscript"
   scope = "source.reds"
   file-types = ["reds"]
+  roots = []
   auto-format = true
   comment-tokens = "//"
   block-comment-tokens = { start = "/*", end = "*/" }
