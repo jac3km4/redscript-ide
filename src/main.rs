@@ -824,7 +824,7 @@ impl LanguageServer for Backend {
         if let Some(options) = params.initialization_options {
             let config: Config = serde_json::from_value(options)
                 .map_err(|err| jsonrpc::Error::invalid_params(err.to_string()))?;
-            self.config.set(config.into()).unwrap();
+            self.config.set(config).unwrap();
         }
 
         for dir in params
