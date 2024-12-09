@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 lspower = "1"
 tokio = { version = "1", features = ["full"] }
-thiserror = "1"
+thiserror = "2"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,11 +22,11 @@ tinytemplate = "1"
 git = "https://github.com/jac3km4/redscript"
 default-features = false
 features = ["arc"]
-rev = "f60cf70"
+rev = "f57224b"
 
 [dependencies.redscript-compiler]
 git = "https://github.com/jac3km4/redscript"
-rev = "f60cf70"
+rev = "f57224b"
 
 [dependencies.redscript-ast]
 git = "https://github.com/jac3km4/redscript-syntax"

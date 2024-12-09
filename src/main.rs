@@ -86,19 +86,22 @@ impl DotRedscript {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(from = "(Option<PathBuf>, Option<PathBuf>)")]
+#[derive(Debug, Clone, Deserialize)]
 struct Config {
     script_cache_path: Option<PathBuf>,
     game_dir: Option<PathBuf>,
 }
 
-impl From<(Option<PathBuf>, Option<PathBuf>)> for Config {
+#[derive(Debug, Deserialize)]
+#[serde(from = "(Option<PathBuf>, Option<PathBuf>)")]
+struct ConfigFields(Config);
+
+impl From<(Option<PathBuf>, Option<PathBuf>)> for ConfigFields {
     fn from((script_cache_path, game_dir): (Option<PathBuf>, Option<PathBuf>)) -> Self {
-        Self {
+        Self(Config {
             script_cache_path: script_cache_path.filter(|p| p.components().count() > 0),
             game_dir: game_dir.filter(|p| p.components().count() > 0),
-        }
+        })
     }
 }
 
@@ -221,7 +224,6 @@ impl Backend {
 
         let bundle = ScriptBundle::load(&mut File::open(path)?)?;
         self.pool.set(bundle.pool).unwrap();
-        self.config.set(config).unwrap();
 
         let files = Files::from_dirs(self.workspace_folders.read().await.values())?;
         if let Err(err) = self.typecheck_workspace(&files).await {
@@ -233,6 +235,10 @@ impl Backend {
     }
 
     async fn get_configuration(&self) -> Result<Config, Error> {
+        if let Some(config) = self.config.get() {
+            return Ok(config.clone());
+        }
+
         let items = Self::CONFIG_FIELDS
             .iter()
             .map(|str| lsp::ConfigurationItem {
@@ -246,9 +252,11 @@ impl Backend {
             .await
             .map_err(|err| Error::Other(err.into()))?;
 
-        let config = serde_json::from_value(serde_json::Value::Array(conf_json))
+        let config: ConfigFields = serde_json::from_value(serde_json::Value::Array(conf_json))
             .map_err(|err| Error::Other(err.into()))?;
-        Ok(config)
+        self.config.set(config.0.clone()).unwrap();
+
+        Ok(config.0)
     }
 
     async fn typecheck_workspace(&self, files: &Files) -> Result<TypecheckOutcome, Error> {
@@ -813,6 +821,12 @@ impl LanguageServer for Backend {
         &self,
         params: lsp::InitializeParams,
     ) -> jsonrpc::Result<lsp::InitializeResult> {
+        if let Some(options) = params.initialization_options {
+            let config: Config = serde_json::from_value(options)
+                .map_err(|err| jsonrpc::Error::invalid_params(err.to_string()))?;
+            self.config.set(config.into()).unwrap();
+        }
+
         for dir in params
             .workspace_folders
             .unwrap_or_default()

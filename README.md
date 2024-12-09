@@ -25,3 +25,63 @@ This file can contain some configuration options:
     # another available variable is {workspace_dir} which refers to the workspace directory that contains the checked file
     create_file = "{game_dir}\\red4ext\\plugins\\RedHotTools\\.hot-scripts"
     ```
+
+## usage
+
+- ### VS Code
+  Use the [Redscript IDE extension from the marketplace](https://marketplace.visualstudio.com/items?itemName=jac3km4.redscript-ide-vscode).
+
+
+- ### Neovim
+  Add the snippet below to your `init.lua` and replace `/path/to/redscript-ide` with the path to
+  a redscript-ide executable downloaded from [here](https://github.com/jac3km4/redscript-ide/releases/latest)
+  and `/path/to/cyberpunk2077` with the path to the root of your Cyberpunk 2077 installation directory:
+  ```lua
+  local configs = require 'lspconfig.configs'
+  local util = require 'lspconfig.util'
+  local lsp = require 'lspconfig'
+
+  -- define the redscript filetype
+  vim.cmd [[
+      augroup RedscriptFile
+          autocmd!
+          autocmd BufNewFile,BufRead *.reds set filetype=reds | set syntax=swift
+      augroup END
+  ]]
+
+  -- configure the redscript language server
+  configs.redscript_ide = {
+      default_config = {
+          cmd = { '/path/to/redscript-ide' },
+          filetypes = 'reds',
+          init_options = {
+              game_dir = '/path/to/cyberpunk2077',
+          },
+          root_dir = function(fname)
+              return util.root_pattern('.git')(fname) or util.path.dirname(fname)
+          end,
+          single_file_support = true
+      }
+  }
+
+  -- invoke the lsp-config setup
+  lsp.redscript_ide.setup {}
+  ```
+- ### Helix
+  Add the snippet below to your [`languages.toml`](https://docs.helix-editor.com/languages.html)
+  and replace the paths, analogously to the Neovim setup:
+  ```toml
+  [[languages]]
+  command = "/path/to/redscript-ide"
+  config = { game_dir = "/path/to/cyberpunk2077" }
+
+  [[language]]
+  name = "redscript"
+  scope = "source.reds"
+  file-types = ["reds"]
+  auto-format = true
+  comment-tokens = "//"
+  block-comment-tokens = { start = "/*", end = "*/" }
+  indent = { tab-width = 2, unit = "  " }
+  language-servers = ["redscript-ide"]
+  ```
