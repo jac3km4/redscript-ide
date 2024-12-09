@@ -1,7 +1,9 @@
 # redscript-ide
+
 Language server for [redscript](https://github.com/jac3km4/redscript)
 
 ## features
+
 - error and warning diagnostics
 - autocompletion for methods and fields
 - hover for function definitions and types
@@ -14,8 +16,10 @@ Language server for [redscript](https://github.com/jac3km4/redscript)
 ![ide-gif](https://user-images.githubusercontent.com/11986158/135734766-b5423e2c-cf47-4836-97ba-5c771cef7cf2.gif)
 
 ## configuration
+
 The language server will attempt to load a TOML file named `.redscript-ide` from every workspace folder.
 This file can contain some configuration options:
+
 - `redscript_dir` maps the source directory to a different folder than the workspace folder root
 - `hooks` allows you to configure hooks on certain events, an example would be creating a file to signal something to an external tool
   - for instance, you can trigger a reload of RedHotTools when the workspace successfully typechecks:
@@ -29,13 +33,15 @@ This file can contain some configuration options:
 ## usage
 
 - ### VS Code
+
   Use the [Redscript IDE extension from the marketplace](https://marketplace.visualstudio.com/items?itemName=jac3km4.redscript-ide-vscode).
 
-
 - ### Neovim
+
   Add the snippet below to your `init.lua` and replace `/path/to/redscript-ide` with the path to
   a redscript-ide executable downloaded from [here](https://github.com/jac3km4/redscript-ide/releases/latest)
   and `/path/to/cyberpunk2077` with the path to the root of your Cyberpunk 2077 installation directory:
+
   ```lua
   local configs = require 'lspconfig.configs'
   local util = require 'lspconfig.util'
@@ -67,9 +73,12 @@ This file can contain some configuration options:
   -- invoke the lsp-config setup
   lsp.redscript_ide.setup {}
   ```
+
 - ### Helix
+
   Add the snippet below to your [`languages.toml`](https://docs.helix-editor.com/languages.html)
-  and replace the paths, analogously to the Neovim setup:
+  and replace the paths, similarly to the Neovim setup:
+
   ```toml
   [language-server.redscript-ide]
   command = "/path/to/redscript-ide"
@@ -84,4 +93,28 @@ This file can contain some configuration options:
   block-comment-tokens = { start = "/*", end = "*/" }
   indent = { tab-width = 2, unit = "  " }
   language-servers = ["redscript-ide"]
+
+  [language.auto-pairs]
+  '(' = ')'
+  '{' = '}'
+  '[' = ']'
+  '"' = '"'
+
+  [[grammar]]
+  name = "redscript"
+  source = { git = "https://github.com/jac3km4/tree-sitter-redscript", rev = "master" }
+  ```
+
+  To get the syntax highlighting to work, you also need to rebuild the grammars and populate the queries folder:
+
+  ```powerhsell
+  # build the grammars
+  helix --grammar fetch
+  helix --grammar build
+
+  # populate the queries
+  # on Linux run:
+  # git clone -b queries --single-branch https://github.com/jac3km4/tree-sitter-redscript "$HOME/.config/helix/runtime/queries/redscript"
+  # on Windows run:
+  # git clone -b queries --single-branch https://github.com/jac3km4/tree-sitter-redscript "$env:USERPROFILE\AppData\Roaming\helix\runtime\queries\redscript"
   ```
