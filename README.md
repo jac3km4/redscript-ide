@@ -88,7 +88,8 @@ This file can contain some configuration options:
   name = "redscript"
   scope = "source.reds"
   file-types = ["reds"]
-  roots = []
+  # you have to have a .redscript file for workspace to be detected (it can be empty)
+  roots = [".redscript"]
   auto-format = true
   comment-tokens = "//"
   block-comment-tokens = { start = "/*", end = "*/" }
