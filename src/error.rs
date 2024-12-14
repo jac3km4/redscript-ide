@@ -1,5 +1,5 @@
-use std::io;
 use std::path::PathBuf;
+use std::{fmt, io};
 
 use redscript::bundle::PoolError;
 use thiserror::Error;
@@ -28,6 +28,12 @@ pub enum Error {
 
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
+        Self::Other(Box::new(value))
+    }
+}
+
+impl From<fmt::Error> for Error {
+    fn from(value: fmt::Error) -> Self {
         Self::Other(Box::new(value))
     }
 }

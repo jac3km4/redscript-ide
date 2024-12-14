@@ -9,6 +9,7 @@ Language server for [redscript](https://github.com/jac3km4/redscript)
 - hover for function definitions and types
 - go-to-definition
   - bonus: limited support for redmod (scripted functions)
+- workspace symbols
 - formatting (beta)
 - debugger (requires [redscript-dap](https://github.com/jac3km4/redscript-dap))
 - hooks for external tools

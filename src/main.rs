@@ -20,7 +20,7 @@ use redscript_compiler::typechecker::{type_of, Callable, Member, TypedAst};
 use redscript_compiler::unit::{CompilationUnit, TypecheckOutput};
 use redscript_formatter::{format_document, FormatSettings};
 use serde::{Deserialize, Serialize};
-use source_links::SourceLinks;
+use source_links::{SourceLinkKind, SourceLinks};
 use tinytemplate::TinyTemplate;
 use tokio::sync::{OnceCell, RwLock};
 
@@ -39,6 +39,7 @@ async fn main() {
     let (service, messages) = LspService::new(|client| Backend {
         client,
         config: OnceCell::new(),
+        capabilities: OnceCell::new(),
         state: RwLock::new(None),
         pool: OnceCell::new(),
         workspace_folders: RwLock::new(HashMap::new()),
@@ -108,6 +109,7 @@ impl From<(Option<PathBuf>, Option<PathBuf>)> for ConfigFields {
 struct Backend {
     client: Client,
     config: OnceCell<Config>,
+    capabilities: OnceCell<lsp::ClientCapabilities>,
     pool: OnceCell<ConstantPool>,
     workspace_folders: RwLock<HashMap<PathBuf, PathBuf>>,
     state: RwLock<Option<ServerState>>,
@@ -383,7 +385,7 @@ impl Backend {
                 match typ.unwrapped() {
                     TypeId::Class(idx) | TypeId::Struct(idx) => {
                         let completions =
-                            Self::class_completions(*idx, *idx, typ, is_static, pool)?;
+                            self.class_completions(*idx, *idx, typ, is_static, pool)?;
                         Ok(Some(lsp::CompletionResponse::Array(completions)))
                     }
                     TypeId::Enum(idx) if is_static => {
@@ -406,30 +408,7 @@ impl Backend {
         if let Some(idx_val) = item.data.as_ref().and_then(serde_json::Value::as_u64) {
             let pool = self.get_cloned_pool().await?;
             let idx = PoolIndex::new(idx_val as u32);
-            let fun = pool.function(idx)?;
-
-            let name = pool.def_name(idx)?;
-            let pretty_name = name.split(';').next().unwrap_or(&name);
-
-            let mut snippet = String::new();
-            for (i, param_idx) in fun.parameters.iter().enumerate() {
-                let name = pool.def_name(*param_idx)?;
-                if i != 0 {
-                    write!(snippet, ", ").unwrap();
-                }
-                write!(snippet, "${{{}:{}}}", i + 1, name).unwrap();
-            }
-            let detail = util::render_function(idx, true, &pool)?;
-
-            let item = lsp::CompletionItem {
-                label: format!("{}(⠤)", pretty_name),
-                kind: Some(lsp::CompletionItemKind::METHOD),
-                insert_text: Some(format!("{}({})", pretty_name, snippet)),
-                insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
-                detail: Some(detail),
-                ..lsp::CompletionItem::default()
-            };
-            Ok(item)
+            Ok(self.method_item(idx, &pool, false)?)
         } else {
             Ok(item)
         }
@@ -524,6 +503,7 @@ impl Backend {
     }
 
     fn class_completions(
+        &self,
         idx: PoolIndex<Class>,
         initial_idx: PoolIndex<Class>,
         typ: TypeId,
@@ -575,42 +555,72 @@ impl Backend {
             if (is_static || !has_static_receiver) && fun.flags.is_static() != is_static {
                 continue;
             }
-            let name = pool.def_name(*idx)?;
-            let pretty_name = name.split(';').next().unwrap_or(&name);
+            completions.push(self.method_item(*idx, pool, has_static_receiver)?);
+        }
 
-            let mut snippet = String::new();
+        if !class.base.is_undefined() {
+            let base = self.class_completions(class.base, initial_idx, typ, is_static, pool)?;
+            completions.extend(base);
+        }
+        Ok(completions)
+    }
 
-            let params = if has_static_receiver && !is_static {
+    fn method_item(
+        &self,
+        idx: PoolIndex<Function>,
+        pool: &ConstantPool,
+        has_static_receiver: bool,
+    ) -> Result<lsp::CompletionItem, Error> {
+        let fun = pool.function(idx)?;
+        let name = pool.def_name(idx)?;
+        let pretty_name = name.split(';').next().unwrap_or(&name);
+
+        let mut text = String::from(pretty_name);
+        let is_snippet = self
+            .capabilities
+            .get()
+            .as_ref()
+            .and_then(|c| {
+                c.text_document
+                    .as_ref()?
+                    .completion
+                    .as_ref()?
+                    .completion_item
+                    .as_ref()?
+                    .snippet_support
+            })
+            .unwrap_or(false);
+        if is_snippet {
+            let params = if has_static_receiver {
                 &fun.parameters[1..]
             } else {
                 &fun.parameters
             };
-
-            for (i, param_idx) in params.iter().enumerate() {
-                let name = pool.def_name(*param_idx)?;
+            write!(text, "(")?;
+            for (i, &param_idx) in params.iter().enumerate() {
+                let name = pool.def_name(param_idx)?;
                 if i != 0 {
-                    write!(snippet, ", ").unwrap();
+                    write!(text, ", ")?;
                 }
-                write!(snippet, "${{{}:{}}}", i + 1, name).unwrap();
+                write!(text, "${{{}:{name}}}", i + 1)?;
             }
-            let detail = util::render_function(*idx, true, pool)?;
+            write!(text, ")")?;
+        };
 
-            let item = lsp::CompletionItem {
-                label: format!("{}(⠤)", pretty_name),
-                kind: Some(lsp::CompletionItemKind::METHOD),
-                insert_text: Some(format!("{}({})", pretty_name, snippet)),
-                insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
-                detail: Some(detail),
-                ..lsp::CompletionItem::default()
-            };
-            completions.push(item);
-        }
+        let detail = util::render_function(idx, true, pool)?;
 
-        if !class.base.is_undefined() {
-            let base = Self::class_completions(class.base, initial_idx, typ, is_static, pool)?;
-            completions.extend(base);
-        }
-        Ok(completions)
+        Ok(lsp::CompletionItem {
+            label: format!("{}(⠤)", pretty_name),
+            kind: Some(lsp::CompletionItemKind::METHOD),
+            insert_text: Some(text),
+            insert_text_format: Some(if is_snippet {
+                lsp::InsertTextFormat::SNIPPET
+            } else {
+                lsp::InsertTextFormat::PLAIN_TEXT
+            }),
+            detail: Some(detail),
+            ..lsp::CompletionItem::default()
+        })
     }
 
     fn enum_completions(
@@ -749,7 +759,7 @@ impl Backend {
 
         let mut msg = String::new();
         for err in errors {
-            writeln!(msg, "{}", err.pretty(&map)).unwrap();
+            writeln!(msg, "{}", err.pretty(&map))?;
         }
         self.spawn_error_popup(format!("formatting failed:\n{msg}"))
             .await;
@@ -817,10 +827,48 @@ impl Backend {
 
 #[lspower::async_trait]
 impl LanguageServer for Backend {
+    async fn symbol(
+        &self,
+        params: lsp::WorkspaceSymbolParams,
+    ) -> jsonrpc::Result<Option<Vec<lsp::SymbolInformation>>> {
+        let state = self.state.read().await;
+        let state = state.as_ref().ok_or(jsonrpc::Error::internal_error())?;
+
+        #[allow(deprecated)]
+        let results = state
+            .source_links
+            .search(&params.query)
+            .map(|(name, kind, pos)| lsp::SymbolInformation {
+                name,
+                kind: match kind {
+                    SourceLinkKind::Class => lsp::SymbolKind::CLASS,
+                    SourceLinkKind::Enum => lsp::SymbolKind::ENUM,
+                    SourceLinkKind::Function => lsp::SymbolKind::FUNCTION,
+                    SourceLinkKind::Method => lsp::SymbolKind::METHOD,
+                    SourceLinkKind::Field => lsp::SymbolKind::FIELD,
+                },
+                location: lsp::Location::new(
+                    lsp::Url::from_file_path(pos.path()).unwrap(),
+                    lsp::Range::new(
+                        lsp::Position::new(pos.line() as u32, 0),
+                        lsp::Position::new(pos.line() as u32, 0),
+                    ),
+                ),
+                tags: None,
+                container_name: None,
+                deprecated: None,
+            })
+            .collect();
+
+        Ok(Some(results))
+    }
+
     async fn initialize(
         &self,
         params: lsp::InitializeParams,
     ) -> jsonrpc::Result<lsp::InitializeResult> {
+        self.capabilities.set(params.capabilities).unwrap();
+
         if let Some(options) = params.initialization_options {
             let config: Config = serde_json::from_value(options)
                 .map_err(|err| jsonrpc::Error::invalid_params(err.to_string()))?;
@@ -859,6 +907,7 @@ impl LanguageServer for Backend {
                 }),
                 file_operations: None,
             }),
+            workspace_symbol_provider: Some(lsp::OneOf::Left(true)),
             ..lsp::ServerCapabilities::default()
         };
 

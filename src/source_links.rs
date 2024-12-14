@@ -43,11 +43,24 @@ impl SourceLinks {
 
     pub fn get(&self, key: SourceLinkKey) -> Option<SourceLinkPos<'_>> {
         let link = self.source_items.get(&key)?;
-        let path = self.path_table.get(link.path)?;
+        self.resolve_link(link)
+    }
+
+    fn resolve_link(&self, key: &SourceLink) -> Option<SourceLinkPos<'_>> {
+        let path = self.path_table.get(key.path)?;
         Some(SourceLinkPos {
             path,
-            line: link.line,
+            line: key.line,
         })
+    }
+
+    fn render_link(&self, key: &SourceLinkKey) -> Option<String> {
+        let name = self.name_table.get(key.name())?;
+        let name = name.split_once(';').map_or(name, |(pre, _)| pre);
+        match key.parent() {
+            Some(parent) => Some(format!("{}::{name}", self.name_table.get(parent)?)),
+            None => Some(name.to_owned()),
+        }
     }
 
     pub fn create_link_key(
@@ -127,8 +140,30 @@ impl SourceLinks {
         };
         Some(result)
     }
+
+    pub fn search<'a>(
+        &'a self,
+        query: &'a str,
+    ) -> impl Iterator<Item = (String, SourceLinkKind, SourceLinkPos<'a>)> {
+        self.source_items.iter().filter_map(move |(key, link)| {
+            let name = self.name_table.get(key.name())?;
+            let pos = name.contains(query).then(|| self.resolve_link(link))??;
+            let name = self.render_link(key)?;
+            Some((name, key.kind(), pos))
+        })
+    }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SourceLinkKind {
+    Class,
+    Enum,
+    Function,
+    Method,
+    Field,
+}
+
+#[derive(Debug)]
 struct SourceLink {
     path: intaglio::Symbol,
     line: usize,
@@ -141,6 +176,38 @@ pub enum SourceLinkKey {
     Function(intaglio::Symbol),
     Method(intaglio::Symbol, intaglio::Symbol),
     Field(intaglio::Symbol, intaglio::Symbol),
+}
+
+impl SourceLinkKey {
+    #[inline]
+    pub fn name(&self) -> intaglio::Symbol {
+        match self {
+            Self::Class(name)
+            | Self::Enum(name)
+            | Self::Function(name)
+            | Self::Method(name, _)
+            | Self::Field(name, _) => *name,
+        }
+    }
+
+    #[inline]
+    pub fn kind(&self) -> SourceLinkKind {
+        match self {
+            Self::Class(_) => SourceLinkKind::Class,
+            Self::Enum(_) => SourceLinkKind::Enum,
+            Self::Function(_) => SourceLinkKind::Function,
+            Self::Method(_, _) => SourceLinkKind::Method,
+            Self::Field(_, _) => SourceLinkKind::Field,
+        }
+    }
+
+    #[inline]
+    pub fn parent(&self) -> Option<intaglio::Symbol> {
+        match self {
+            Self::Method(_, parent) | Self::Field(_, parent) => Some(*parent),
+            _ => None,
+        }
+    }
 }
 
 pub struct SourceLinkPos<'a> {
