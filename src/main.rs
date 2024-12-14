@@ -555,7 +555,7 @@ impl Backend {
             if (is_static || !has_static_receiver) && fun.flags.is_static() != is_static {
                 continue;
             }
-            completions.push(self.method_item(*idx, pool, has_static_receiver)?);
+            completions.push(self.method_item(*idx, pool, has_static_receiver && !is_static)?);
         }
 
         if !class.base.is_undefined() {
