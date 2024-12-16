@@ -12,6 +12,7 @@ use redscript::ast::{Expr, TypeName};
 use redscript::bundle::{ConstantPool, PoolIndex, ScriptBundle};
 use redscript::definition::{Class, Enum, Function, Type};
 use redscript_compiler::diagnostics::Diagnostic;
+use redscript_compiler::error::Cause;
 use redscript_compiler::parser;
 use redscript_compiler::scope::{Reference, TypeId};
 use redscript_compiler::source_map::Files;
@@ -478,7 +479,15 @@ impl Backend {
                 lsp::Position::new(loc.end.line as u32, loc.end.col as u32),
             );
             let source = Some("redscript".to_owned());
-            let msg = diagnostic.to_string();
+            let msg = if let Diagnostic::CompileError(Cause::UnresolvedModule(m), _) = diagnostic {
+                format!(
+                    "{diagnostic}\n\n\
+                     Ensure that the source file defining '{m}' exists in your workspace \
+                     (you can add it as a workspace folder if it's a dependency)."
+                )
+            } else {
+                diagnostic.to_string()
+            };
             let diagnostic =
                 lsp::Diagnostic::new(range, Some(severity), None, source, msg, None, None);
             match messages.entry(loc.file.path().to_owned()) {
