@@ -22,11 +22,11 @@ tinytemplate = "1"
 git = "https://github.com/jac3km4/redscript"
 default-features = false
 features = ["arc"]
-rev = "f57224b"
+rev = "8b44fd2"
 
 [dependencies.redscript-compiler]
 git = "https://github.com/jac3km4/redscript"
-rev = "f57224b"
+rev = "8b44fd2"
 
 [dependencies.redscript-ast]
 git = "https://github.com/jac3km4/redscript-syntax"
