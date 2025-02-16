@@ -743,7 +743,7 @@ impl Backend {
         let path = uri.to_file_path().map_err(|_| Error::NonFileUri)?;
         let contents = buf.contents();
         let mut map = redscript_ast::SourceMap::new();
-        let id = map.add(path, contents.to_string());
+        let id = map.push_back(path, contents.to_string());
         let file = map.get(id).unwrap();
 
         let settings = FormatSettings {
@@ -767,8 +767,10 @@ impl Backend {
         };
 
         let mut msg = String::new();
-        for err in errors {
-            writeln!(msg, "{}", err.pretty(&map))?;
+        for err in errors.into_iter() {
+            if let Some(err) = err.display(&map) {
+                writeln!(msg, "{err}")?;
+            }
         }
         self.spawn_error_popup(format!("formatting failed:\n{msg}"))
             .await;
