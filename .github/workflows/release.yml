@@ -4,11 +4,10 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
 
 env:
-  CARGO_INCREMENTAL: 0 # Incremental not supported by our caching
-  CARGO_TERM_COLOR: always # GH action logs supports terminal colors
-  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse # New format as of 2023-03-09
+  CARGO_TERM_COLOR: always
 
 jobs:
   prepare:
@@ -47,8 +46,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: binaries
+          path: artifacts
           merge-multiple: true
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create ${{ github.ref_name }} --generate-notes ./binaries/*
+        run: |
+          FLAGS=()
+          ARTIFACTS=$(find ./artifacts -type f)
+
+          IS_PRE_RELEASE=$(echo ${{ github.ref_name }} | grep -E 'v[0-9]+\.[0-9]+\.[0-9]+-.+')
+          if [ -n "$IS_PRE_RELEASE" ]; then
+            FLAGS+=("--prerelease")
+          fi
+
+          gh release create ${{ github.ref_name }} --generate-notes ${FLAGS[@]} $ARTIFACTS
