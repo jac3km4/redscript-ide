@@ -2,13 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["*.*.x"]
   pull_request:
+    branches: ["*.*.x"]
 
 env:
-  CARGO_INCREMENTAL: 0 # Incremental not supported by our caching
-  CARGO_TERM_COLOR: always # GH action logs support terminal colors
-  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse # New format as of 2023-03-09
+  CARGO_TERM_COLOR: always
 
 jobs:
   lint:
