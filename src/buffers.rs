@@ -1,28 +1,29 @@
-use dashmap::DashMap;
-use lspower::lsp;
-use redscript::ast::Pos;
+use std::collections::HashMap;
+
+use lsp_types as lsp;
 use ropey::Rope;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Buffers {
-    map: DashMap<lsp::Url, Buffer>,
+    map: HashMap<lsp::Uri, Buffer>,
 }
 
 impl Buffers {
-    pub fn add(&self, url: lsp::Url, content: String) {
+    pub fn add(&mut self, url: lsp::Uri, content: String) {
         self.map.insert(url, Buffer::new(content));
     }
 
-    pub fn update(&self, url: &lsp::Url, change: lsp::TextDocumentContentChangeEvent) {
-        let mut buf = self.map.get_mut(url).unwrap();
-        buf.update(change);
+    pub fn update_range(&mut self, url: &lsp::Uri, range: lsp::Range, text: String) {
+        let buf = self.map.get_mut(url).unwrap();
+        buf.update_range(range, text);
     }
 
-    pub fn get(&self, url: &lsp::Url) -> Option<dashmap::mapref::one::Ref<'_, lsp::Url, Buffer>> {
+    pub fn get(&self, url: &lsp::Uri) -> Option<&Buffer> {
         self.map.get(url)
     }
 }
 
+#[derive(Debug)]
 pub struct Buffer {
     contents: Rope,
 }
@@ -34,32 +35,19 @@ impl Buffer {
         }
     }
 
-    pub fn update(&mut self, change: lsp::TextDocumentContentChangeEvent) {
-        match change.range {
-            Some(range) => {
-                let start = self.contents.line_to_char(range.start.line as usize)
-                    + range.start.character as usize;
-                let end = self.contents.line_to_char(range.end.line as usize)
-                    + range.end.character as usize;
-                self.contents.remove(start..end);
-                self.contents.insert(start, &change.text);
-            }
-            None => {
-                self.contents = Rope::from_str(&change.text);
-            }
-        }
+    pub fn update_range(&mut self, range: lsp::Range, text: String) {
+        let start =
+            self.contents.line_to_char(range.start.line as usize) + range.start.character as usize;
+        let end =
+            self.contents.line_to_char(range.end.line as usize) + range.end.character as usize;
+        self.contents.remove(start..end);
+        self.contents.insert(start, &text);
     }
 
-    pub fn get_pos(&self, line: u32, col: u32) -> Option<Pos> {
+    pub fn get_pos(&self, line: u32, col: u32) -> Option<u32> {
         let line_start = self.contents.line_to_char(line as usize);
         let byte_index = self.contents.char_to_byte(line_start + col as usize);
-        Some(Pos::new(byte_index))
-    }
-
-    pub fn get_loc(&self, pos: Pos) -> Option<(u32, u32)> {
-        let line = self.contents.byte_to_line(pos.into());
-        let col = self.contents.byte_to_char(pos.into()) - self.contents.line_to_char(line);
-        Some((line as u32, col as u32))
+        Some(byte_index as u32)
     }
 
     pub fn contents(&self) -> &Rope {
