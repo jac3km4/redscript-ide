@@ -1,6 +1,6 @@
 [package]
 name = "redscript-ide"
-version = "0.2.0-dev"
+version = "0.2.0-preview1"
 edition = "2024"
 
 [dependencies]
