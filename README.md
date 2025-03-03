@@ -37,6 +37,9 @@ This file can contain some configuration options:
 
   Use the [Redscript IDE extension from the marketplace](https://marketplace.visualstudio.com/items?itemName=jac3km4.redscript-ide-vscode).
 
+- ### IntelliJ
+  Use the (work in progress) [Redscript-IntelliJ Plugin](https://github.com/pawrequest/redscript-intellij).
+
 - ### Neovim
 
   Add the snippet below to your `init.lua` and replace `/path/to/redscript-ide` with the path to
