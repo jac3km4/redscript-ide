@@ -191,9 +191,8 @@ impl RedscriptLanguageServer {
         query: &str,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp::WorkspaceSymbolResponse> {
-        self.cache.with(|cache| {
-            let funcs = cache
-                .symbols
+        self.check_workspace(|_, syms, _, sources| {
+            let funcs = syms
                 .free_functions()
                 .filter_map(|e| Some((*e.name(), e.func().span()?)))
                 .filter(|(name, _)| name.as_ref().last().is_some_and(|n| n.contains(query)))
@@ -204,12 +203,11 @@ impl RedscriptLanguageServer {
                         kind: lsp::SymbolKind::FUNCTION,
                         tags: None,
                         deprecated: None,
-                        location: location(span, cache.sources, ctx)?,
+                        location: location(span, sources, ctx)?,
                         container_name: None,
                     })
                 });
-            let types = cache
-                .symbols
+            let types = syms
                 .types()
                 .filter_map(|(id, def)| Some((id, def.span()?)))
                 .filter(|(id, _)| id.as_str().contains(query))
@@ -220,7 +218,7 @@ impl RedscriptLanguageServer {
                         kind: lsp::SymbolKind::CLASS,
                         tags: None,
                         deprecated: None,
-                        location: location(span, cache.sources, ctx)?,
+                        location: location(span, sources, ctx)?,
                         container_name: None,
                     })
                 });
