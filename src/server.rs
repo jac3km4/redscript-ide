@@ -1,8 +1,11 @@
+use std::borrow::Cow;
+use std::ffi::OsString;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::str::FromStr;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use crossbeam_channel::Sender;
 use lsp_server::{Connection, ErrorCode, Message, RequestId, Response, ResponseError};
 use lsp_types::notification::Notification;
@@ -84,7 +87,11 @@ impl LspServer<'_> {
                         ..
                     } = serde_json::from_value(request.params)?;
                     let doc = self.document_location(&params.text_document.uri, params.position)?;
-                    self.handle_response(request.id, self.server.completion(doc, &self.context))?;
+                    let completion = self.server.completion(doc, &self.context);
+                    self.handle_response(
+                        request.id,
+                        completion.as_deref().map_err(|err| anyhow!("{err}")),
+                    )?;
                 }
                 lsp::request::GotoDefinition::METHOD => {
                     let lsp::GotoDefinitionParams {
@@ -243,7 +250,7 @@ pub trait LanguageServer {
         &self,
         doc: CodeLocation<'_>,
         ctx: &LspContext,
-    ) -> anyhow::Result<lsp::CompletionResponse>;
+    ) -> anyhow::Result<Rc<lsp::CompletionResponse>>;
     fn goto_definition(
         &self,
         doc: CodeLocation<'_>,
@@ -277,12 +284,8 @@ impl LspContext {
     }
 
     pub fn notify<N: lsp::notification::Notification>(&self, params: N::Params) {
-        self.sender
-            .send(Message::Notification(lsp_server::Notification::new(
-                N::METHOD.into(),
-                params,
-            )))
-            .ok();
+        let notification = lsp_server::Notification::new(N::METHOD.into(), params);
+        self.sender.send(Message::Notification(notification)).ok();
     }
 
     pub fn uri(&self, path: &Path) -> anyhow::Result<lsp::Uri> {
@@ -317,7 +320,7 @@ impl<'a> LspLog<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Document<'a> {
     path: PathBuf,
     body: &'a Buffer,
@@ -337,7 +340,7 @@ impl<'a> Document<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CodeLocation<'a> {
     document: Document<'a>,
     pos: u32,
@@ -382,17 +385,25 @@ impl Options {
 fn path_from_uri(uri: &lsp::Uri) -> anyhow::Result<PathBuf> {
     let stripped = uri
         .as_str()
-        .strip_prefix("file:///")
+        .strip_prefix("file://")
         .context("receiver non-URI path")?;
     Ok(PathBuf::from(urlencoding::decode(stripped)?.as_ref()))
 }
 
 fn uri_from_path(path: &Path) -> anyhow::Result<lsp::Uri> {
     let str = path
-        .to_str()
-        .context("receiver URI with non-UTF-8 characters")?;
-    let encoded = urlencoding::encode(str);
-    Ok(lsp::Uri::from_str(&format!("file:///{encoded}"))?)
+        .components()
+        .map(|c| match c {
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::CurDir
+            | std::path::Component::ParentDir => Cow::Borrowed(c.as_os_str()),
+            std::path::Component::Normal(os_str) => {
+                OsString::from(urlencoding::encode(&os_str.to_string_lossy()).as_ref()).into()
+            }
+        })
+        .collect::<PathBuf>();
+    Ok(lsp::Uri::from_str(&format!("file://{}", str.display()))?)
 }
 
 fn capabilities() -> lsp::ServerCapabilities {
@@ -401,9 +412,20 @@ fn capabilities() -> lsp::ServerCapabilities {
             lsp::TextDocumentSyncKind::INCREMENTAL,
         )),
         completion_provider: Some(lsp::CompletionOptions {
+            resolve_provider: Some(true),
             trigger_characters: Some(vec![".".to_owned()]),
+            completion_item: Some(lsp::CompletionOptionsCompletionItem {
+                label_details_support: Some(true),
+            }),
             ..Default::default()
         }),
+        diagnostic_provider: Some(lsp::DiagnosticServerCapabilities::Options(
+            lsp::DiagnosticOptions {
+                inter_file_dependencies: true,
+                workspace_diagnostics: true,
+                ..Default::default()
+            },
+        )),
         hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
         definition_provider: Some(lsp::OneOf::Left(true)),
         workspace: Some(lsp::WorkspaceServerCapabilities {

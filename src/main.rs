@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::{fs, iter, mem};
 
 use anyhow::bail;
@@ -56,6 +58,7 @@ fn main() -> anyhow::Result<()> {
 struct RedscriptLanguageServer {
     workspace_dirs: BTreeSet<PathBuf>,
     cache: CompilationCache,
+    cached_completions: RefCell<Option<CachedCompletions>>,
 }
 
 impl RedscriptLanguageServer {
@@ -64,6 +67,7 @@ impl RedscriptLanguageServer {
         Ok(Self {
             cache: CompilationCache::make(cache_bytes, workspace_folders, TypeInterner::default())?,
             workspace_dirs: workspace_folders.iter().cloned().collect(),
+            cached_completions: RefCell::new(None),
         })
     }
 
@@ -99,13 +103,29 @@ impl RedscriptLanguageServer {
         &self,
         loc: CodeLocation<'_>,
         ctx: &LspContext,
-    ) -> anyhow::Result<lsp::CompletionResponse> {
+    ) -> anyhow::Result<Rc<lsp::CompletionResponse>> {
         let preceding_pos = loc.pos() - 1;
-        self.patched_expr_at(
-            loc.with_pos(preceding_pos),
+        let byte = loc.doc().buffer().contents().byte(preceding_pos as usize);
+
+        if let Some(cached) = &mut *self.cached_completions.borrow_mut() {
+            if cached.file == loc.doc().path()
+                && loc.pos().saturating_sub(cached.pos) <= 1
+                && (byte == b'_' || byte.is_ascii_alphanumeric())
+            {
+                cached.pos = loc.pos();
+                return Ok(cached.completions.clone());
+            }
+        };
+
+        if byte != b'.' {
+            return Ok(Rc::new(lsp::CompletionResponse::Array(vec![])));
+        }
+
+        let completions = self.patched_expr_at(
+            loc.clone().with_pos(preceding_pos),
             |at| {
                 let typ = at.expr_type();
-                let res = if let Some(typ) = typ
+                if let Some(typ) = typ
                     .as_ref()
                     .map(Type::unwrap_ref_or_self)
                     .and_then(Type::upper_bound)
@@ -114,26 +134,28 @@ impl RedscriptLanguageServer {
                         .symbols()
                         .query_methods(typ.id())
                         .filter(|m| !m.func().flags().is_static())
-                        .map(|e| lsp::CompletionItem {
-                            label: (*e.name()).to_string(),
-                            label_details: Some(lsp::CompletionItemLabelDetails {
-                                detail: Some(
-                                    FunctionTypeDisplay::new(e.func().type_()).to_string(),
+                        .map(|e| {
+                            let detail = FunctionTypeDisplay::new(e.func().type_()).to_string();
+                            lsp::CompletionItem {
+                                label: (*e.name()).to_string(),
+                                label_details: Some(lsp::CompletionItemLabelDetails {
+                                    detail: Some(detail.clone()),
+                                    description: None,
+                                }),
+                                detail: Some(detail),
+                                kind: Some(lsp::CompletionItemKind::METHOD),
+                                documentation: Some(lsp::Documentation::MarkupContent(
+                                    lsp::MarkupContent {
+                                        kind: lsp::MarkupKind::Markdown,
+                                        value: DocDisplay::new(e.func().doc()).to_string(),
+                                    },
+                                )),
+                                insert_text: Some(
+                                    SnippetDisplay::new(e.name(), e.func().type_()).to_string(),
                                 ),
-                                description: None,
-                            }),
-                            kind: Some(lsp::CompletionItemKind::METHOD),
-                            documentation: Some(lsp::Documentation::MarkupContent(
-                                lsp::MarkupContent {
-                                    kind: lsp::MarkupKind::Markdown,
-                                    value: DocDisplay::new(e.func().doc()).to_string(),
-                                },
-                            )),
-                            insert_text: Some(
-                                SnippetDisplay::new(e.name(), e.func().type_()).to_string(),
-                            ),
-                            insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
-                            ..Default::default()
+                                insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
+                                ..Default::default()
+                            }
                         });
 
                     let methods = at
@@ -141,30 +163,45 @@ impl RedscriptLanguageServer {
                         .base_iter(typ.id())
                         .filter_map(|(_, def)| def.schema().as_aggregate())
                         .flat_map(|agg| agg.fields().iter())
-                        .map(|e| lsp::CompletionItem {
-                            label: e.name().to_string(),
-                            label_details: Some(lsp::CompletionItemLabelDetails {
-                                detail: Some(format!(": {}", e.field().type_())),
-                                description: None,
-                            }),
-                            kind: Some(lsp::CompletionItemKind::FIELD),
-                            documentation: Some(lsp::Documentation::MarkupContent(
-                                lsp::MarkupContent {
-                                    kind: lsp::MarkupKind::Markdown,
-                                    value: DocDisplay::new(e.field().doc()).to_string(),
-                                },
-                            )),
-                            ..Default::default()
+                        .map(|e| {
+                            let detail = format!(": {}", e.field().type_());
+                            lsp::CompletionItem {
+                                label: e.name().to_string(),
+                                label_details: Some(lsp::CompletionItemLabelDetails {
+                                    detail: Some(detail.clone()),
+                                    description: None,
+                                }),
+                                detail: Some(detail),
+                                kind: Some(lsp::CompletionItemKind::FIELD),
+                                documentation: Some(lsp::Documentation::MarkupContent(
+                                    lsp::MarkupContent {
+                                        kind: lsp::MarkupKind::Markdown,
+                                        value: DocDisplay::new(e.field().doc()).to_string(),
+                                    },
+                                )),
+                                ..Default::default()
+                            }
                         });
 
-                    fields.chain(methods).collect::<Vec<_>>()
+                    Ok(fields.chain(methods).collect::<Vec<_>>())
                 } else {
-                    vec![]
-                };
-                Ok(res.into())
+                    Ok(vec![])
+                }
             },
             ctx,
-        )
+        )?;
+
+        if !completions.is_empty() {
+            let resp = Rc::new(lsp::CompletionResponse::Array(completions));
+            *self.cached_completions.borrow_mut() = Some(CachedCompletions::new(
+                resp.clone(),
+                loc.doc().path().to_owned(),
+                loc.pos(),
+            ));
+            Ok(resp)
+        } else {
+            Ok(Rc::new(lsp::CompletionResponse::Array(vec![])))
+        }
     }
 
     fn definition_at(
@@ -525,7 +562,7 @@ impl LanguageServer for RedscriptLanguageServer {
         &self,
         loc: CodeLocation<'_>,
         _ctx: &LspContext,
-    ) -> anyhow::Result<lsp_types::CompletionResponse> {
+    ) -> anyhow::Result<Rc<lsp_types::CompletionResponse>> {
         self.completion_at(loc, _ctx)
     }
 
@@ -559,6 +596,23 @@ impl LanguageServer for RedscriptLanguageServer {
 enum FileResolution {
     Workspace,
     NonWorkspace(PathBuf),
+}
+
+#[derive(Debug)]
+struct CachedCompletions {
+    completions: Rc<lsp::CompletionResponse>,
+    file: PathBuf,
+    pos: u32,
+}
+
+impl CachedCompletions {
+    fn new(completions: Rc<lsp::CompletionResponse>, file: PathBuf, pos: u32) -> Self {
+        Self {
+            completions,
+            file,
+            pos,
+        }
+    }
 }
 
 fn find_cache_file(game_dir: &Path) -> anyhow::Result<PathBuf> {
