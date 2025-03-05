@@ -4,7 +4,6 @@ use redscript_compiler_api::{FunctionType, Symbols, ir};
 
 use crate::query::{ExprAt, type_of};
 
-#[derive(Debug)]
 pub struct ExprAtDisplay<'ctx, 'a> {
     inner: ExprAt<'ctx, 'a>,
 }
@@ -66,35 +65,29 @@ impl fmt::Display for CallDisplay<'_, '_> {
                 writeln!(f, "{name}{}", FunctionTypeDisplay::new(func.type_()))?;
                 func.doc()
             }
-            &ir::Call::Static {
-                parent_id, method, ..
-            } => {
+            &ir::Call::Static { method, .. } => {
                 let (name, func) = self.symbols.get_method(method).unwrap();
                 writeln!(
                     f,
-                    "{parent_id}::{name}{}",
+                    "{}::{name}{}",
+                    method.parent(),
                     FunctionTypeDisplay::new(func.type_())
                 )?;
                 func.doc()
             }
-            ir::Call::Instance {
-                receiver_type,
-                method,
-                ..
-            } => {
-                let typ = receiver_type.coalesced(self.symbols).unwrap();
+            ir::Call::Instance { method, .. } => {
                 let (name, func) = self.symbols.get_method(*method).unwrap();
                 writeln!(
                     f,
                     "{}::{name}{}",
-                    typ.id(),
+                    method.parent(),
                     FunctionTypeDisplay::new(func.type_())
                 )?;
                 func.doc()
             }
             ir::Call::Closure { closure_type, .. } => {
                 if let Ok(ft) = closure_type.coalesced(self.symbols) {
-                    writeln!(f, "{}", ft)?;
+                    writeln!(f, "{ft}")?;
                 }
                 return Ok(());
             }

@@ -6,7 +6,7 @@ use redscript_compiler_api::{FunctionType, LoweredFunction, PolyType, Symbols, T
 
 use crate::display::ExprAtDisplay;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExprAt<'ctx, 'a> {
     expr: Option<&'a ir::Expr<'ctx>>,
     func: Option<&'a LoweredFunction<'ctx>>,
@@ -191,14 +191,4 @@ fn type_of_call<'ctx>(
         .ok()?
         .coalesce(symbols)
         .ok()
-}
-
-pub fn find_expr<'ctx, 'a>(
-    fns: &'a [&'a LoweredFunction<'ctx>],
-    pos: u32,
-) -> Option<(&'a LoweredFunction<'ctx>, &'a ir::Expr<'ctx>)> {
-    let idx = fns.binary_search_by(|f| f.span.cmp_pos(pos)).ok()?;
-    let func = fns[idx];
-    let expr = func.block.find_at(pos)?;
-    Some((func, expr))
 }

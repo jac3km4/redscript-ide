@@ -13,6 +13,10 @@ impl Buffers {
         self.map.insert(url, Buffer::new(content));
     }
 
+    pub fn remove(&mut self, url: &lsp::Uri) {
+        self.map.remove(url);
+    }
+
     pub fn update_range(&mut self, url: &lsp::Uri, range: lsp::Range, text: String) {
         let buf = self.map.get_mut(url).unwrap();
         buf.update_range(range, text);

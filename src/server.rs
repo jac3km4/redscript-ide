@@ -35,7 +35,7 @@ impl LspServer<'_> {
         let init_params: lsp::InitializeParams = serde_json::from_value(params)?;
         let workspace_folders = init_params
             .workspace_folders
-            .unwrap()
+            .unwrap_or_default()
             .into_iter()
             .map(|folder| path_from_uri(&folder.uri))
             .collect::<Result<Vec<PathBuf>, _>>()?;
@@ -130,12 +130,17 @@ impl LspServer<'_> {
                     let lsp::DidSaveTextDocumentParams {
                         text_document: doc, ..
                     } = serde_json::from_value(notif.params)?;
-                    self.server.check(self.document(&doc.uri)?, &self.context)?;
+                    self.server.check(path_from_uri(&doc.uri)?, &self.context)?;
                 }
                 lsp::notification::DidOpenTextDocument::METHOD => {
                     let lsp::DidOpenTextDocumentParams { text_document: doc } =
                         serde_json::from_value(notif.params)?;
                     self.buffers.add(doc.uri, doc.text);
+                }
+                lsp::notification::DidCloseTextDocument::METHOD => {
+                    let lsp::DidCloseTextDocumentParams { text_document: doc } =
+                        serde_json::from_value(notif.params)?;
+                    self.buffers.remove(&doc.uri);
                 }
                 lsp::notification::DidChangeTextDocument::METHOD => {
                     let lsp::DidChangeTextDocumentParams {
@@ -226,7 +231,7 @@ impl LspServer<'_> {
 }
 
 pub trait LanguageServer {
-    fn check(&self, doc: Document<'_>, ctx: &LspContext) -> anyhow::Result<()>;
+    fn check(&mut self, path: PathBuf, ctx: &LspContext) -> anyhow::Result<()>;
     fn change_workspace_folders(
         &mut self,
         added: Vec<PathBuf>,

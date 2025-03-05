@@ -12,22 +12,21 @@ ouroboros = "0.18"
 urlencoding = "2"
 ropey = "1"
 crossbeam-channel = "0.5"
-vmap = "0.6"
 mimalloc = "0.1"
 lsp-server = "0.7"
 lsp-types = "0.97"
 
 [dependencies.redscript-parser]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview4"
+rev = "3f6e595"
 
 [dependencies.redscript-formatter]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview4"
+rev = "3f6e595"
 
 [dependencies.redscript-compiler-api]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview4"
+rev = "3f6e595"
 features = ["walkdir"]
 
 [patch.crates-io]

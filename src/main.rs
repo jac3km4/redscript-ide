@@ -6,11 +6,13 @@ use anyhow::bail;
 use display::{DocDisplay, FunctionTypeDisplay, SnippetDisplay};
 use lsp_types as lsp;
 use mimalloc::MiMalloc;
-use query::{ExprAt, find_expr};
+use ouroboros::self_referencing;
+use query::ExprAt;
 use redscript_compiler_api::types::Type;
 use redscript_compiler_api::{
-    CompilationInputs, CompileErrorReporter, Diagnostic, LoweredCompilationUnit, ScriptBundle,
-    SourceMapExt, Symbols, TypeInterner, ast, infer_from_sources, parse_sources, process_sources,
+    CompilationInputs, CompileErrorReporter, Diagnostic, Evaluator, LoweredCompilationUnit,
+    ScriptBundle, SourceMapExt, Symbols, TypeInterner, ast, infer_from_sources, parse_one,
+    parse_sources, process_sources,
 };
 use redscript_formatter::{FormatSettings, format_document};
 use serde::Deserialize;
@@ -41,109 +43,129 @@ fn main() -> anyhow::Result<()> {
             } else {
                 bail!("game directory initialization options were not provided");
             };
-            let bytes = fs::read(find_cache_file(&game_dir)?)?;
-            Ok((opts.workspace_dirs, bytes))
+            Ok((opts.workspace_dirs, game_dir))
         },
-        |(dirs, bytes), ctx| {
-            let bundle = ScriptBundle::from_bytes(bytes)?;
-            let ls = RedscriptLanguageServer::new(bundle, dirs.iter().cloned().collect());
-            ls.check_workspace(ctx)?;
+        |(dirs, game_dir), ctx| {
+            let ls = RedscriptLanguageServer::new(find_cache_file(game_dir)?, dirs)?;
+            ls.check_workspace_and_publish(ctx)?;
             Ok(Box::new(ls))
         },
     )
 }
 
-#[derive(Debug)]
-struct RedscriptLanguageServer<'a> {
-    bundle: ScriptBundle<'a>,
-    workspace_folders: BTreeSet<PathBuf>,
+struct RedscriptLanguageServer {
+    cache_path: PathBuf,
+    workspace_dirs: BTreeSet<PathBuf>,
+    cache: CompilationCache,
 }
 
-impl<'a> RedscriptLanguageServer<'a> {
-    fn new(bundle: ScriptBundle<'a>, workspace_folders: BTreeSet<PathBuf>) -> Self {
-        Self {
-            bundle,
-            workspace_folders,
-        }
+impl RedscriptLanguageServer {
+    fn new(cache_path: PathBuf, workspace_folders: &[PathBuf]) -> anyhow::Result<Self> {
+        Ok(Self {
+            cache: CompilationCache::make(&cache_path, workspace_folders)?,
+            workspace_dirs: workspace_folders.iter().cloned().collect(),
+            cache_path,
+        })
     }
 
     fn resolve_path(&self, path: &Path) -> anyhow::Result<FileResolution> {
-        if iter::successors(Some(path), |p| p.parent()).any(|p| self.workspace_folders.contains(p))
-        {
+        if iter::successors(Some(path), |p| p.parent()).any(|p| self.workspace_dirs.contains(p)) {
             Ok(FileResolution::Workspace)
         } else {
             Ok(FileResolution::NonWorkspace(path.to_owned()))
         }
     }
 
-    fn hover_at(&self, loc: CodeLocation<'_>) -> anyhow::Result<lsp::Hover> {
-        self.expr_at(loc, |at| {
-            Ok(lsp::Hover {
-                contents: lsp::HoverContents::Markup(lsp::MarkupContent {
-                    kind: lsp::MarkupKind::Markdown,
-                    value: at.display().to_string(),
-                }),
-                range: None,
-            })
-        })
+    fn hover_at(&self, loc: CodeLocation<'_>, ctx: &LspContext) -> anyhow::Result<lsp::Hover> {
+        self.expr_at(
+            loc,
+            |at| {
+                let range = at.expr().and_then(|e| {
+                    let span = e.span();
+                    range(span, at.sources().get(span.file)?)
+                });
+                Ok(lsp::Hover {
+                    contents: lsp::HoverContents::Markup(lsp::MarkupContent {
+                        kind: lsp::MarkupKind::Markdown,
+                        value: at.display().to_string(),
+                    }),
+                    range,
+                })
+            },
+            ctx,
+        )
     }
 
-    fn completion_at(&self, loc: CodeLocation<'_>) -> anyhow::Result<lsp::CompletionResponse> {
+    fn completion_at(
+        &self,
+        loc: CodeLocation<'_>,
+        ctx: &LspContext,
+    ) -> anyhow::Result<lsp::CompletionResponse> {
         let preceding_pos = loc.pos() - 1;
-        self.patched_expr_at(loc.with_pos(preceding_pos), |at| {
-            let typ = at.expr_type();
-            let res = if let Some(typ) = typ.as_ref().and_then(Type::upper_bound) {
-                let fields = at
-                    .symbols()
-                    .query_methods(typ.id())
-                    .filter(|m| !m.func().flags().is_static())
-                    .map(|e| lsp::CompletionItem {
-                        label: (*e.name()).to_string(),
-                        label_details: Some(lsp::CompletionItemLabelDetails {
-                            detail: Some(FunctionTypeDisplay::new(e.func().type_()).to_string()),
-                            description: None,
-                        }),
-                        kind: Some(lsp::CompletionItemKind::METHOD),
-                        documentation: Some(lsp::Documentation::MarkupContent(
-                            lsp::MarkupContent {
-                                kind: lsp::MarkupKind::Markdown,
-                                value: DocDisplay::new(e.func().doc()).to_string(),
-                            },
-                        )),
-                        insert_text: Some(
-                            SnippetDisplay::new(e.name(), e.func().type_()).to_string(),
-                        ),
-                        insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
-                        ..Default::default()
-                    });
+        self.patched_expr_at(
+            loc.with_pos(preceding_pos),
+            |at| {
+                let typ = at.expr_type();
+                let res = if let Some(typ) = typ
+                    .as_ref()
+                    .map(Type::unwrap_ref_or_self)
+                    .and_then(Type::upper_bound)
+                {
+                    let fields = at
+                        .symbols()
+                        .query_methods(typ.id())
+                        .filter(|m| !m.func().flags().is_static())
+                        .map(|e| lsp::CompletionItem {
+                            label: (*e.name()).to_string(),
+                            label_details: Some(lsp::CompletionItemLabelDetails {
+                                detail: Some(
+                                    FunctionTypeDisplay::new(e.func().type_()).to_string(),
+                                ),
+                                description: None,
+                            }),
+                            kind: Some(lsp::CompletionItemKind::METHOD),
+                            documentation: Some(lsp::Documentation::MarkupContent(
+                                lsp::MarkupContent {
+                                    kind: lsp::MarkupKind::Markdown,
+                                    value: DocDisplay::new(e.func().doc()).to_string(),
+                                },
+                            )),
+                            insert_text: Some(
+                                SnippetDisplay::new(e.name(), e.func().type_()).to_string(),
+                            ),
+                            insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
+                            ..Default::default()
+                        });
 
-                let methods = at
-                    .symbols()
-                    .base_iter(typ.id())
-                    .filter_map(|(_, def)| def.schema().as_aggregate())
-                    .flat_map(|agg| agg.fields().iter())
-                    .map(|e| lsp::CompletionItem {
-                        label: e.name().to_string(),
-                        label_details: Some(lsp::CompletionItemLabelDetails {
-                            detail: Some(format!(": {}", e.field().type_())),
-                            description: None,
-                        }),
-                        kind: Some(lsp::CompletionItemKind::FIELD),
-                        documentation: Some(lsp::Documentation::MarkupContent(
-                            lsp::MarkupContent {
-                                kind: lsp::MarkupKind::Markdown,
-                                value: DocDisplay::new(e.field().doc()).to_string(),
-                            },
-                        )),
-                        ..Default::default()
-                    });
+                    let methods = at
+                        .symbols()
+                        .base_iter(typ.id())
+                        .filter_map(|(_, def)| def.schema().as_aggregate())
+                        .flat_map(|agg| agg.fields().iter())
+                        .map(|e| lsp::CompletionItem {
+                            label: e.name().to_string(),
+                            label_details: Some(lsp::CompletionItemLabelDetails {
+                                detail: Some(format!(": {}", e.field().type_())),
+                                description: None,
+                            }),
+                            kind: Some(lsp::CompletionItemKind::FIELD),
+                            documentation: Some(lsp::Documentation::MarkupContent(
+                                lsp::MarkupContent {
+                                    kind: lsp::MarkupKind::Markdown,
+                                    value: DocDisplay::new(e.field().doc()).to_string(),
+                                },
+                            )),
+                            ..Default::default()
+                        });
 
-                fields.chain(methods).collect::<Vec<_>>()
-            } else {
-                vec![]
-            };
-            Ok(res.into())
-        })
+                    fields.chain(methods).collect::<Vec<_>>()
+                } else {
+                    vec![]
+                };
+                Ok(res.into())
+            },
+            ctx,
+        )
     }
 
     fn definition_at(
@@ -151,47 +173,54 @@ impl<'a> RedscriptLanguageServer<'a> {
         loc: CodeLocation<'_>,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp::GotoDefinitionResponse> {
-        self.expr_at(loc, |at| {
-            let locations = at
-                .definition_span()
-                .and_then(|span| Some(vec![location(span, at.sources(), ctx)?]))
-                .unwrap_or_default();
-            Ok(locations.into())
-        })
+        self.expr_at(
+            loc,
+            |at| {
+                let locations = at
+                    .definition_span()
+                    .and_then(|span| Some(vec![location(span, at.sources(), ctx)?]))
+                    .unwrap_or_default();
+                Ok(locations.into())
+            },
+            ctx,
+        )
     }
 
-    fn workspace_symbol(
+    fn workspace_symbols(
         &self,
         query: &str,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp::WorkspaceSymbolResponse> {
-        let sources = ast::SourceMap::from_paths_recursively(&self.workspace_folders)?;
-        self.check_with(sources, |_, syms, _, sources| {
-            let funcs = syms
+        self.cache.with(|cache| {
+            let funcs = cache
+                .symbols
                 .free_functions()
                 .filter_map(|e| Some((*e.name(), e.func().span()?)))
                 .filter(|(name, _)| name.as_ref().last().is_some_and(|n| n.contains(query)))
                 .filter_map(|(name, span)| {
+                    #[allow(deprecated)]
                     Some(lsp::SymbolInformation {
                         name: name.to_string(),
                         kind: lsp::SymbolKind::FUNCTION,
                         tags: None,
                         deprecated: None,
-                        location: location(span, sources, ctx)?,
+                        location: location(span, cache.sources, ctx)?,
                         container_name: None,
                     })
                 });
-            let types = syms
+            let types = cache
+                .symbols
                 .types()
                 .filter_map(|(id, def)| Some((id, def.span()?)))
                 .filter(|(id, _)| id.as_str().contains(query))
                 .filter_map(|(id, span)| {
+                    #[allow(deprecated)]
                     Some(lsp::SymbolInformation {
                         name: id.to_string(),
                         kind: lsp::SymbolKind::CLASS,
                         tags: None,
                         deprecated: None,
-                        location: location(span, sources, ctx)?,
+                        location: location(span, cache.sources, ctx)?,
                         container_name: None,
                     })
                 });
@@ -207,7 +236,7 @@ impl<'a> RedscriptLanguageServer<'a> {
         tab_size: u16,
     ) -> anyhow::Result<Vec<lsp::TextEdit>> {
         let contents = doc.buffer().contents();
-        let mut map = ast::SourceMap::new();
+        let map = ast::SourceMap::new();
         let id = map.push_back(doc.path(), contents.to_string());
         let file = map.get(id).unwrap();
 
@@ -234,20 +263,22 @@ impl<'a> RedscriptLanguageServer<'a> {
         Ok(vec![])
     }
 
-    fn check_workspace(&self, ctx: &LspContext) -> anyhow::Result<()> {
-        let sources = ast::SourceMap::from_paths_recursively(&self.workspace_folders)?;
-        self.check(sources, ctx)
+    fn reload_cache(&mut self) -> anyhow::Result<()> {
+        self.cache = CompilationCache::make(&self.cache_path, &self.workspace_dirs)?;
+        Ok(())
     }
 
-    fn check(&self, sources: ast::SourceMap, ctx: &LspContext) -> anyhow::Result<()> {
-        self.check_with(sources, |_, _, diags, sources| {
-            self.publish_diagnostics(diags, sources, ctx)
-        })
+    fn reload_cache_with_file(&mut self, path: PathBuf) -> anyhow::Result<()> {
+        self.cache = CompilationCache::make(&self.cache_path, [path])?;
+        Ok(())
     }
 
-    fn check_with<A>(
+    fn check_workspace_and_publish(&self, ctx: &LspContext) -> anyhow::Result<()> {
+        self.check_workspace(|_, _, diags, sources| Self::publish_diagnostics(diags, sources, ctx))
+    }
+
+    fn check_workspace<A>(
         &self,
-        mut sources: ast::SourceMap,
         cb: impl Fn(
             &LoweredCompilationUnit<'_>,
             &Symbols<'_>,
@@ -255,15 +286,14 @@ impl<'a> RedscriptLanguageServer<'a> {
             &ast::SourceMap,
         ) -> anyhow::Result<A>,
     ) -> anyhow::Result<A> {
-        sources.populate_boot_lib();
-        let interner = TypeInterner::default();
-        let syms = CompilationInputs::load_without_mapping(&self.bundle, &interner)?;
-        let (unit, syms, diags) = infer_from_sources(&sources, &interner, syms);
-        cb(&unit, &syms, &diags, &sources)
+        self.cache.with(|cache| {
+            let (unit, syms, diags) =
+                infer_from_sources(cache.sources, cache.interner, cache.symbols.clone());
+            cb(&unit, &syms, &diags, cache.sources)
+        })
     }
 
     fn publish_diagnostics(
-        &self,
         diags: &[Diagnostic<'_>],
         sources: &ast::SourceMap,
         ctx: &LspContext,
@@ -314,16 +344,18 @@ impl<'a> RedscriptLanguageServer<'a> {
         &self,
         loc: CodeLocation<'_>,
         cb: impl Fn(ExprAt<'_, '_>) -> anyhow::Result<A>,
+        ctx: &LspContext,
     ) -> anyhow::Result<A> {
-        self.expr_at_with(loc, false, cb)
+        self.expr_at_with(loc, false, cb, ctx)
     }
 
     fn patched_expr_at<A>(
         &self,
         loc: CodeLocation<'_>,
         cb: impl Fn(ExprAt<'_, '_>) -> anyhow::Result<A>,
+        ctx: &LspContext,
     ) -> anyhow::Result<A> {
-        self.expr_at_with(loc, true, cb)
+        self.expr_at_with(loc, true, cb, ctx)
     }
 
     fn expr_at_with<A>(
@@ -331,46 +363,104 @@ impl<'a> RedscriptLanguageServer<'a> {
         loc: CodeLocation<'_>,
         patch: bool,
         cb: impl Fn(ExprAt<'_, '_>) -> anyhow::Result<A>,
+        _ctx: &LspContext,
     ) -> anyhow::Result<A> {
-        let interner = TypeInterner::default();
-        let mut sources = ast::SourceMap::from_paths_recursively(&self.workspace_folders)?;
+        self.cache.with(|cache| {
+            let mut contents = loc.doc().buffer().contents().to_string();
+            if patch {
+                let pos = loc.pos() as usize;
+                if let Some(c) = contents[pos..].chars().next() {
+                    contents.replace_range(pos..pos + c.len_utf8(), &" ".repeat(c.len_utf8()));
+                }
+            };
 
-        let mut contents = loc.doc().buffer().contents().to_string();
-        if patch {
-            let pos = loc.pos() as usize;
-            if let Some(c) = contents[pos..].chars().next() {
-                contents.replace_range(pos..pos + c.len_utf8(), &" ".repeat(c.len_utf8()));
-            }
-        };
+            let id = cache.sources.push_back(loc.doc().path(), contents);
+            let file = cache.sources.get(id).unwrap();
 
-        let file = sources.push_back(loc.doc().path(), contents);
+            let previous_id = cache.file_ids.get(loc.doc().path()).copied();
+
+            let mut reporter = CompileErrorReporter::default();
+            let module = parse_one(id, file, &mut reporter);
+
+            let typ = if let Some(ast::QueryResult::Type(&ast::Type::Named { name, .. })) =
+                module.as_ref().and_then(|m| m.find_at(loc.pos()))
+            {
+                Some(name)
+            } else {
+                None
+            };
+
+            let evaluator = Evaluator::from_modules(cache.modules.iter().chain(module.as_ref()));
+            let mods = cache
+                .modules
+                .iter()
+                .filter(|m| m.span().map(|s| s.file) != previous_id)
+                .cloned()
+                .chain(module);
+            let (unit, syms, _) = process_sources(
+                mods,
+                evaluator,
+                cache.interner,
+                cache.symbols.clone(),
+                reporter,
+            );
+            let func = unit
+                .all_functions()
+                .find(|f| f.span.file == id && f.span.contains(loc.pos()));
+            let expr = func.and_then(|f| f.block.find_at(loc.pos()));
+
+            let typ = typ
+                .and_then(|t| unit.scopes.get(&id)?.get(t)?.id())
+                .or_else(|| cache.interner.get_index(cache.interner.get_index_of(typ?)?));
+            cb(ExprAt::new(expr, func, typ, &syms, cache.sources))
+        })
+    }
+}
+
+#[self_referencing]
+struct CompilationCache {
+    cache_bytes: Vec<u8>,
+    interner: TypeInterner,
+    sources: ast::SourceMap,
+    file_ids: HashMap<PathBuf, ast::FileId>,
+
+    #[borrows(cache_bytes, interner, sources)]
+    #[not_covariant]
+    symbols: Symbols<'this>,
+
+    #[borrows(sources)]
+    #[not_covariant]
+    modules: Vec<ast::SourceModule<'this>>,
+}
+
+impl CompilationCache {
+    pub fn make(
+        cache_path: &Path,
+        workspace_dirs: impl IntoIterator<Item = impl Into<PathBuf>>,
+    ) -> anyhow::Result<Self> {
+        let cache_bytes = fs::read(cache_path)?;
+        let sources = ast::SourceMap::from_paths_recursively(workspace_dirs)?;
+
+        let file_ids = sources
+            .files()
+            .map(|(id, file)| (file.path().to_owned(), id))
+            .collect();
         sources.populate_boot_lib();
 
-        let mut reporter = CompileErrorReporter::default();
-        let mods = parse_sources(&sources, &mut reporter);
-
-        let symbols = CompilationInputs::load_without_mapping(&self.bundle, &interner)?;
-        let typ = if let Some(ast::QueryResult::Type(&ast::Type::Named { name, .. })) =
-            mods.last().and_then(|m| m.find_at(loc.pos()))
-        {
-            Some(name)
-        } else {
-            None
-        };
-
-        let (unit, syms, _) = process_sources(mods, &interner, symbols, reporter);
-
-        let mut index = unit
-            .all_functions()
-            .filter(|f| f.span.file == file)
-            .collect::<Vec<_>>();
-        index.sort_unstable_by_key(|func| func.span);
-        let (func, expr) = find_expr(&index, loc.pos()).unzip();
-
-        let typ = typ
-            .and_then(|t| unit.scopes.get(&file)?.get(t)?.id())
-            .or_else(|| interner.get_index(interner.get_index_of(typ?)?));
-        cb(ExprAt::new(expr, func, typ, &syms, &sources))
+        Self::try_new(
+            cache_bytes,
+            TypeInterner::default(),
+            sources,
+            file_ids,
+            |bytes, interner, _| {
+                let bundle = ScriptBundle::from_bytes(bytes)?;
+                Ok(CompilationInputs::load_without_mapping(&bundle, interner)?)
+            },
+            |sources| {
+                let mut reporter = CompileErrorReporter::default();
+                Ok(parse_sources(sources, &mut reporter))
+            },
+        )
     }
 }
 
@@ -391,12 +481,16 @@ fn range(span: ast::Span, file: &ast::File) -> Option<lsp::Range> {
     })
 }
 
-impl LanguageServer for RedscriptLanguageServer<'_> {
-    fn check(&self, doc: Document<'_>, ctx: &LspContext) -> anyhow::Result<()> {
-        match self.resolve_path(doc.path())? {
-            FileResolution::Workspace => self.check_workspace(ctx),
+impl LanguageServer for RedscriptLanguageServer {
+    fn check(&mut self, path: PathBuf, ctx: &LspContext) -> anyhow::Result<()> {
+        match self.resolve_path(&path)? {
+            FileResolution::Workspace => {
+                self.reload_cache()?;
+                self.check_workspace_and_publish(ctx)
+            }
             FileResolution::NonWorkspace(path) => {
-                self.check(ast::SourceMap::from_files([path])?, ctx)
+                self.reload_cache_with_file(path)?;
+                self.check_workspace_and_publish(ctx)
             }
         }
     }
@@ -407,15 +501,15 @@ impl LanguageServer for RedscriptLanguageServer<'_> {
         removed: Vec<PathBuf>,
         _ctx: &LspContext,
     ) -> anyhow::Result<()> {
-        self.workspace_folders.extend(added);
+        self.workspace_dirs.extend(added);
         for folder in removed {
-            self.workspace_folders.remove(&folder);
+            self.workspace_dirs.remove(&folder);
         }
         Ok(())
     }
 
     fn hover(&self, loc: CodeLocation<'_>, _ctx: &LspContext) -> anyhow::Result<lsp_types::Hover> {
-        self.hover_at(loc)
+        self.hover_at(loc, _ctx)
     }
 
     fn completion(
@@ -423,7 +517,7 @@ impl LanguageServer for RedscriptLanguageServer<'_> {
         loc: CodeLocation<'_>,
         _ctx: &LspContext,
     ) -> anyhow::Result<lsp_types::CompletionResponse> {
-        self.completion_at(loc)
+        self.completion_at(loc, _ctx)
     }
 
     fn goto_definition(
@@ -439,7 +533,7 @@ impl LanguageServer for RedscriptLanguageServer<'_> {
         query: &str,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp_types::WorkspaceSymbolResponse> {
-        self.workspace_symbol(query, ctx)
+        self.workspace_symbols(query, ctx)
     }
 
     fn format(
