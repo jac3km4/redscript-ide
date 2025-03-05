@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::{fs, iter};
+use std::{fs, iter, mem};
 
 use anyhow::bail;
 use display::{DocDisplay, FunctionTypeDisplay, SnippetDisplay};
@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
             Ok((opts.workspace_dirs, game_dir))
         },
         |(dirs, game_dir), ctx| {
-            let ls = RedscriptLanguageServer::new(find_cache_file(game_dir)?, dirs)?;
+            let ls = RedscriptLanguageServer::new(&find_cache_file(game_dir)?, dirs)?;
             ls.check_workspace_and_publish(ctx)?;
             Ok(Box::new(ls))
         },
@@ -54,17 +54,16 @@ fn main() -> anyhow::Result<()> {
 }
 
 struct RedscriptLanguageServer {
-    cache_path: PathBuf,
     workspace_dirs: BTreeSet<PathBuf>,
     cache: CompilationCache,
 }
 
 impl RedscriptLanguageServer {
-    fn new(cache_path: PathBuf, workspace_folders: &[PathBuf]) -> anyhow::Result<Self> {
+    fn new(cache_path: &Path, workspace_folders: &[PathBuf]) -> anyhow::Result<Self> {
+        let cache_bytes = fs::read(cache_path)?;
         Ok(Self {
-            cache: CompilationCache::make(&cache_path, workspace_folders)?,
+            cache: CompilationCache::make(cache_bytes, workspace_folders, TypeInterner::default())?,
             workspace_dirs: workspace_folders.iter().cloned().collect(),
-            cache_path,
         })
     }
 
@@ -261,16 +260,6 @@ impl RedscriptLanguageServer {
         Ok(vec![])
     }
 
-    fn reload_cache(&mut self) -> anyhow::Result<()> {
-        self.cache = CompilationCache::make(&self.cache_path, &self.workspace_dirs)?;
-        Ok(())
-    }
-
-    fn reload_cache_with_file(&mut self, path: PathBuf) -> anyhow::Result<()> {
-        self.cache = CompilationCache::make(&self.cache_path, [path])?;
-        Ok(())
-    }
-
     fn check_workspace_and_publish(&self, ctx: &LspContext) -> anyhow::Result<()> {
         self.check_workspace(|_, _, diags, sources| Self::publish_diagnostics(diags, sources, ctx))
     }
@@ -433,10 +422,10 @@ struct CompilationCache {
 
 impl CompilationCache {
     pub fn make(
-        cache_path: &Path,
+        cache_bytes: Vec<u8>,
         workspace_dirs: impl IntoIterator<Item = impl Into<PathBuf>>,
+        interner: TypeInterner,
     ) -> anyhow::Result<Self> {
-        let cache_bytes = fs::read(cache_path)?;
         let sources = ast::SourceMap::from_paths_recursively(workspace_dirs)?;
 
         let file_ids = sources
@@ -447,7 +436,7 @@ impl CompilationCache {
 
         Self::try_new(
             cache_bytes,
-            TypeInterner::default(),
+            interner,
             sources,
             file_ids,
             |bytes, interner, _| {
@@ -458,6 +447,28 @@ impl CompilationCache {
                 let mut reporter = CompileErrorReporter::default();
                 Ok(parse_sources(sources, &mut reporter))
             },
+        )
+    }
+
+    pub fn remake(
+        &mut self,
+        dirs: impl IntoIterator<Item = impl Into<PathBuf>>,
+    ) -> anyhow::Result<()> {
+        let cache = mem::take(self).into_heads();
+        *self = CompilationCache::make(cache.cache_bytes, dirs, cache.interner)?;
+        Ok(())
+    }
+}
+
+impl Default for CompilationCache {
+    fn default() -> Self {
+        Self::new(
+            vec![],
+            TypeInterner::default(),
+            ast::SourceMap::default(),
+            HashMap::default(),
+            |_, _, _| Symbols::with_default_types(),
+            |_| vec![],
         )
     }
 }
@@ -483,11 +494,11 @@ impl LanguageServer for RedscriptLanguageServer {
     fn check(&mut self, path: PathBuf, ctx: &LspContext) -> anyhow::Result<()> {
         match self.resolve_path(&path)? {
             FileResolution::Workspace => {
-                self.reload_cache()?;
+                self.cache.remake(&self.workspace_dirs)?;
                 self.check_workspace_and_publish(ctx)
             }
             FileResolution::NonWorkspace(path) => {
-                self.reload_cache_with_file(path)?;
+                self.cache.remake([path])?;
                 self.check_workspace_and_publish(ctx)
             }
         }
