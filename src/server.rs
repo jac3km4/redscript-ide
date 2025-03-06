@@ -1,11 +1,9 @@
-use std::borrow::Cow;
-use std::ffi::OsString;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use crossbeam_channel::Sender;
 use lsp_server::{Connection, ErrorCode, Message, RequestId, Response, ResponseError};
 use lsp_types::notification::Notification;
@@ -383,27 +381,30 @@ impl Options {
 }
 
 fn path_from_uri(uri: &lsp::Uri) -> anyhow::Result<PathBuf> {
-    let stripped = uri
-        .as_str()
-        .strip_prefix("file://")
-        .context("receiver non-URI path")?;
-    Ok(PathBuf::from(urlencoding::decode(stripped)?.as_ref()))
+    if !uri
+        .scheme()
+        .is_some_and(|scheme| scheme.eq_lowercase("file"))
+    {
+        bail!("Unsupported URI scheme");
+    }
+
+    let stripped = uri.path().as_estr().decode().into_string()?;
+    #[cfg(windows)]
+    let path = PathBuf::from(stripped.trim_start_matches("/"));
+    #[cfg(not(windows))]
+    let path = PathBuf::from(&*stripped);
+    Ok(path)
 }
 
-fn uri_from_path(path: &Path) -> anyhow::Result<lsp::Uri> {
-    let str = path
-        .components()
-        .map(|c| match c {
-            std::path::Component::Prefix(_)
-            | std::path::Component::RootDir
-            | std::path::Component::CurDir
-            | std::path::Component::ParentDir => Cow::Borrowed(c.as_os_str()),
-            std::path::Component::Normal(os_str) => {
-                OsString::from(urlencoding::encode(&os_str.to_string_lossy()).as_ref()).into()
-            }
-        })
-        .collect::<PathBuf>();
-    Ok(lsp::Uri::from_str(&format!("file://{}", str.display()))?)
+fn uri_from_path(p: &Path) -> anyhow::Result<lsp::Uri> {
+    let mut path = fluent_uri::encoding::EString::new();
+    path.encode::<fluent_uri::encoding::encoder::Path>(p.as_os_str().as_encoded_bytes());
+
+    let uri = fluent_uri::Uri::builder()
+        .scheme(fluent_uri::component::Scheme::new_or_panic("file"))
+        .path(&path)
+        .build()?;
+    Ok(lsp::Uri::from_str(uri.as_str())?)
 }
 
 fn capabilities() -> lsp::ServerCapabilities {
@@ -419,13 +420,6 @@ fn capabilities() -> lsp::ServerCapabilities {
             }),
             ..Default::default()
         }),
-        diagnostic_provider: Some(lsp::DiagnosticServerCapabilities::Options(
-            lsp::DiagnosticOptions {
-                inter_file_dependencies: true,
-                workspace_diagnostics: true,
-                ..Default::default()
-            },
-        )),
         hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
         definition_provider: Some(lsp::OneOf::Left(true)),
         workspace: Some(lsp::WorkspaceServerCapabilities {
