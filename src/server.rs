@@ -413,7 +413,6 @@ fn capabilities() -> lsp::ServerCapabilities {
             lsp::TextDocumentSyncKind::INCREMENTAL,
         )),
         completion_provider: Some(lsp::CompletionOptions {
-            resolve_provider: Some(true),
             trigger_characters: Some(vec![".".to_owned()]),
             completion_item: Some(lsp::CompletionOptionsCompletionItem {
                 label_details_support: Some(true),
