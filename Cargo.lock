@@ -77,6 +77,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eeab4423108c5d7c744f4d234de88d18d636100093ae04caf4825134b9c3a32"
 
 [[package]]
+name = "bstr"
+version = "1.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "531a9155a481e2ee699d4f98f43c0ca4ff8ee1bfd55c31e9e98fb29d2b176fe0"
+dependencies = [
+ "memchr",
+ "serde",
+]
+
+[[package]]
 name = "byte"
 version = "0.2.7"
 source = "git+https://github.com/jac3km4/byte?rev=da71833#da71833efec765732f5d08dec6b78a0c7d1de82c"
@@ -116,7 +126,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7b80276986f86789dc56ca6542d53bba9cda3c66091ebbe7bd96fc1bdf20f1f"
 dependencies = [
  "hashbrown 0.14.5",
- "regex-automata",
+ "regex-automata 0.3.9",
  "serde",
  "stacker",
  "unicode-ident",
@@ -136,6 +146,25 @@ name = "crossbeam-channel"
 version = "0.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06ba6d68e24814cb8de6bb986db8222d3a027d15872cabc0d18817bc3c0e4471"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-deque"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dd111b7b7f7d55b72c0a6ae361660ee5853c9af73f70c3c2ef6858b950e2e51"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -199,6 +228,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a0d2fde1f7b3d48b8395d5f2de76c18a528bd6a9cdde438df747bfcba3e05d6f"
 
 [[package]]
+name = "globset"
+version = "0.4.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54a1028dfc5f5df5da8a56a73e6c153c9a9708ec57232470703592a3f18e49f5"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata 0.4.9",
+ "regex-syntax 0.8.5",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -230,6 +272,22 @@ name = "identity-hash"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfdd7caa900436d8f13b2346fe10257e0c05c1f1f9e351f4f5d57c03bd5f45da"
+
+[[package]]
+name = "ignore"
+version = "0.4.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d89fd380afde86567dfba715db065673989d6253f42b88179abd3eae47bda4b"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata 0.4.9",
+ "same-file",
+ "walkdir",
+ "winapi-util",
+]
 
 [[package]]
 name = "indexmap"
@@ -392,19 +450,19 @@ dependencies = [
 [[package]]
 name = "redscript-ast"
 version = "1.0.0-preview4"
-source = "git+https://github.com/jac3km4/redscript?rev=3f6e595#3f6e59513e26f519e8f1a1632e6c5716cb5d3e3d"
+source = "git+https://github.com/jac3km4/redscript?rev=6721c5c#6721c5ce04457b55566dd228ccc1b2b79a7f6d7d"
 dependencies = [
  "bitflags 2.9.0",
  "chumsky",
  "derive-where",
  "elsa",
- "walkdir",
+ "ignore",
 ]
 
 [[package]]
 name = "redscript-compiler-api"
 version = "1.0.0-preview4"
-source = "git+https://github.com/jac3km4/redscript?rev=3f6e595#3f6e59513e26f519e8f1a1632e6c5716cb5d3e3d"
+source = "git+https://github.com/jac3km4/redscript?rev=6721c5c#6721c5ce04457b55566dd228ccc1b2b79a7f6d7d"
 dependencies = [
  "log",
  "redscript-ast",
@@ -418,7 +476,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-backend"
 version = "1.0.0-preview4"
-source = "git+https://github.com/jac3km4/redscript?rev=3f6e595#3f6e59513e26f519e8f1a1632e6c5716cb5d3e3d"
+source = "git+https://github.com/jac3km4/redscript?rev=6721c5c#6721c5ce04457b55566dd228ccc1b2b79a7f6d7d"
 dependencies = [
  "hashbrown 0.15.2",
  "identity-hash",
@@ -433,7 +491,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-frontend"
 version = "1.0.0-preview4"
-source = "git+https://github.com/jac3km4/redscript?rev=3f6e595#3f6e59513e26f519e8f1a1632e6c5716cb5d3e3d"
+source = "git+https://github.com/jac3km4/redscript?rev=6721c5c#6721c5ce04457b55566dd228ccc1b2b79a7f6d7d"
 dependencies = [
  "bitfield-struct",
  "derive-where",
@@ -452,7 +510,7 @@ dependencies = [
 [[package]]
 name = "redscript-formatter"
 version = "1.0.0-preview4"
-source = "git+https://github.com/jac3km4/redscript?rev=3f6e595#3f6e59513e26f519e8f1a1632e6c5716cb5d3e3d"
+source = "git+https://github.com/jac3km4/redscript?rev=6721c5c#6721c5ce04457b55566dd228ccc1b2b79a7f6d7d"
 dependencies = [
  "pretty_dtoa",
  "redscript-ast",
@@ -482,7 +540,7 @@ dependencies = [
 [[package]]
 name = "redscript-io"
 version = "1.0.0-preview4"
-source = "git+https://github.com/jac3km4/redscript?rev=3f6e595#3f6e59513e26f519e8f1a1632e6c5716cb5d3e3d"
+source = "git+https://github.com/jac3km4/redscript?rev=6721c5c#6721c5ce04457b55566dd228ccc1b2b79a7f6d7d"
 dependencies = [
  "bitfield-struct",
  "byte",
@@ -496,7 +554,7 @@ dependencies = [
 [[package]]
 name = "redscript-parser"
 version = "1.0.0-preview4"
-source = "git+https://github.com/jac3km4/redscript?rev=3f6e595#3f6e59513e26f519e8f1a1632e6c5716cb5d3e3d"
+source = "git+https://github.com/jac3km4/redscript?rev=6721c5c#6721c5ce04457b55566dd228ccc1b2b79a7f6d7d"
 dependencies = [
  "chumsky",
  "redscript-ast",
@@ -530,7 +588,18 @@ checksum = "59b23e92ee4318893fa3fe3e6fb365258efbfe6ac6ab30f090cdcbb7aa37efa9"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-syntax",
+ "regex-syntax 0.7.5",
+]
+
+[[package]]
+name = "regex-automata"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "809e8dc61f6de73b46c85f4c96486310fe304c434cfa43669d7b40f711150908"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-syntax 0.8.5",
 ]
 
 [[package]]
@@ -538,6 +607,12 @@ name = "regex-syntax"
 version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dbb5fb1acd8a1a18b3dd5be62d25485eb770e05afb408a9627d14d451bae12da"
+
+[[package]]
+name = "regex-syntax"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
 
 [[package]]
 name = "ropey"
