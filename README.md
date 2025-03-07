@@ -45,7 +45,7 @@ This file can contain some configuration options:
       "lsp": {
         "redscript-ide": {
           "initialization_options": {
-            "game_dir": "D:\\winapps\\Cyberpunk 2077"
+            "game_dir": "D:\\Games\\Cyberpunk 2077"
           }
         }
       }
