@@ -62,13 +62,19 @@ impl LspServer<'_> {
         };
 
         loop {
-            if let Err(err) = this.handle() {
-                context.logger().error(err);
+            match this.handle() {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(err) => {
+                    context.logger().error(err);
+                }
             }
         }
+
+        Ok(())
     }
 
-    fn handle(&mut self) -> anyhow::Result<()> {
+    fn handle(&mut self) -> anyhow::Result<bool> {
         match self.connection.receiver.recv()? {
             Message::Request(request) => match request.method.as_str() {
                 lsp::request::HoverRequest::METHOD => {
@@ -123,6 +129,9 @@ impl LspServer<'_> {
                             .format(doc, options.tab_size as u16, &self.context),
                     )?;
                 }
+                lsp::request::Shutdown::METHOD => {
+                    self.handle_response(request.id, Ok(Value::Null))?;
+                }
                 _ => {
                     self.context
                         .logger()
@@ -175,6 +184,9 @@ impl LspServer<'_> {
                     self.server
                         .change_workspace_folders(added, removed, &self.context)?;
                 }
+                lsp::notification::Exit::METHOD => {
+                    return Ok(true);
+                }
                 _ => {
                     self.context.logger().info(format!(
                         "Received an unexpected notification: {}",
@@ -188,7 +200,7 @@ impl LspServer<'_> {
                     .info(format!("Received an unexpected response: {}", response.id));
             }
         };
-        Ok(())
+        Ok(false)
     }
 
     fn handle_response<R: Serialize>(
