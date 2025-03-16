@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-
+use hashbrown::HashMap;
 use lsp_types as lsp;
 use ropey::Rope;
 

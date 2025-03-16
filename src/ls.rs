@@ -1,12 +1,9 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::{fs, iter, mem};
 
-use crate::display::{DocDisplay, FunctionTypeDisplay, SnippetDisplay};
-use crate::query::ExprAt;
-use crate::server::{CodeLocation, Document, LanguageServer, LspContext};
+use hashbrown::{HashMap, HashSet};
 use lsp_types as lsp;
 use ouroboros::self_referencing;
 use redscript_compiler_api::types::Type;
@@ -18,10 +15,15 @@ use redscript_compiler_api::{
 use redscript_dotfile::Dotfile;
 use redscript_formatter::{FormatSettings, format_document};
 
+use crate::display::{DocDisplay, FunctionTypeDisplay, SnippetDisplay};
+use crate::query::ExprAt;
+use crate::server::{CodeLocation, Document, LanguageServer, LspContext};
+
 pub struct RedscriptLanguageServer {
-    workspaces: BTreeMap<PathBuf, WorkspaceDir>,
+    workspaces: HashMap<PathBuf, WorkspaceDir>,
     cache: CompilationCache,
     cached_completions: RefCell<Option<CachedCompletions>>,
+    last_diagnostics: RefCell<HashSet<PathBuf>>,
 }
 
 impl RedscriptLanguageServer {
@@ -37,12 +39,13 @@ impl RedscriptLanguageServer {
                 let workspace = WorkspaceDir::load(&dir)?;
                 Ok((dir, workspace))
             })
-            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+            .collect::<anyhow::Result<HashMap<_, _>>>()?;
         let workspace_dirs = workspaces.iter().flat_map(|(_, w)| &w.roots);
         Ok(Self {
             cache: CompilationCache::make(cache_bytes, workspace_dirs, TypeInterner::default())?,
             workspaces,
             cached_completions: RefCell::new(None),
+            last_diagnostics: RefCell::new(HashSet::new()),
         })
     }
 
@@ -277,7 +280,7 @@ impl RedscriptLanguageServer {
     }
 
     pub fn check_workspace_and_publish(&self, ctx: &LspContext) -> anyhow::Result<()> {
-        self.check_workspace(|_, _, diags, sources| Self::publish_diagnostics(diags, sources, ctx))
+        self.check_workspace(|_, _, diags, sources| self.publish_diagnostics(diags, sources, ctx))
     }
 
     fn check_workspace<A>(
@@ -297,21 +300,27 @@ impl RedscriptLanguageServer {
     }
 
     fn publish_diagnostics(
+        &self,
         diags: &[Diagnostic<'_>],
         sources: &ast::SourceMap,
         ctx: &LspContext,
     ) -> anyhow::Result<()> {
         let mut file_diags = HashMap::new();
         for diag in diags {
-            file_diags
-                .entry(diag.span().file)
-                .or_insert_with(Vec::new)
-                .push(diag);
+            let file = diag.span().file;
+            if sources
+                .get(file)
+                .is_some_and(|f| self.resolve_file(f.path()).as_workspace().is_some())
+            {
+                file_diags.entry(file).or_insert_with(Vec::new).push(diag);
+            }
         }
 
-        for (_, file) in sources.files() {
+        let mut last_diagnostics = self.last_diagnostics.borrow_mut();
+
+        for path in last_diagnostics.drain() {
             ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
-                uri: ctx.uri(file.path())?,
+                uri: ctx.uri(&path)?,
                 diagnostics: vec![],
                 version: None,
             });
@@ -319,6 +328,10 @@ impl RedscriptLanguageServer {
 
         for (file, diags) in file_diags {
             let file = sources.get(file).unwrap();
+
+            if !last_diagnostics.contains(file.path()) {
+                last_diagnostics.insert(file.path().to_owned());
+            }
 
             ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
                 uri: ctx.uri(file.path())?,

@@ -534,6 +534,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "fluent-uri 0.3.2",
+ "hashbrown 0.15.2",
  "lsp-server",
  "lsp-types",
  "mimalloc",
