@@ -18,20 +18,20 @@ lsp-types = "0.97"
 
 [dependencies.redscript-parser]
 git = "https://github.com/jac3km4/redscript"
-rev = "5f51b7f"
+rev = "v1.0.0-preview8"
 
 [dependencies.redscript-formatter]
 git = "https://github.com/jac3km4/redscript"
-rev = "5f51b7f"
+rev = "v1.0.0-preview8"
 
 [dependencies.redscript-compiler-api]
 git = "https://github.com/jac3km4/redscript"
-rev = "5f51b7f"
+rev = "v1.0.0-preview8"
 features = ["ignore"]
 
 [dependencies.redscript-dotfile]
 git = "https://github.com/jac3km4/redscript"
-rev = "5f51b7f"
+rev = "v1.0.0-preview8"
 
 [patch.crates-io]
 stable_deref_trait = { git = "https://github.com/Storyyeller/stable_deref_trait", rev = "59a35e0" }

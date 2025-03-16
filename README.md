@@ -18,18 +18,21 @@ Language server for [redscript](https://github.com/jac3km4/redscript)
 
 ## configuration
 
-The language server will attempt to load a TOML file named `.redscript-ide` from every workspace folder.
-This file can contain some configuration options:
+The language server will attempt to load a TOML file named `.redscript` from every workspace folder.
+This file can contain the following configuration options:
 
-- `redscript_dir` maps the source directory to a different folder than the workspace folder root
-- `hooks` allows you to configure hooks on certain events, an example would be creating a file to signal something to an external tool
-  - for instance, you can trigger a reload of RedHotTools when the workspace successfully typechecks:
-    ```toml
-    [[hooks.successful_check]]
-    # you can use {game_dir} to refer to the game directory if it's configured for the extension in your editor (e.g. VSCode),
-    # another available variable is {workspace_dir} which refers to the workspace directory that contains the checked file
-    create_file = "{game_dir}\\red4ext\\plugins\\RedHotTools\\.hot-scripts"
-    ```
+- `source_roots` allows you to specify source directories where the compiler should look for REDscript files, defaults to `["."]`
+- `format` block allows you to configure the formatter, you can find the available options [here](https://github.com/jac3km4/redscript/blob/c3d0ec6f12583eccc51b5a482583e8fb6641ce8d/crates/dotfile/src/lib.rs#L36-L43)
+
+Here's an example `.redscript` file:
+
+```toml
+source_roots = [".", "../red4ext/plugins"]
+
+[format]
+indent = 2
+max_width = 80
+```
 
 ## usage
 
