@@ -9,8 +9,8 @@ use ouroboros::self_referencing;
 use redscript_compiler_api::types::Type;
 use redscript_compiler_api::{
     CompilationInputs, CompileErrorReporter, Diagnostic, Evaluator, LoweredCompilationUnit,
-    ScriptBundle, SourceMapExt, Symbols, TypeInterner, ast, infer_from_sources, parse_one,
-    parse_sources, process_sources,
+    ScriptBundle, SourceMapExt, Symbols, TypeInterner, ast, infer_from_sources, parse_file,
+    parse_files, process_sources,
 };
 use redscript_dotfile::Dotfile;
 use redscript_formatter::{FormatSettings, format_document};
@@ -396,7 +396,7 @@ impl RedscriptLanguageServer {
             let previous_id = cache.file_ids.get(loc.doc().path()).copied();
 
             let mut reporter = CompileErrorReporter::default();
-            let module = parse_one(id, file, &mut reporter);
+            let module = parse_file(id, file, &mut reporter);
 
             let typ = if let Some(ast::QueryResult::Type(&ast::Type::Named { name, .. })) =
                 module.as_ref().and_then(|m| m.find_at(loc.pos()))
@@ -560,7 +560,7 @@ impl CompilationCache {
             },
             |sources| {
                 let mut reporter = CompileErrorReporter::default();
-                Ok(parse_sources(sources, &mut reporter))
+                Ok(parse_files(sources, &mut reporter))
             },
         )
     }

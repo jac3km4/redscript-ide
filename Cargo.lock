@@ -449,8 +449,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-ast"
-version = "1.0.0-preview8"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview8#838c24af904c3bf58fdf7ca1dde49044a8824af9"
+version = "1.0.0-preview9"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
 dependencies = [
  "bitflags 2.9.0",
  "chumsky",
@@ -461,8 +461,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-api"
-version = "1.0.0-preview8"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview8#838c24af904c3bf58fdf7ca1dde49044a8824af9"
+version = "1.0.0-preview9"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
 dependencies = [
  "log",
  "redscript-ast",
@@ -475,8 +475,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-backend"
-version = "1.0.0-preview8"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview8#838c24af904c3bf58fdf7ca1dde49044a8824af9"
+version = "1.0.0-preview9"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
 dependencies = [
  "hashbrown 0.15.2",
  "identity-hash",
@@ -490,8 +490,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-frontend"
-version = "1.0.0-preview8"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview8#838c24af904c3bf58fdf7ca1dde49044a8824af9"
+version = "1.0.0-preview9"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
 dependencies = [
  "bitfield-struct",
  "derive-where",
@@ -509,8 +509,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-dotfile"
-version = "1.0.0-preview8"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview8#838c24af904c3bf58fdf7ca1dde49044a8824af9"
+version = "1.0.0-preview9"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
 dependencies = [
  "anyhow",
  "serde",
@@ -519,8 +519,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-formatter"
-version = "1.0.0-preview8"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview8#838c24af904c3bf58fdf7ca1dde49044a8824af9"
+version = "1.0.0-preview9"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
 dependencies = [
  "pretty_dtoa",
  "redscript-ast",
@@ -551,8 +551,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-io"
-version = "1.0.0-preview8"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview8#838c24af904c3bf58fdf7ca1dde49044a8824af9"
+version = "1.0.0-preview9"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
 dependencies = [
  "bitfield-struct",
  "byte",
@@ -565,8 +565,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-parser"
-version = "1.0.0-preview8"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview8#838c24af904c3bf58fdf7ca1dde49044a8824af9"
+version = "1.0.0-preview9"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
 dependencies = [
  "chumsky",
  "redscript-ast",
