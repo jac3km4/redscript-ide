@@ -13,6 +13,7 @@ pub struct ExprAt<'ctx, 'a> {
     type_: Option<TypeId<'ctx>>,
     symbols: &'a Symbols<'ctx>,
     sources: &'ctx SourceMap,
+    context: Option<AtContext>,
 }
 
 impl<'ctx, 'a> ExprAt<'ctx, 'a> {
@@ -22,6 +23,7 @@ impl<'ctx, 'a> ExprAt<'ctx, 'a> {
         type_: Option<TypeId<'ctx>>,
         symbols: &'a Symbols<'ctx>,
         sources: &'ctx SourceMap,
+        context: Option<AtContext>,
     ) -> Self {
         Self {
             expr,
@@ -29,6 +31,7 @@ impl<'ctx, 'a> ExprAt<'ctx, 'a> {
             type_,
             symbols,
             sources,
+            context,
         }
     }
 
@@ -50,6 +53,10 @@ impl<'ctx, 'a> ExprAt<'ctx, 'a> {
 
     pub fn sources(&self) -> &'ctx SourceMap {
         self.sources
+    }
+
+    pub fn context(&self) -> Option<AtContext> {
+        self.context
     }
 
     pub fn expr_type(&self) -> Option<Type<'ctx>> {
@@ -83,6 +90,11 @@ impl<'ctx, 'a> ExprAt<'ctx, 'a> {
     pub fn display(self) -> impl Display {
         ExprAtDisplay::new(self)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum AtContext {
+    Expr,
 }
 
 pub fn type_of<'ctx>(

@@ -106,9 +106,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.16"
+version = "1.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be714c154be609ec7f5dad223a33bf1482fff90472de28f7362806e6d4832b8c"
+checksum = "525046617d8376e3db1deffb079e91cef90a89fc3ca5c185bbf8c9ecdd15cd5c"
 dependencies = [
  "shlex",
 ]
@@ -291,9 +291,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.8.0"
+version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3954d50fe15b02142bf25d3b8bdadb634ec3948f103d04ffe3031bc8fe9d7058"
+checksum = "cea70ddb795996207ad57735b50c5982d8844f38ba9ee5f1aedcfb708a2aa11e"
 dependencies = [
  "equivalent",
  "hashbrown 0.15.2",
@@ -323,9 +323,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.26"
+version = "0.4.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30bde2b3dc3671ae49d8e2e9f044c7c005836e7a023ee57cffa25ab82764bb9e"
+checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
 
 [[package]]
 name = "lsp-server"
@@ -370,9 +370,9 @@ dependencies = [
 
 [[package]]
 name = "once_cell"
-version = "1.21.1"
+version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d75b0bedcc4fe52caa0e03d9f1151a323e4aa5e2d78ba3580400cd3c9e2bc4bc"
+checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
 name = "ouroboros"
@@ -449,8 +449,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-ast"
-version = "1.0.0-preview9"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
+version = "1.0.0-preview.10"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.10#8e9dc08be03676866a7322c9e2488d9a27b77556"
 dependencies = [
  "bitflags 2.9.0",
  "chumsky",
@@ -461,8 +461,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-api"
-version = "1.0.0-preview9"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
+version = "1.0.0-preview.10"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.10#8e9dc08be03676866a7322c9e2488d9a27b77556"
 dependencies = [
  "log",
  "redscript-ast",
@@ -475,8 +475,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-backend"
-version = "1.0.0-preview9"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
+version = "1.0.0-preview.10"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.10#8e9dc08be03676866a7322c9e2488d9a27b77556"
 dependencies = [
  "hashbrown 0.15.2",
  "identity-hash",
@@ -490,8 +490,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-frontend"
-version = "1.0.0-preview9"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
+version = "1.0.0-preview.10"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.10#8e9dc08be03676866a7322c9e2488d9a27b77556"
 dependencies = [
  "bitfield-struct",
  "derive-where",
@@ -509,8 +509,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-dotfile"
-version = "1.0.0-preview9"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
+version = "1.0.0-preview.10"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.10#8e9dc08be03676866a7322c9e2488d9a27b77556"
 dependencies = [
  "anyhow",
  "serde",
@@ -519,9 +519,10 @@ dependencies = [
 
 [[package]]
 name = "redscript-formatter"
-version = "1.0.0-preview9"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
+version = "1.0.0-preview.10"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.10#8e9dc08be03676866a7322c9e2488d9a27b77556"
 dependencies = [
+ "hashbrown 0.15.2",
  "pretty_dtoa",
  "redscript-ast",
  "redscript-parser",
@@ -551,8 +552,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-io"
-version = "1.0.0-preview9"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
+version = "1.0.0-preview.10"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.10#8e9dc08be03676866a7322c9e2488d9a27b77556"
 dependencies = [
  "bitfield-struct",
  "byte",
@@ -565,8 +566,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-parser"
-version = "1.0.0-preview9"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview9#4774c6bdde9e170f89c0d516d3e59600bc7f0c3f"
+version = "1.0.0-preview.10"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.10#8e9dc08be03676866a7322c9e2488d9a27b77556"
 dependencies = [
  "chumsky",
  "redscript-ast",
@@ -734,9 +735,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.14.0"
+version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fcf8323ef1faaee30a44a340193b1ac6814fd9b7b4e88e9d4519a3e4abe1cfd"
+checksum = "8917285742e9f3e1683f0a9c4e6b57960b7314d0b08d30d1ecd426713ee2eee9"
 
 [[package]]
 name = "stable_deref_trait"
@@ -745,9 +746,9 @@ source = "git+https://github.com/Storyyeller/stable_deref_trait?rev=59a35e0#59a3
 
 [[package]]
 name = "stacker"
-version = "0.1.19"
+version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9156ebd5870ef293bfb43f91c7a74528d363ec0d424afe24160ed5a4343d08a"
+checksum = "601f9201feb9b09c00266478bf459952b9ef9a6b94edb2f21eba14ab681a60a9"
 dependencies = [
  "cc",
  "cfg-if",

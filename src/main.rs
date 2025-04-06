@@ -7,6 +7,7 @@ use serde::Deserialize;
 use server::LspServer;
 
 mod buffers;
+mod completions;
 mod display;
 mod ls;
 mod query;

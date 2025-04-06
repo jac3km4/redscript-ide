@@ -9,14 +9,14 @@ use ouroboros::self_referencing;
 use redscript_compiler_api::types::Type;
 use redscript_compiler_api::{
     CompilationInputs, CompileErrorReporter, Diagnostic, Evaluator, LoweredCompilationUnit,
-    ScriptBundle, SourceMapExt, Symbols, TypeInterner, ast, infer_from_sources, parse_file,
-    parse_files, process_sources,
+    ScriptBundle, SourceMapExt, Symbols, TypeInterner, TypeSchema, ast, infer_from_sources,
+    parse_file, parse_files, process_sources,
 };
 use redscript_dotfile::Dotfile;
 use redscript_formatter::{FormatSettings, format_document};
 
-use crate::display::{DocDisplay, FunctionTypeDisplay, SnippetDisplay};
-use crate::query::ExprAt;
+use crate::completions;
+use crate::query::{AtContext, ExprAt};
 use crate::server::{CodeLocation, Document, LanguageServer, LspContext};
 
 pub struct RedscriptLanguageServer {
@@ -103,71 +103,7 @@ impl RedscriptLanguageServer {
 
         let completions = self.patched_expr_at(
             loc.clone().with_pos(preceding_pos),
-            |at| {
-                let typ = at.expr_type();
-                if let Some(typ) = typ
-                    .as_ref()
-                    .map(Type::unwrap_ref_or_self)
-                    .and_then(Type::upper_bound)
-                {
-                    let fields = at
-                        .symbols()
-                        .query_methods(typ.id())
-                        .filter(|m| !m.func().flags().is_static())
-                        .map(|e| {
-                            let detail = FunctionTypeDisplay::new(e.func().type_()).to_string();
-                            lsp::CompletionItem {
-                                label: (*e.name()).to_string(),
-                                label_details: Some(lsp::CompletionItemLabelDetails {
-                                    detail: Some(detail.clone()),
-                                    description: None,
-                                }),
-                                detail: Some(detail),
-                                kind: Some(lsp::CompletionItemKind::METHOD),
-                                documentation: Some(lsp::Documentation::MarkupContent(
-                                    lsp::MarkupContent {
-                                        kind: lsp::MarkupKind::Markdown,
-                                        value: DocDisplay::new(e.func().doc()).to_string(),
-                                    },
-                                )),
-                                insert_text: Some(
-                                    SnippetDisplay::new(e.name(), e.func().type_()).to_string(),
-                                ),
-                                insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
-                                ..Default::default()
-                            }
-                        });
-
-                    let methods = at
-                        .symbols()
-                        .base_iter(typ.id())
-                        .filter_map(|(_, def)| def.schema().as_aggregate())
-                        .flat_map(|agg| agg.fields().iter())
-                        .map(|e| {
-                            let detail = format!(": {}", e.field().type_());
-                            lsp::CompletionItem {
-                                label: e.name().to_string(),
-                                label_details: Some(lsp::CompletionItemLabelDetails {
-                                    detail: Some(detail.clone()),
-                                    description: None,
-                                }),
-                                detail: Some(detail),
-                                kind: Some(lsp::CompletionItemKind::FIELD),
-                                documentation: Some(lsp::Documentation::MarkupContent(
-                                    lsp::MarkupContent {
-                                        kind: lsp::MarkupKind::Markdown,
-                                        value: DocDisplay::new(e.field().doc()).to_string(),
-                                    },
-                                )),
-                                ..Default::default()
-                            }
-                        });
-
-                    Ok(fields.chain(methods).collect::<Vec<_>>())
-                } else {
-                    Ok(vec![])
-                }
-            },
+            generate_completions,
             ctx,
         )?;
 
@@ -398,12 +334,13 @@ impl RedscriptLanguageServer {
             let mut reporter = CompileErrorReporter::default();
             let module = parse_file(id, file, &mut reporter);
 
-            let typ = if let Some(ast::QueryResult::Type(&ast::Type::Named { name, .. })) =
-                module.as_ref().and_then(|m| m.find_at(loc.pos()))
-            {
-                Some(name)
-            } else {
-                None
+            let match_ = module.as_ref().and_then(|m| m.find_at(loc.pos()));
+            let (ctx, typ) = match match_ {
+                Some(ast::QueryResult::Type(&ast::Type::Named { name, .. })) => (None, Some(name)),
+                Some(ast::QueryResult::Expr(&ast::Expr::Ident(name))) => {
+                    (Some(AtContext::Expr), Some(name))
+                }
+                _ => (None, None),
             };
 
             let evaluator = Evaluator::from_modules(cache.modules.iter().chain(module.as_ref()));
@@ -428,9 +365,59 @@ impl RedscriptLanguageServer {
             let typ = typ
                 .and_then(|t| unit.scopes.get(&id)?.get(t)?.id())
                 .or_else(|| cache.interner.get_index(cache.interner.get_index_of(typ?)?));
-            cb(ExprAt::new(expr, func, typ, &syms, cache.sources))
+            cb(ExprAt::new(expr, func, typ, &syms, cache.sources, ctx))
         })
     }
+}
+
+fn generate_completions(
+    at: ExprAt<'_, '_>,
+) -> Result<Vec<lsp_types::CompletionItem>, anyhow::Error> {
+    let mut completions = vec![];
+
+    if let (Some(typ), Some(AtContext::Expr)) = (at.type_(), at.context()) {
+        match at.symbols()[typ].schema() {
+            TypeSchema::Aggregate(_) => {
+                let methods = at
+                    .symbols()
+                    .query_methods(typ)
+                    .filter(|m| m.func().flags().is_static())
+                    .map(|e| completions::method(e.name(), e.func().type_(), e.func().doc()));
+                completions.extend(methods);
+            }
+            TypeSchema::Enum(enum_) => {
+                let variants = enum_
+                    .variants()
+                    .map(|(name, _)| completions::enum_member(name));
+                completions.extend(variants);
+            }
+            _ => {}
+        };
+    }
+
+    let typ = at.expr_type();
+    if let Some(typ) = typ
+        .as_ref()
+        .map(Type::unwrap_ref_or_self)
+        .and_then(Type::upper_bound)
+    {
+        let methods = at
+            .symbols()
+            .query_methods(typ.id())
+            .filter(|m| !m.func().flags().is_static())
+            .map(|e| completions::method(e.name(), e.func().type_(), e.func().doc()));
+        completions.extend(methods);
+
+        let fields = at
+            .symbols()
+            .base_iter(typ.id())
+            .filter_map(|(_, def)| def.schema().as_aggregate())
+            .flat_map(|agg| agg.fields().iter())
+            .map(|e| completions::field(e.name(), e.field()));
+        completions.extend(fields);
+    };
+
+    Ok(completions)
 }
 
 impl LanguageServer for RedscriptLanguageServer {
