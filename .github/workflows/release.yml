@@ -51,7 +51,7 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          FLAGS=()
+          FLAGS=(--generate-notes)
           ARTIFACTS=$(find ./artifacts -type f)
 
           IS_PRE_RELEASE=$(echo ${{ github.ref_name }} | grep -E 'v[0-9]+\.[0-9]+\.[0-9]+-.+')
@@ -59,4 +59,4 @@ jobs:
             FLAGS+=("--prerelease")
           fi
 
-          gh release create ${{ github.ref_name }} --generate-notes ${FLAGS[@]} $ARTIFACTS
+          gh release create ${{ github.ref_name }} ${FLAGS[@]} $ARTIFACTS
