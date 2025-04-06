@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "redscript-ide"
-version = "0.2.0-preview9"
+version = "0.2.0-preview.9"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
