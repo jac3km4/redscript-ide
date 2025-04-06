@@ -54,8 +54,7 @@ jobs:
           FLAGS=(--generate-notes)
           ARTIFACTS=$(find ./artifacts -type f)
 
-          IS_PRE_RELEASE=$(echo ${{ github.ref_name }} | grep -E 'v[0-9]+\.[0-9]+\.[0-9]+-.+')
-          if [ -n "$IS_PRE_RELEASE" ]; then
+          if echo ${{ github.ref_name }} | grep -E 'v[0-9]+\.[0-9]+\.[0-9]+-.+'; then
             FLAGS+=(--prerelease)
           fi
 
