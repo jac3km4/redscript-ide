@@ -229,9 +229,14 @@ impl RedscriptLanguageServer {
         ) -> anyhow::Result<A>,
     ) -> anyhow::Result<A> {
         self.cache.with(|cache| {
-            let (unit, syms, diags) =
-                infer_from_sources(cache.sources, cache.interner, cache.symbols.clone());
-            cb(&unit, &syms, &diags, cache.sources)
+            let mut reporter = CompileErrorReporter::default();
+            let (unit, syms) = infer_from_sources(
+                cache.sources,
+                cache.symbols.clone(),
+                &mut reporter,
+                cache.interner,
+            );
+            cb(&unit, &syms, &reporter.into_reported(), cache.sources)
         })
     }
 
@@ -350,12 +355,12 @@ impl RedscriptLanguageServer {
                 .filter(|m| m.span().map(|s| s.file) != previous_id)
                 .cloned()
                 .chain(module);
-            let (unit, syms, _) = process_sources(
+            let (unit, syms) = process_sources(
                 mods,
-                evaluator,
-                cache.interner,
                 cache.symbols.clone(),
-                reporter,
+                evaluator,
+                &mut reporter,
+                cache.interner,
             );
             let func = unit
                 .all_functions()
