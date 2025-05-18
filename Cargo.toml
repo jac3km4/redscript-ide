@@ -19,20 +19,20 @@ lsp-types = "0.97"
 
 [dependencies.redscript-parser]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.11"
+rev = "v1.0.0-preview.12"
 
 [dependencies.redscript-formatter]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.11"
+rev = "v1.0.0-preview.12"
 
 [dependencies.redscript-compiler-api]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.11"
+rev = "v1.0.0-preview.12"
 features = ["ignore"]
 
 [dependencies.redscript-dotfile]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.11"
+rev = "v1.0.0-preview.12"
 
 [patch.crates-io]
 stable_deref_trait = { git = "https://github.com/Storyyeller/stable_deref_trait", rev = "59a35e0" }
@@ -45,6 +45,7 @@ nonstandard-style = "warn"
 rust-2018-compatibility = "warn"
 rust-2018-idioms = "warn"
 rust-2021-compatibility = "warn"
+rust-2024-compatibility = "warn"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
