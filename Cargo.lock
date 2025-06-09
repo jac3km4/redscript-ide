@@ -106,18 +106,18 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.23"
+version = "1.2.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f4ac86a9e5bc1e2b3449ab9d7d3a6a405e3d1bb28d7b9be8614f55846ae3766"
+checksum = "956a5e21988b87f372569b66183b78babf23ebc2e744b733e4350a752c4dafac"
 dependencies = [
  "shlex",
 ]
 
 [[package]]
 name = "cfg-if"
-version = "1.0.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
+checksum = "9555578bc9e57714c812a1f84e4fc5b4d21fcb063490c624de019f7464c91268"
 
 [[package]]
 name = "chumsky"
@@ -456,7 +456,7 @@ dependencies = [
 [[package]]
 name = "redscript-ast"
 version = "1.0.0-preview.13"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.13#9152298425525a153e62de6b2a10d94e98a80e8a"
+source = "git+https://github.com/jac3km4/redscript?rev=01e4135#01e4135ee9b5650395ef625b98b7f56fde5cff7f"
 dependencies = [
  "bitflags 2.9.1",
  "chumsky",
@@ -468,7 +468,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-api"
 version = "1.0.0-preview.13"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.13#9152298425525a153e62de6b2a10d94e98a80e8a"
+source = "git+https://github.com/jac3km4/redscript?rev=01e4135#01e4135ee9b5650395ef625b98b7f56fde5cff7f"
 dependencies = [
  "log",
  "redscript-ast",
@@ -482,7 +482,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-backend"
 version = "1.0.0-preview.13"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.13#9152298425525a153e62de6b2a10d94e98a80e8a"
+source = "git+https://github.com/jac3km4/redscript?rev=01e4135#01e4135ee9b5650395ef625b98b7f56fde5cff7f"
 dependencies = [
  "hashbrown 0.15.4",
  "identity-hash",
@@ -497,7 +497,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-frontend"
 version = "1.0.0-preview.13"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.13#9152298425525a153e62de6b2a10d94e98a80e8a"
+source = "git+https://github.com/jac3km4/redscript?rev=01e4135#01e4135ee9b5650395ef625b98b7f56fde5cff7f"
 dependencies = [
  "bitfield-struct",
  "derive-where",
@@ -517,7 +517,7 @@ dependencies = [
 [[package]]
 name = "redscript-dotfile"
 version = "1.0.0-preview.13"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.13#9152298425525a153e62de6b2a10d94e98a80e8a"
+source = "git+https://github.com/jac3km4/redscript?rev=01e4135#01e4135ee9b5650395ef625b98b7f56fde5cff7f"
 dependencies = [
  "anyhow",
  "serde",
@@ -527,7 +527,7 @@ dependencies = [
 [[package]]
 name = "redscript-formatter"
 version = "1.0.0-preview.13"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.13#9152298425525a153e62de6b2a10d94e98a80e8a"
+source = "git+https://github.com/jac3km4/redscript?rev=01e4135#01e4135ee9b5650395ef625b98b7f56fde5cff7f"
 dependencies = [
  "hashbrown 0.15.4",
  "pretty_dtoa",
@@ -560,7 +560,7 @@ dependencies = [
 [[package]]
 name = "redscript-io"
 version = "1.0.0-preview.13"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.13#9152298425525a153e62de6b2a10d94e98a80e8a"
+source = "git+https://github.com/jac3km4/redscript?rev=01e4135#01e4135ee9b5650395ef625b98b7f56fde5cff7f"
 dependencies = [
  "bitfield-struct",
  "byte",
@@ -574,7 +574,7 @@ dependencies = [
 [[package]]
 name = "redscript-parser"
 version = "1.0.0-preview.13"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.13#9152298425525a153e62de6b2a10d94e98a80e8a"
+source = "git+https://github.com/jac3km4/redscript?rev=01e4135#01e4135ee9b5650395ef625b98b7f56fde5cff7f"
 dependencies = [
  "chumsky",
  "redscript-ast",
@@ -742,9 +742,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.15.0"
+version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8917285742e9f3e1683f0a9c4e6b57960b7314d0b08d30d1ecd426713ee2eee9"
+checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "stable_deref_trait"
