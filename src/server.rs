@@ -408,13 +408,18 @@ fn path_from_uri(uri: &lsp::Uri) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-fn uri_from_path(p: &Path) -> anyhow::Result<lsp::Uri> {
-    let mut path = fluent_uri::encoding::EString::new();
-    path.encode::<fluent_uri::encoding::encoder::Path>(p.as_os_str().as_encoded_bytes());
+fn uri_from_path(path: &Path) -> anyhow::Result<lsp::Uri> {
+    let mut encoded_path = fluent_uri::encoding::EString::new();
+    let path_str = path.to_string_lossy().replace('\\', "/");
+
+    #[cfg(windows)]
+    encoded_path.encode::<fluent_uri::encoding::encoder::Path>(&b"/");
+    encoded_path.encode::<fluent_uri::encoding::encoder::Path>(&path_str);
 
     let uri = fluent_uri::Uri::builder()
         .scheme(fluent_uri::component::Scheme::new_or_panic("file"))
-        .path(&path)
+        .authority(fluent_uri::component::Authority::EMPTY)
+        .path(&encoded_path)
         .build()?;
     Ok(lsp::Uri::from_str(uri.as_str())?)
 }
@@ -443,5 +448,47 @@ fn capabilities() -> lsp::ServerCapabilities {
         workspace_symbol_provider: Some(lsp::OneOf::Left(true)),
         document_formatting_provider: Some(lsp::OneOf::Left(true)),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_uri_from_windows_path() {
+        let path = PathBuf::from("C:/some/path/r6");
+        let uri = uri_from_path(&path).unwrap();
+        assert_eq!(uri.to_string(), "file:///C:/some/path/r6");
+    }
+
+    #[test]
+    fn test_uri_from_windows_path_with_backslashes() {
+        let path = PathBuf::from("C:\\some\\path\\r6");
+        let uri = uri_from_path(&path).unwrap();
+        assert_eq!(uri.to_string(), "file:///C:/some/path/r6");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_uri_from_unix_path() {
+        let path = PathBuf::from("/some/path/r6");
+        let uri = uri_from_path(&path).unwrap();
+        assert_eq!(uri.to_string(), "file:///some/path/r6");
+    }
+
+    #[test]
+    fn test_path_from_windows_uri() {
+        let uri = lsp::Uri::from_str("file:///C:/some/path/r6").unwrap();
+        let path = path_from_uri(&uri).unwrap();
+        assert_eq!(path, PathBuf::from("C:/some/path/r6"));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_path_from_unix_uri() {
+        let uri = lsp::Uri::from_str("file:///some/path/r6").unwrap();
+        let path = path_from_uri(&uri).unwrap();
+        assert_eq!(path, PathBuf::from("/some/path/r6"));
     }
 }
