@@ -590,7 +590,7 @@ impl WorkspaceDir {
     fn load(dir: &Path) -> anyhow::Result<Self> {
         let dotfile = Dotfile::load_or_default(dir)?;
         let roots = dotfile
-            .source_roots
+            .expanded_source_roots()
             .into_iter()
             .map(|p| dir.join(p))
             .collect();
