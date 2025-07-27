@@ -88,6 +88,7 @@ impl RedscriptLanguageServer {
         ctx: &LspContext,
     ) -> anyhow::Result<Rc<lsp::CompletionResponse>> {
         let preceding_pos = loc.pos() - 1;
+
         let byte = loc.doc().buffer().contents().byte(preceding_pos as usize);
 
         if let Some(cached) = &mut *self.cached_completions.borrow_mut() {
@@ -336,6 +337,8 @@ impl RedscriptLanguageServer {
                 }
             };
 
+            let preceding_pos = loc.pos() - 1;
+
             let id = cache.sources.push_back(loc.doc().path(), contents);
             let file = cache.sources.get(id).unwrap();
 
@@ -344,7 +347,7 @@ impl RedscriptLanguageServer {
             let mut reporter = CompileErrorReporter::default();
             let module = parse_file(id, file, &mut reporter);
 
-            let match_ = module.as_ref().and_then(|m| m.find_at(loc.pos()));
+            let match_ = module.as_ref().and_then(|m| m.find_at(preceding_pos));
             let (ctx, typ) = match match_ {
                 Some(ast::QueryResult::Type(&ast::Type::Named { name, .. })) => (None, Some(name)),
                 Some(ast::QueryResult::Expr(&ast::Expr::Ident(name))) => {
@@ -369,8 +372,8 @@ impl RedscriptLanguageServer {
             );
             let func = unit
                 .all_functions()
-                .find(|f| f.span.file == id && f.span.contains(loc.pos()));
-            let expr = func.and_then(|f| f.block.find_at(loc.pos()));
+                .find(|f| f.span.file == id && f.span.contains(preceding_pos));
+            let expr = func.and_then(|f| f.block.find_at(preceding_pos));
 
             let typ = typ
                 .and_then(|t| unit.scopes.get(&id)?.get(t)?.id())
