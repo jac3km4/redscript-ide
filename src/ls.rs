@@ -6,11 +6,12 @@ use std::{fs, iter, mem};
 use hashbrown::{HashMap, HashSet};
 use lsp_types as lsp;
 use ouroboros::self_referencing;
+use redscript_compiler_api::pass::{DiagnosticPass, UnusedLocals};
 use redscript_compiler_api::types::Type;
 use redscript_compiler_api::{
     CompilationInputs, CompileErrorReporter, Diagnostic, Evaluator, LoweredCompilationUnit,
-    ScriptBundle, SourceMapExt, Symbols, TypeInterner, TypeSchema, ast, infer_from_sources,
-    parse_file, parse_files, process_sources,
+    ScriptBundle, SourceMapExt, Symbols, TypeFlags, TypeInterner, TypeSchema, ast,
+    infer_from_sources, parse_file, parse_files, process_sources,
 };
 use redscript_dotfile::Dotfile;
 use redscript_formatter::{FormatSettings, format_document};
@@ -18,6 +19,8 @@ use redscript_formatter::{FormatSettings, format_document};
 use crate::completions;
 use crate::query::{AtContext, ExprAt};
 use crate::server::{CodeLocation, Document, LanguageServer, LspContext};
+
+const DIAGNOSTIC_PASSES: &[&'static (dyn DiagnosticPass + 'static)] = &[&UnusedLocals];
 
 pub struct RedscriptLanguageServer {
     workspaces: HashMap<PathBuf, WorkspaceDir>,
@@ -236,6 +239,8 @@ impl RedscriptLanguageServer {
                 &mut reporter,
                 cache.interner,
             );
+            unit.run_diagnostics(DIAGNOSTIC_PASSES, &mut reporter);
+
             cb(&unit, &syms, &reporter.into_reported(), cache.sources)
         })
     }
@@ -548,7 +553,11 @@ impl CompilationCache {
             file_ids,
             |bytes, interner, _| {
                 let bundle = ScriptBundle::from_bytes(bytes)?;
-                Ok(CompilationInputs::load_without_mapping(&bundle, interner)?)
+                Ok(CompilationInputs::load_without_mapping(
+                    &bundle,
+                    interner,
+                    &TypeFlags::default(),
+                )?)
             },
             |sources| {
                 let mut reporter = CompileErrorReporter::default();
