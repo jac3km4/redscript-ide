@@ -125,9 +125,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.30"
+version = "1.2.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "deec109607ca693028562ed836a5f1c4b8bd77755c4e132fc5ce11b0b6211ae7"
+checksum = "c3a42d84bb6b69d3a8b3eaacf0d88f179e1929695e1ad012b6cf64d9caaa5fd2"
 dependencies = [
  "shlex",
 ]
@@ -564,8 +564,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-ast"
-version = "1.0.0-preview.14"
-source = "git+https://github.com/jac3km4/redscript?rev=e45a98d#e45a98dc14634d51d478cb39fac5963669c68b5e"
+version = "1.0.0-preview.15"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.15#368def84adad86acde7c2da0d3426a070c784783"
 dependencies = [
  "bitflags 2.9.1",
  "chumsky",
@@ -576,8 +576,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-api"
-version = "1.0.0-preview.14"
-source = "git+https://github.com/jac3km4/redscript?rev=e45a98d#e45a98dc14634d51d478cb39fac5963669c68b5e"
+version = "1.0.0-preview.15"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.15#368def84adad86acde7c2da0d3426a070c784783"
 dependencies = [
  "bon",
  "log",
@@ -591,8 +591,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-backend"
-version = "1.0.0-preview.14"
-source = "git+https://github.com/jac3km4/redscript?rev=e45a98d#e45a98dc14634d51d478cb39fac5963669c68b5e"
+version = "1.0.0-preview.15"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.15#368def84adad86acde7c2da0d3426a070c784783"
 dependencies = [
  "bon",
  "hashbrown 0.15.4",
@@ -607,8 +607,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-frontend"
-version = "1.0.0-preview.14"
-source = "git+https://github.com/jac3km4/redscript?rev=e45a98d#e45a98dc14634d51d478cb39fac5963669c68b5e"
+version = "1.0.0-preview.15"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.15#368def84adad86acde7c2da0d3426a070c784783"
 dependencies = [
  "bitfield-struct",
  "derive-where",
@@ -627,8 +627,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-dotfile"
-version = "1.0.0-preview.14"
-source = "git+https://github.com/jac3km4/redscript?rev=e45a98d#e45a98dc14634d51d478cb39fac5963669c68b5e"
+version = "1.0.0-preview.15"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.15#368def84adad86acde7c2da0d3426a070c784783"
 dependencies = [
  "anyhow",
  "hashbrown 0.15.4",
@@ -639,8 +639,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-formatter"
-version = "1.0.0-preview.14"
-source = "git+https://github.com/jac3km4/redscript?rev=e45a98d#e45a98dc14634d51d478cb39fac5963669c68b5e"
+version = "1.0.0-preview.15"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.15#368def84adad86acde7c2da0d3426a070c784783"
 dependencies = [
  "hashbrown 0.15.4",
  "pretty_dtoa",
@@ -672,8 +672,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-io"
-version = "1.0.0-preview.14"
-source = "git+https://github.com/jac3km4/redscript?rev=e45a98d#e45a98dc14634d51d478cb39fac5963669c68b5e"
+version = "1.0.0-preview.15"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.15#368def84adad86acde7c2da0d3426a070c784783"
 dependencies = [
  "bitfield-struct",
  "byte",
@@ -686,8 +686,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-parser"
-version = "1.0.0-preview.14"
-source = "git+https://github.com/jac3km4/redscript?rev=e45a98d#e45a98dc14634d51d478cb39fac5963669c68b5e"
+version = "1.0.0-preview.15"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.15#368def84adad86acde7c2da0d3426a070c784783"
 dependencies = [
  "chumsky",
  "redscript-ast",

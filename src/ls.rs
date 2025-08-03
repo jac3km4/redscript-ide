@@ -287,7 +287,7 @@ impl RedscriptLanguageServer {
                     .filter_map(|diag| {
                         Some(lsp::Diagnostic {
                             range: range(diag.span(), file)?,
-                            severity: Some(if diag.is_fatal() {
+                            severity: Some(if diag.is_error() {
                                 lsp::DiagnosticSeverity::ERROR
                             } else {
                                 lsp::DiagnosticSeverity::WARNING
