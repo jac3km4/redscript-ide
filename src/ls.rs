@@ -7,7 +7,6 @@ use hashbrown::{HashMap, HashSet};
 use lsp_types as lsp;
 use ouroboros::self_referencing;
 use redscript_compiler_api::pass::{DiagnosticPass, UnusedLocals};
-use redscript_compiler_api::types::Type;
 use redscript_compiler_api::{
     CompilationInputs, CompileErrorReporter, Diagnostic, Evaluator, LoweredCompilationUnit,
     ScriptBundle, SourceMapExt, Symbols, TypeFlags, TypeInterner, TypeSchema, ast,
@@ -200,7 +199,9 @@ impl RedscriptLanguageServer {
         let file = map.get(id).unwrap();
 
         let (module, errors) = format_document(file.source(), id, settings);
-        if let (Some(module), []) = (module, &errors[..]) {
+        if let Some(module) = module
+            && errors.is_empty()
+        {
             let last_line = contents.len_lines() - 1;
             let edit = lsp::TextEdit::new(
                 lsp::Range::new(
@@ -387,7 +388,9 @@ fn generate_completions(
 ) -> Result<Vec<lsp_types::CompletionItem>, anyhow::Error> {
     let mut completions = vec![];
 
-    if let (Some(typ), Some(AtContext::Expr)) = (at.type_(), at.context()) {
+    if let Some(typ) = at.type_()
+        && matches!(at.context(), Some(AtContext::Expr))
+    {
         match at.symbols()[typ].schema() {
             TypeSchema::Aggregate(_) => {
                 let methods = at
@@ -408,10 +411,8 @@ fn generate_completions(
     }
 
     let typ = at.expr_type();
-    if let Some(typ) = typ
-        .as_ref()
-        .map(Type::unwrap_ref_or_self)
-        .and_then(Type::upper_bound)
+    if let Some(typ) = typ.as_ref()
+        && let Some(typ) = typ.unwrap_ref_or_self().upper_bound()
     {
         let methods = at
             .symbols()

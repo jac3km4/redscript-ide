@@ -60,7 +60,9 @@ impl<'ctx, 'a> ExprAt<'ctx, 'a> {
     }
 
     pub fn expr_type(&self) -> Option<Type<'ctx>> {
-        if let (Some(expr), Some(func)) = (self.expr, self.func) {
+        if let Some(expr) = self.expr
+            && let Some(func) = self.func
+        {
             type_of(expr, func, self.symbols)
         } else {
             None

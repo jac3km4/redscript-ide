@@ -17,7 +17,9 @@ impl<'ctx, 'a> ExprAtDisplay<'ctx, 'a> {
 impl fmt::Display for ExprAtDisplay<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = &self.inner;
-        let has_header = if let (Some(expr), Some(func)) = (inner.expr(), inner.func()) {
+        let has_header = if let Some(expr) = inner.expr()
+            && let Some(func) = inner.func()
+        {
             if let ir::Expr::Call { call, .. } = expr {
                 writeln!(f, "### Signature")?;
                 writeln!(f, "{}", CallDisplay::new(call, inner.symbols()))?;
