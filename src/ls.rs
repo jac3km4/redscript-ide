@@ -91,14 +91,13 @@ impl RedscriptLanguageServer {
 
         let byte = loc.doc().buffer().contents().byte(preceding_pos as usize);
 
-        if let Some(cached) = &mut *self.cached_completions.borrow_mut() {
-            if cached.file == loc.doc().path()
-                && loc.pos().saturating_sub(cached.pos) <= 1
-                && (byte == b'_' || byte.is_ascii_alphanumeric())
-            {
-                cached.pos = loc.pos();
-                return Ok(cached.completions.clone());
-            }
+        if let Some(cached) = &mut *self.cached_completions.borrow_mut()
+            && cached.file == loc.doc().path()
+            && loc.pos().saturating_sub(cached.pos) <= 1
+            && (byte == b'_' || byte.is_ascii_alphanumeric())
+        {
+            cached.pos = loc.pos();
+            return Ok(cached.completions.clone());
         };
 
         if byte != b'.' {
