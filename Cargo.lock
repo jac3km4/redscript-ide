@@ -60,15 +60,15 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
-version = "2.9.1"
+version = "2.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b8e56985ec62d17e9c1001dc89c88ecd7dc08e47eba5ec7c29c7b5eeecde967"
+checksum = "6a65b545ab31d687cff52899d4890855fec459eb6afe0da6417b8a18da87aa29"
 
 [[package]]
 name = "bon"
-version = "3.6.5"
+version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33d9ef19ae5263a138da9a86871eca537478ab0332a7770bac7e3f08b801f89f"
+checksum = "67a0c21249ad725ebcadcb1b1885f8e3d56e8e6b8924f560268aab000982d637"
 dependencies = [
  "bon-macros",
  "rustversion",
@@ -76,9 +76,9 @@ dependencies = [
 
 [[package]]
 name = "bon-macros"
-version = "3.6.5"
+version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "577ae008f2ca11ca7641bd44601002ee5ab49ef0af64846ce1ab6057218a5cc1"
+checksum = "a660ebdea4d4d3ec7788cfc9c035b66efb66028b9b97bf6cde7023ccc8e77e28"
 dependencies = [
  "darling",
  "ident_case",
@@ -125,9 +125,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.31"
+version = "1.2.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3a42d84bb6b69d3a8b3eaacf0d88f179e1929695e1ad012b6cf64d9caaa5fd2"
+checksum = "3ee0f8803222ba5a7e2777dd72ca451868909b1ac410621b676adf07280e9b5f"
 dependencies = [
  "shlex",
 ]
@@ -196,9 +196,9 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "darling"
-version = "0.21.0"
+version = "0.21.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a79c4acb1fd5fa3d9304be4c76e031c54d2e92d172a393e24b19a14fe8532fe9"
+checksum = "08440b3dd222c3d0433e63e097463969485f112baff337dfdaca043a0d760570"
 dependencies = [
  "darling_core",
  "darling_macro",
@@ -206,9 +206,9 @@ dependencies = [
 
 [[package]]
 name = "darling_core"
-version = "0.21.0"
+version = "0.21.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74875de90daf30eb59609910b84d4d368103aaec4c924824c6799b28f77d6a1d"
+checksum = "d25b7912bc28a04ab1b7715a68ea03aaa15662b43a1a4b2c480531fd19f8bf7e"
 dependencies = [
  "fnv",
  "ident_case",
@@ -220,9 +220,9 @@ dependencies = [
 
 [[package]]
 name = "darling_macro"
-version = "0.21.0"
+version = "0.21.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e79f8e61677d5df9167cd85265f8e5f64b215cdea3fb55eebc3e622e44c7a146"
+checksum = "ce154b9bea7fb0c8e8326e62d00354000c36e79770ff21b8c84e3aa267d9d531"
 dependencies = [
  "darling_core",
  "quote",
@@ -231,9 +231,9 @@ dependencies = [
 
 [[package]]
 name = "derive-where"
-version = "1.5.0"
+version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "510c292c8cf384b1a340b816a9a6cf2599eb8f566a44949024af88418000c50b"
+checksum = "ef941ded77d15ca19b40374869ac6000af1c9f2a4c0f3d4c70926287e6364a8f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -384,9 +384,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.174"
+version = "0.2.175"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1171693293099992e19cddea4e8b849964e9846f4acee11b3948bcc337be8776"
+checksum = "6a82ae493e598baaea5209805c49bbf2ea7de956d50d7da0da1164f9c6d28543"
 
 [[package]]
 name = "libmimalloc-sys"
@@ -524,9 +524,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.95"
+version = "1.0.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02b3e5e68a3a1a02aad3ec490a98007cbc13c37cbe84a3cd7b8e406d76e7f778"
+checksum = "89ae43fd86e4158d6db51ad8e2b80f313af9cc74f5c0e03ccb87de09998732de"
 dependencies = [
  "unicode-ident",
 ]
@@ -564,10 +564,10 @@ dependencies = [
 
 [[package]]
 name = "redscript-ast"
-version = "1.0.0-preview.15"
-source = "git+https://github.com/jac3km4/redscript?rev=ae66f9e#ae66f9e8affb463f6a9c694a27c85f688109cc1e"
+version = "1.0.0-preview.16"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
 dependencies = [
- "bitflags 2.9.1",
+ "bitflags 2.9.2",
  "chumsky",
  "derive-where",
  "elsa",
@@ -576,8 +576,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-api"
-version = "1.0.0-preview.15"
-source = "git+https://github.com/jac3km4/redscript?rev=ae66f9e#ae66f9e8affb463f6a9c694a27c85f688109cc1e"
+version = "1.0.0-preview.16"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
 dependencies = [
  "bon",
  "log",
@@ -591,8 +591,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-backend"
-version = "1.0.0-preview.15"
-source = "git+https://github.com/jac3km4/redscript?rev=ae66f9e#ae66f9e8affb463f6a9c694a27c85f688109cc1e"
+version = "1.0.0-preview.16"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
 dependencies = [
  "bon",
  "hashbrown 0.15.5",
@@ -607,8 +607,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-frontend"
-version = "1.0.0-preview.15"
-source = "git+https://github.com/jac3km4/redscript?rev=ae66f9e#ae66f9e8affb463f6a9c694a27c85f688109cc1e"
+version = "1.0.0-preview.16"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
 dependencies = [
  "bitfield-struct",
  "bon",
@@ -628,8 +628,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-dotfile"
-version = "1.0.0-preview.15"
-source = "git+https://github.com/jac3km4/redscript?rev=ae66f9e#ae66f9e8affb463f6a9c694a27c85f688109cc1e"
+version = "1.0.0-preview.16"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
 dependencies = [
  "anyhow",
  "hashbrown 0.15.5",
@@ -640,8 +640,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-formatter"
-version = "1.0.0-preview.15"
-source = "git+https://github.com/jac3km4/redscript?rev=ae66f9e#ae66f9e8affb463f6a9c694a27c85f688109cc1e"
+version = "1.0.0-preview.16"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
 dependencies = [
  "hashbrown 0.15.5",
  "pretty_dtoa",
@@ -673,8 +673,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-io"
-version = "1.0.0-preview.15"
-source = "git+https://github.com/jac3km4/redscript?rev=ae66f9e#ae66f9e8affb463f6a9c694a27c85f688109cc1e"
+version = "1.0.0-preview.16"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
 dependencies = [
  "bitfield-struct",
  "byte",
@@ -687,8 +687,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-parser"
-version = "1.0.0-preview.15"
-source = "git+https://github.com/jac3km4/redscript?rev=ae66f9e#ae66f9e8affb463f6a9c694a27c85f688109cc1e"
+version = "1.0.0-preview.16"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
 dependencies = [
  "chumsky",
  "redscript-ast",
@@ -760,9 +760,9 @@ dependencies = [
 
 [[package]]
 name = "rustversion"
-version = "1.0.21"
+version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a0d197bd2c9dc6e53b84da9556a69ba4cdfab8619eb41a8bd1cc2027a0f6b1d"
+checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "ryu"
@@ -853,9 +853,9 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "slab"
-version = "0.4.10"
+version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04dc19736151f35336d325007ac991178d504a119863a2fcb3758cdb5e52c50d"
+checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "smallvec"
@@ -901,9 +901,9 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "syn"
-version = "2.0.104"
+version = "2.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17b6f705963418cdb9927482fa304bc562ece2fdd4f616084c50b7023b435a40"
+checksum = "ede7c438028d4436d71104916910f5bb611972c5cfd7f89b8300a8186e6fada6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -918,18 +918,18 @@ checksum = "b52ada790ecca61aa8e561eba96355deb41b9b1b796dd3c965e74a590e9734a3"
 
 [[package]]
 name = "thiserror"
-version = "2.0.12"
+version = "2.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "567b8a2dae586314f7be2a752ec7474332959c6460e02bde30d702a66d488708"
+checksum = "80d76d3f064b981389ecb4b6b7f45a0bf9fdac1d5b9204c7bd6714fecc302850"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.12"
+version = "2.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f7cf42b4507d8ea322120659672cf1b9dbb93f8f2d4ecfd6e51350ff5b17a1d"
+checksum = "44d29feb33e986b6ea906bd9c3559a856983f92371b3eaa5e83782a351623de0"
 dependencies = [
  "proc-macro2",
  "quote",
