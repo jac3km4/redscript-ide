@@ -571,29 +571,41 @@ dependencies = [
  "chumsky",
  "derive-where",
  "elsa",
+]
+
+[[package]]
+name = "redscript-ast"
+version = "1.0.0-preview.17"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.17#bbc3d310a36c091acf870344a1f1e3a155b82841"
+dependencies = [
+ "bitflags 2.9.2",
+ "chumsky",
+ "derive-where",
+ "elsa",
  "ignore",
 ]
 
 [[package]]
 name = "redscript-compiler-api"
-version = "1.0.0-preview.16"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
+version = "1.0.0-preview.17"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.17#bbc3d310a36c091acf870344a1f1e3a155b82841"
 dependencies = [
  "bon",
  "log",
- "redscript-ast",
+ "redscript-ast 1.0.0-preview.17",
  "redscript-compiler-backend",
  "redscript-compiler-frontend",
  "redscript-io",
- "redscript-parser",
+ "redscript-parser 1.0.0-preview.17",
  "thiserror",
 ]
 
 [[package]]
 name = "redscript-compiler-backend"
-version = "1.0.0-preview.16"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
+version = "1.0.0-preview.17"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.17#bbc3d310a36c091acf870344a1f1e3a155b82841"
 dependencies = [
+ "bitfield-struct",
  "bon",
  "hashbrown 0.15.5",
  "identity-hash",
@@ -607,8 +619,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-frontend"
-version = "1.0.0-preview.16"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
+version = "1.0.0-preview.17"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.17#bbc3d310a36c091acf870344a1f1e3a155b82841"
 dependencies = [
  "bitfield-struct",
  "bon",
@@ -618,8 +630,8 @@ dependencies = [
  "identity-hash",
  "indexmap",
  "paste",
- "redscript-ast",
- "redscript-parser",
+ "redscript-ast 1.0.0-preview.17",
+ "redscript-parser 1.0.0-preview.17",
  "sequence_trie",
  "slab",
  "smallvec",
@@ -645,8 +657,8 @@ source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb21
 dependencies = [
  "hashbrown 0.15.5",
  "pretty_dtoa",
- "redscript-ast",
- "redscript-parser",
+ "redscript-ast 1.0.0-preview.16",
+ "redscript-parser 1.0.0-preview.16",
 ]
 
 [[package]]
@@ -664,7 +676,7 @@ dependencies = [
  "redscript-compiler-api",
  "redscript-dotfile",
  "redscript-formatter",
- "redscript-parser",
+ "redscript-parser 1.0.0-preview.16",
  "ropey",
  "serde",
  "serde_json",
@@ -673,8 +685,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-io"
-version = "1.0.0-preview.16"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
+version = "1.0.0-preview.17"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.17#bbc3d310a36c091acf870344a1f1e3a155b82841"
 dependencies = [
  "bitfield-struct",
  "byte",
@@ -691,7 +703,16 @@ version = "1.0.0-preview.16"
 source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
 dependencies = [
  "chumsky",
- "redscript-ast",
+ "redscript-ast 1.0.0-preview.16",
+]
+
+[[package]]
+name = "redscript-parser"
+version = "1.0.0-preview.17"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.17#bbc3d310a36c091acf870344a1f1e3a155b82841"
+dependencies = [
+ "chumsky",
+ "redscript-ast 1.0.0-preview.17",
 ]
 
 [[package]]
