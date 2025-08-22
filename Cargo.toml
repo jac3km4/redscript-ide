@@ -19,7 +19,7 @@ lsp-types = "0.97"
 
 [dependencies.redscript-parser]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.16"
+rev = "v1.0.0-preview.17"
 
 [dependencies.redscript-formatter]
 git = "https://github.com/jac3km4/redscript"
