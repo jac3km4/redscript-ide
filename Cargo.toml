@@ -32,7 +32,7 @@ features = ["ignore"]
 
 [dependencies.redscript-dotfile]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.16"
+rev = "v1.0.0-preview.17"
 
 [patch.crates-io]
 stable_deref_trait = { git = "https://github.com/Storyyeller/stable_deref_trait", rev = "59a35e0" }

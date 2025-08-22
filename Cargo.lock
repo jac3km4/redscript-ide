@@ -628,8 +628,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-dotfile"
-version = "1.0.0-preview.16"
-source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.16#9e9fb217f2dff687800074da72afdb595448c662"
+version = "1.0.0-preview.17"
+source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.17#bbc3d310a36c091acf870344a1f1e3a155b82841"
 dependencies = [
  "anyhow",
  "hashbrown 0.15.5",
