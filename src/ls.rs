@@ -9,7 +9,7 @@ use ouroboros::self_referencing;
 use redscript_compiler_api::pass::{DiagnosticPass, UnusedLocals};
 use redscript_compiler_api::{
     CompilationInputs, CompileErrorReporter, Diagnostic, Evaluator, LoweredCompilationUnit,
-    ScriptBundle, SourceMapExt, Symbols, TypeFlags, TypeInterner, TypeSchema, ast,
+    ScriptBundle, SourceMapExt, Symbols, TypeFlagRegistry, TypeInterner, TypeSchema, ast,
     infer_from_sources, parse_file, parse_files, process_sources,
 };
 use redscript_dotfile::Dotfile;
@@ -423,9 +423,8 @@ fn generate_completions(
 
         let fields = at
             .symbols()
-            .base_iter(typ.id())
-            .filter_map(|(_, def)| def.schema().as_aggregate())
-            .flat_map(|agg| agg.fields().iter())
+            .base_iter_with_self(typ.id())
+            .flat_map(|(_, agg)| agg.fields().iter())
             .map(|e| completions::field(e.name(), e.field()));
         completions.extend(fields);
     };
@@ -559,7 +558,7 @@ impl CompilationCache {
                 Ok(CompilationInputs::load_without_mapping(
                     &bundle,
                     interner,
-                    &TypeFlags::default(),
+                    &TypeFlagRegistry::default(),
                 )?)
             },
             |sources| {

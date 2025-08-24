@@ -23,10 +23,6 @@ jobs:
         with:
           shared-key: release-${{ inputs.os }}
 
-      # Set the stack size to 8MB to avoid crashes on Windows
-      - if: runner.os == 'Windows'
-        run: echo "RUSTFLAGS=-C link-arg=/STACK:8388608" >> $env:GITHUB_ENV
-
       - run: cargo build --release
 
       - name: Append system triplet to binary name
