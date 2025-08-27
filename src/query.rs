@@ -105,8 +105,8 @@ pub fn type_of<'ctx>(
     symbols: &Symbols<'ctx>,
 ) -> Option<Type<'ctx>> {
     let t = match expr {
-        ir::Expr::NewClass { class_type, .. } => class_type,
-        ir::Expr::NewStruct { struct_type, .. } => struct_type,
+        ir::Expr::NewInstance { class_type, .. } => class_type,
+        ir::Expr::Construct { struct_type, .. } => struct_type,
         ir::Expr::NewClosure { closure, .. } => &closure.typ,
         ir::Expr::Call { call, .. } => {
             let (fn_type, receiver_type_args, fn_type_args) = match &**call {
