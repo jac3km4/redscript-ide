@@ -13,26 +13,31 @@ ouroboros = "0.18"
 fluent-uri = "0.3"
 ropey = "1"
 crossbeam-channel = "0.5"
-mimalloc = "0.1"
+mimalloc = { version = "0.1", features = ["v3"] }
 lsp-server = "0.7"
 lsp-types = "0.97"
 
 [dependencies.redscript-parser]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.18"
+rev = "b958816"
 
 [dependencies.redscript-formatter]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.18"
+rev = "b958816"
 
 [dependencies.redscript-compiler-api]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.18"
+rev = "b958816"
 features = ["ignore"]
 
 [dependencies.redscript-dotfile]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.18"
+rev = "b958816"
+
+[dependencies.redscript-code-edit]
+git = "https://github.com/jac3km4/redscript"
+rev = "b958816"
+
 
 [patch.crates-io]
 stable_deref_trait = { git = "https://github.com/Storyyeller/stable_deref_trait", rev = "59a35e0" }

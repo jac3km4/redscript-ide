@@ -1,11 +1,16 @@
 use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::{fs, iter, mem};
+use std::{fmt, fs, iter, mem};
 
+use anyhow::Context;
 use hashbrown::{HashMap, HashSet};
-use lsp_types as lsp;
+use lsp_types::{self as lsp};
 use ouroboros::self_referencing;
+use redscript_code_edit::{CodeEdit, TextEdit};
+use redscript_compiler_api::ast::Span;
 use redscript_compiler_api::pass::{DiagnosticPass, UnusedLocals};
 use redscript_compiler_api::{
     CompilationInputs, CompileErrorReporter, Diagnostic, Evaluator, LoweredCompilationUnit,
@@ -14,6 +19,7 @@ use redscript_compiler_api::{
 };
 use redscript_dotfile::Dotfile;
 use redscript_formatter::{FormatSettings, format_document};
+use serde::{Deserialize, Serialize};
 
 use crate::completions;
 use crate::query::{AtContext, ExprAt};
@@ -21,11 +27,14 @@ use crate::server::{CodeLocation, Document, LanguageServer, LspContext};
 
 const DIAGNOSTIC_PASSES: &[&'static (dyn DiagnosticPass + 'static)] = &[&UnusedLocals];
 
+type FixMap = HashMap<PathBuf, BTreeMap<(u32, u32), Fix>>;
+
 pub struct RedscriptLanguageServer {
     workspaces: HashMap<PathBuf, WorkspaceDir>,
     cache: CompilationCache,
     cached_completions: RefCell<Option<CachedCompletions>>,
-    last_diagnostics: RefCell<HashSet<PathBuf>>,
+    fixes: RefCell<FixMap>,
+    last_published_files: RefCell<HashSet<PathBuf>>,
 }
 
 impl RedscriptLanguageServer {
@@ -47,7 +56,8 @@ impl RedscriptLanguageServer {
             cache: CompilationCache::make(cache_bytes, workspace_dirs, TypeInterner::default())?,
             workspaces,
             cached_completions: RefCell::new(None),
-            last_diagnostics: RefCell::new(HashSet::new()),
+            fixes: RefCell::new(HashMap::new()),
+            last_published_files: RefCell::new(HashSet::new()),
         })
     }
 
@@ -219,17 +229,100 @@ impl RedscriptLanguageServer {
         Ok(vec![])
     }
 
+    fn code_action(
+        &self,
+        path: PathBuf,
+        span: Range<u32>,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<lsp::CodeActionResponse> {
+        let fixes = self.fixes.borrow();
+
+        if let Some(fixes) = fixes.get(&path)
+            && let Some((&(start, end), fix)) = fixes.range(..(span.start, span.end)).last()
+            && (start..end).contains(&span.start)
+        {
+            let fix_one = lsp::CodeAction {
+                title: fix.kind.to_string(),
+                kind: Some(lsp::CodeActionKind::REFACTOR_REWRITE),
+                data: Some(serde_json::to_value(FixRequest::One(fix.clone()))?),
+                is_preferred: Some(true),
+                ..Default::default()
+            };
+
+            let fix_all = lsp::CodeAction {
+                title: format!("{} - fix all in the workspace", fix.kind),
+                kind: Some(lsp::CodeActionKind::REFACTOR_REWRITE),
+                data: Some(serde_json::to_value(FixRequest::FixAll(fix.kind))?),
+                ..Default::default()
+            };
+
+            Ok(vec![
+                lsp::CodeActionOrCommand::CodeAction(fix_one),
+                lsp::CodeActionOrCommand::CodeAction(fix_all),
+            ])
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    fn code_action_resolve(
+        &self,
+        action: lsp::CodeAction,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<lsp::CodeAction> {
+        let Some(data) = action.data else {
+            return Ok(action);
+        };
+
+        let request: FixRequest = serde_json::from_value(data)?;
+        let action = match request {
+            FixRequest::One(fix) => lsp::CodeAction {
+                title: fix.kind.to_string(),
+                edit: Some(lsp::WorkspaceEdit::new(
+                    [(fix.uri, vec![fix.edit])].into_iter().collect(),
+                )),
+                ..Default::default()
+            },
+            FixRequest::FixAll(kind) => {
+                let mut unique = HashSet::<(lsp::Uri, lsp::Range)>::new();
+
+                #[allow(clippy::mutable_key_type)]
+                let mut edits = std::collections::HashMap::<lsp::Uri, Vec<lsp::TextEdit>>::new();
+                for (_, fix) in self
+                    .fixes
+                    .borrow_mut()
+                    .drain()
+                    .flat_map(|(_, f)| f)
+                    .filter(|(_, f)| f.kind == kind)
+                {
+                    if unique.insert((fix.uri.clone(), fix.edit.range)) {
+                        edits.entry(fix.uri).or_default().push(fix.edit);
+                    }
+                }
+
+                lsp::CodeAction {
+                    title: kind.to_string(),
+                    edit: Some(lsp::WorkspaceEdit::new(edits)),
+                    ..Default::default()
+                }
+            }
+        };
+        Ok(action)
+    }
+
     pub fn check_workspace_and_publish(&self, ctx: &LspContext) -> anyhow::Result<()> {
-        self.check_workspace(|_, _, diags, sources| self.publish_diagnostics(diags, sources, ctx))
+        self.check_workspace(|_, symbols, diags, sources| {
+            self.publish_diagnostics(diags, symbols, sources, ctx)
+        })
     }
 
     fn check_workspace<A>(
         &self,
-        cb: impl Fn(
-            &LoweredCompilationUnit<'_>,
-            &Symbols<'_>,
-            &[Diagnostic<'_>],
-            &ast::SourceMap,
+        cb: impl for<'ctx> Fn(
+            &LoweredCompilationUnit<'ctx>,
+            &Symbols<'ctx>,
+            &[Diagnostic<'ctx>],
+            &'ctx ast::SourceMap,
         ) -> anyhow::Result<A>,
     ) -> anyhow::Result<A> {
         self.cache.with(|cache| {
@@ -246,10 +339,11 @@ impl RedscriptLanguageServer {
         })
     }
 
-    fn publish_diagnostics(
+    fn publish_diagnostics<'ctx>(
         &self,
-        diags: &[Diagnostic<'_>],
-        sources: &ast::SourceMap,
+        diags: &[Diagnostic<'ctx>],
+        symbols: &Symbols<'ctx>,
+        sources: &'ctx ast::SourceMap,
         ctx: &LspContext,
     ) -> anyhow::Result<()> {
         let mut file_diags = HashMap::new();
@@ -263,7 +357,9 @@ impl RedscriptLanguageServer {
             }
         }
 
-        let mut last_diagnostics = self.last_diagnostics.borrow_mut();
+        let mut last_diagnostics = self.last_published_files.borrow_mut();
+        let mut fixes = self.fixes.borrow_mut();
+        fixes.clear();
 
         for path in last_diagnostics.drain() {
             ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
@@ -274,10 +370,18 @@ impl RedscriptLanguageServer {
         }
 
         for (file, diags) in file_diags {
-            let file = sources.get(file).unwrap();
+            let file = sources.get(file).context("missing source file")?;
 
             if !last_diagnostics.contains(file.path()) {
                 last_diagnostics.insert(file.path().to_owned());
+            }
+
+            let slots = fixes.entry_ref(file.path()).or_default();
+            for diag in &diags {
+                if let Some(fix) = generate_fix(diag, symbols, sources, ctx) {
+                    let span = diag.span();
+                    slots.insert((span.start, span.end), fix);
+                }
             }
 
             ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
@@ -381,6 +485,23 @@ impl RedscriptLanguageServer {
             cb(ExprAt::new(expr, func, typ, &syms, cache.sources, ctx))
         })
     }
+}
+
+fn generate_fix<'ctx>(
+    diag: &Diagnostic<'ctx>,
+    symbols: &Symbols<'ctx>,
+    sources: &'ctx ast::SourceMap,
+    ctx: &LspContext,
+) -> Option<Fix> {
+    let code_edit = CodeEdit::from_diagnostic(diag)?;
+    let edit = TextEdit::from_code_edit(&code_edit, symbols, sources).ok()?;
+    let file = sources.get(edit.file)?;
+    let range = range(Span::new(edit.start as _, edit.end as _, edit.file), file)?;
+    Some(Fix {
+        kind: FixKind::from(&code_edit),
+        uri: ctx.uri(file.path()).ok()?,
+        edit: lsp::TextEdit::new(range, edit.content.to_string()),
+    })
 }
 
 fn generate_completions(
@@ -498,6 +619,23 @@ impl LanguageServer for RedscriptLanguageServer {
         _ctx: &LspContext,
     ) -> anyhow::Result<Vec<lsp_types::TextEdit>> {
         self.format_document(doc, tab_size)
+    }
+
+    fn code_action(
+        &self,
+        path: PathBuf,
+        span: Range<u32>,
+        ctx: &LspContext,
+    ) -> anyhow::Result<lsp_types::CodeActionResponse> {
+        self.code_action(path, span, ctx)
+    }
+
+    fn code_action_resolve(
+        &self,
+        action: lsp::CodeAction,
+        ctx: &LspContext,
+    ) -> anyhow::Result<lsp_types::CodeAction> {
+        self.code_action_resolve(action, ctx)
     }
 }
 
@@ -661,6 +799,49 @@ impl CachedCompletions {
             completions,
             file,
             pos,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum FixRequest {
+    One(Fix),
+    FixAll(FixKind),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Fix {
+    kind: FixKind,
+    uri: lsp::Uri,
+    edit: lsp::TextEdit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum FixKind {
+    FixStructNewConstructor,
+    MakeMethodPublic,
+    MakeFieldPublic,
+    MakeTypePublic,
+}
+
+impl From<&CodeEdit<'_>> for FixKind {
+    fn from(edit: &CodeEdit<'_>) -> Self {
+        match edit {
+            CodeEdit::FixStructNewConstructor(_, _) => Self::FixStructNewConstructor,
+            CodeEdit::MakeMethodPublic(_) => Self::MakeMethodPublic,
+            CodeEdit::MakeFieldPublic(_) => Self::MakeFieldPublic,
+            CodeEdit::MakeTypePublic(_) => Self::MakeTypePublic,
+        }
+    }
+}
+
+impl fmt::Display for FixKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FixStructNewConstructor => write!(f, "Fix by using struct constructor"),
+            Self::MakeMethodPublic => write!(f, "Make method public"),
+            Self::MakeFieldPublic => write!(f, "Make field public"),
+            Self::MakeTypePublic => write!(f, "Make type public"),
         }
     }
 }

@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -129,6 +130,26 @@ impl LspServer<'_> {
                             .format(doc, options.tab_size as u16, &self.context),
                     )?;
                 }
+                lsp::request::CodeActionRequest::METHOD => {
+                    let lsp::CodeActionParams {
+                        text_document,
+                        range,
+                        ..
+                    } = serde_json::from_value(request.params)?;
+                    let path = path_from_uri(&text_document.uri)?;
+                    let range = self.range(&text_document.uri, range)?;
+                    self.handle_response(
+                        request.id,
+                        self.server.code_action(path, range, &self.context),
+                    )?;
+                }
+                lsp::request::CodeActionResolveRequest::METHOD => {
+                    let action: lsp::CodeAction = serde_json::from_value(request.params)?;
+                    self.handle_response(
+                        request.id,
+                        self.server.code_action_resolve(action, &self.context),
+                    )?;
+                }
                 lsp::request::Shutdown::METHOD => {
                     self.handle_response(request.id, Ok(Value::Null))?;
                 }
@@ -245,6 +266,19 @@ impl LspServer<'_> {
             .context("position not found")?;
         Ok(CodeLocation::new(document, pos))
     }
+
+    fn range(&self, uri: &lsp::Uri, range: lsp::Range) -> anyhow::Result<Range<u32>> {
+        let document = self.document(uri)?;
+        let start = document
+            .body
+            .get_pos(range.start.line, range.start.character)
+            .context("start position not found")?;
+        let end = document
+            .body
+            .get_pos(range.end.line, range.end.character)
+            .context("end position not found")?;
+        Ok(start..end)
+    }
 }
 
 pub trait LanguageServer {
@@ -277,6 +311,17 @@ pub trait LanguageServer {
         tab_size: u16,
         ctx: &LspContext,
     ) -> anyhow::Result<Vec<lsp::TextEdit>>;
+    fn code_action(
+        &self,
+        path: PathBuf,
+        span: Range<u32>,
+        ctx: &LspContext,
+    ) -> anyhow::Result<lsp::CodeActionResponse>;
+    fn code_action_resolve(
+        &self,
+        action: lsp::CodeAction,
+        ctx: &LspContext,
+    ) -> anyhow::Result<lsp::CodeAction>;
 }
 
 #[derive(Debug, Clone)]
@@ -447,6 +492,12 @@ fn capabilities() -> lsp::ServerCapabilities {
         }),
         workspace_symbol_provider: Some(lsp::OneOf::Left(true)),
         document_formatting_provider: Some(lsp::OneOf::Left(true)),
+        code_action_provider: Some(lsp::CodeActionProviderCapability::Options(
+            lsp::CodeActionOptions {
+                resolve_provider: Some(true),
+                ..Default::default()
+            },
+        )),
         ..Default::default()
     }
 }
