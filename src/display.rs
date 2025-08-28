@@ -168,8 +168,17 @@ impl fmt::Display for DocDisplay<'_, '_> {
             return Ok(());
         }
         writeln!(f, "---")?;
-        for l in self.doc {
-            writeln!(f, "{}", l.strip_prefix("///").unwrap_or(l).trim())?;
+        let shared_prefix = self
+            .doc
+            .iter()
+            .map(|&line| {
+                let trimmed = line.strip_prefix("///").unwrap_or(line).trim_ascii_start();
+                line.len() - trimmed.len()
+            })
+            .min()
+            .unwrap_or(0);
+        for line in self.doc {
+            writeln!(f, "{}", &line[shared_prefix..])?;
         }
         Ok(())
     }
