@@ -244,7 +244,7 @@ impl RedscriptLanguageServer {
             let fix_one = lsp::CodeAction {
                 title: fix.kind.to_string(),
                 kind: Some(lsp::CodeActionKind::REFACTOR_REWRITE),
-                data: Some(serde_json::to_value(FixRequest::One(fix.clone()))?),
+                data: Some(serde_json::to_value(FixRequest::FixOne(fix.clone()))?),
                 is_preferred: Some(true),
                 ..Default::default()
             };
@@ -276,7 +276,7 @@ impl RedscriptLanguageServer {
 
         let request: FixRequest = serde_json::from_value(data)?;
         let action = match request {
-            FixRequest::One(fix) => lsp::CodeAction {
+            FixRequest::FixOne(fix) => lsp::CodeAction {
                 title: fix.kind.to_string(),
                 edit: Some(lsp::WorkspaceEdit::new(
                     [(fix.uri, vec![fix.edit])].into_iter().collect(),
@@ -805,7 +805,7 @@ impl CachedCompletions {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum FixRequest {
-    One(Fix),
+    FixOne(Fix),
     FixAll(FixKind),
 }
 
