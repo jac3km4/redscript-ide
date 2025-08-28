@@ -471,8 +471,13 @@ fn uri_from_path(path: &Path) -> anyhow::Result<lsp::Uri> {
 
 fn capabilities() -> lsp::ServerCapabilities {
     lsp::ServerCapabilities {
-        text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
-            lsp::TextDocumentSyncKind::INCREMENTAL,
+        text_document_sync: Some(lsp::TextDocumentSyncCapability::Options(
+            lsp::TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(lsp::TextDocumentSyncKind::INCREMENTAL),
+                save: Some(lsp::TextDocumentSyncSaveOptions::Supported(true)),
+                ..Default::default()
+            },
         )),
         completion_provider: Some(lsp::CompletionOptions {
             trigger_characters: Some(vec![".".to_owned()]),

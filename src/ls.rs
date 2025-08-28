@@ -31,9 +31,9 @@ type FixMap = HashMap<PathBuf, BTreeMap<(u32, u32), Fix>>;
 
 pub struct RedscriptLanguageServer {
     workspaces: HashMap<PathBuf, WorkspaceDir>,
-    cache: CompilationCache,
+    compilation_cache: CompilationCache,
     cached_completions: RefCell<Option<CachedCompletions>>,
-    fixes: RefCell<FixMap>,
+    cached_fixes: RefCell<FixMap>,
     last_published_files: RefCell<HashSet<PathBuf>>,
 }
 
@@ -53,10 +53,14 @@ impl RedscriptLanguageServer {
             .collect::<anyhow::Result<HashMap<_, _>>>()?;
         let workspace_dirs = workspaces.iter().flat_map(|(_, w)| &w.roots);
         Ok(Self {
-            cache: CompilationCache::make(cache_bytes, workspace_dirs, TypeInterner::default())?,
+            compilation_cache: CompilationCache::make(
+                cache_bytes,
+                workspace_dirs,
+                TypeInterner::default(),
+            )?,
             workspaces,
             cached_completions: RefCell::new(None),
-            fixes: RefCell::new(HashMap::new()),
+            cached_fixes: RefCell::new(HashMap::new()),
             last_published_files: RefCell::new(HashSet::new()),
         })
     }
@@ -206,7 +210,7 @@ impl RedscriptLanguageServer {
         let contents = doc.buffer().contents();
         let map = ast::SourceMap::new();
         let id = map.push_back(doc.path(), contents.to_string());
-        let file = map.get(id).unwrap();
+        let file = map.get(id).context("missing source file")?;
 
         let (module, errors) = format_document(file.source(), id, settings);
         if let Some(module) = module
@@ -235,7 +239,7 @@ impl RedscriptLanguageServer {
         span: Range<u32>,
         _ctx: &LspContext,
     ) -> anyhow::Result<lsp::CodeActionResponse> {
-        let fixes = self.fixes.borrow();
+        let fixes = self.cached_fixes.borrow();
 
         if let Some(fixes) = fixes.get(&path)
             && let Some((&(start, end), fix)) = fixes.range(..(span.start, span.end)).last()
@@ -289,7 +293,7 @@ impl RedscriptLanguageServer {
                 #[allow(clippy::mutable_key_type)]
                 let mut edits = std::collections::HashMap::<lsp::Uri, Vec<lsp::TextEdit>>::new();
                 for (_, fix) in self
-                    .fixes
+                    .cached_fixes
                     .borrow_mut()
                     .drain()
                     .flat_map(|(_, f)| f)
@@ -325,7 +329,7 @@ impl RedscriptLanguageServer {
             &'ctx ast::SourceMap,
         ) -> anyhow::Result<A>,
     ) -> anyhow::Result<A> {
-        self.cache.with(|cache| {
+        self.compilation_cache.with(|cache| {
             let mut reporter = CompileErrorReporter::default();
             let (unit, syms) = infer_from_sources(
                 cache.sources,
@@ -358,7 +362,7 @@ impl RedscriptLanguageServer {
         }
 
         let mut last_diagnostics = self.last_published_files.borrow_mut();
-        let mut fixes = self.fixes.borrow_mut();
+        let mut fixes = self.cached_fixes.borrow_mut();
         fixes.clear();
 
         for path in last_diagnostics.drain() {
@@ -371,12 +375,13 @@ impl RedscriptLanguageServer {
 
         for (file, diags) in file_diags {
             let file = sources.get(file).context("missing source file")?;
+            let path = file.path();
 
-            if !last_diagnostics.contains(file.path()) {
-                last_diagnostics.insert(file.path().to_owned());
+            if !last_diagnostics.contains(path) {
+                last_diagnostics.insert(path.to_owned());
             }
 
-            let slots = fixes.entry_ref(file.path()).or_default();
+            let slots = fixes.entry_ref(path).or_default();
             for diag in &diags {
                 if let Some(fix) = generate_fix(diag, symbols, sources, ctx) {
                     let span = diag.span();
@@ -385,7 +390,7 @@ impl RedscriptLanguageServer {
             }
 
             ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
-                uri: ctx.uri(file.path())?,
+                uri: ctx.uri(path)?,
                 diagnostics: diags
                     .into_iter()
                     .filter_map(|diag| {
@@ -432,7 +437,7 @@ impl RedscriptLanguageServer {
         cb: impl Fn(ExprAt<'_, '_>) -> anyhow::Result<A>,
         _ctx: &LspContext,
     ) -> anyhow::Result<A> {
-        self.cache.with(|cache| {
+        self.compilation_cache.with(|cache| {
             let mut contents = loc.doc().buffer().contents().to_string();
             if patch {
                 let pos = loc.pos() as usize;
@@ -444,7 +449,7 @@ impl RedscriptLanguageServer {
             let preceding_pos = loc.pos() - 1;
 
             let id = cache.sources.push_back(loc.doc().path(), contents);
-            let file = cache.sources.get(id).unwrap();
+            let file = cache.sources.get(id).context("missing source file")?;
 
             let previous_id = cache.file_ids.get(loc.doc().path()).copied();
 
@@ -558,11 +563,11 @@ impl LanguageServer for RedscriptLanguageServer {
         match self.resolve_file(&path) {
             FileResolution::Workspace(_) => {
                 let workspace_dirs = self.workspaces.values().flat_map(|w| &w.roots);
-                self.cache.remake(workspace_dirs)?;
+                self.compilation_cache.remake(workspace_dirs)?;
                 self.check_workspace_and_publish(ctx)
             }
             FileResolution::NonWorkspace(path) => {
-                self.cache.remake([path])?;
+                self.compilation_cache.remake([path])?;
                 self.check_workspace_and_publish(ctx)
             }
         }

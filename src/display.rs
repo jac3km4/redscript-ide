@@ -63,12 +63,12 @@ impl fmt::Display for CallDisplay<'_, '_> {
         writeln!(f, "```")?;
         let doc = match self.call {
             &ir::Call::FreeFunction { function, .. } => {
-                let (name, func) = self.symbols.get_free_function(function).unwrap();
+                let (name, func) = self.symbols.get_free_function(function).ok_or(fmt::Error)?;
                 writeln!(f, "{name}{}", FunctionTypeDisplay::new(func.type_()))?;
                 func.doc()
             }
             &ir::Call::Static { method, .. } => {
-                let (name, func) = self.symbols.get_method(method).unwrap();
+                let (name, func) = self.symbols.get_method(method).ok_or(fmt::Error)?;
                 writeln!(
                     f,
                     "{}::{name}{}",
@@ -78,7 +78,7 @@ impl fmt::Display for CallDisplay<'_, '_> {
                 func.doc()
             }
             ir::Call::Instance { method, .. } => {
-                let (name, func) = self.symbols.get_method(*method).unwrap();
+                let (name, func) = self.symbols.get_method(*method).ok_or(fmt::Error)?;
                 writeln!(
                     f,
                     "{}::{name}{}",
