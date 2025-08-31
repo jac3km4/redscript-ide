@@ -581,8 +581,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-ast"
-version = "1.0.0-preview.20"
-source = "git+https://github.com/jac3km4/redscript?rev=f74054d#f74054dda8fd93903a786911b5113b8f3a936c26"
+version = "1.0.0-preview.21"
+source = "git+https://github.com/jac3km4/redscript?rev=4fc7018#4fc701817e020f8d43cdbace6869131f26beb7d5"
 dependencies = [
  "bitflags 2.9.3",
  "chumsky",
@@ -593,8 +593,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-code-edit"
-version = "1.0.0-preview.20"
-source = "git+https://github.com/jac3km4/redscript?rev=f74054d#f74054dda8fd93903a786911b5113b8f3a936c26"
+version = "1.0.0-preview.21"
+source = "git+https://github.com/jac3km4/redscript?rev=4fc7018#4fc701817e020f8d43cdbace6869131f26beb7d5"
 dependencies = [
  "anyhow",
  "mimalloc",
@@ -603,8 +603,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-api"
-version = "1.0.0-preview.20"
-source = "git+https://github.com/jac3km4/redscript?rev=f74054d#f74054dda8fd93903a786911b5113b8f3a936c26"
+version = "1.0.0-preview.21"
+source = "git+https://github.com/jac3km4/redscript?rev=4fc7018#4fc701817e020f8d43cdbace6869131f26beb7d5"
 dependencies = [
  "bon",
  "log",
@@ -618,8 +618,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-backend"
-version = "1.0.0-preview.20"
-source = "git+https://github.com/jac3km4/redscript?rev=f74054d#f74054dda8fd93903a786911b5113b8f3a936c26"
+version = "1.0.0-preview.21"
+source = "git+https://github.com/jac3km4/redscript?rev=4fc7018#4fc701817e020f8d43cdbace6869131f26beb7d5"
 dependencies = [
  "bitfield-struct",
  "bon",
@@ -635,8 +635,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-compiler-frontend"
-version = "1.0.0-preview.20"
-source = "git+https://github.com/jac3km4/redscript?rev=f74054d#f74054dda8fd93903a786911b5113b8f3a936c26"
+version = "1.0.0-preview.21"
+source = "git+https://github.com/jac3km4/redscript?rev=4fc7018#4fc701817e020f8d43cdbace6869131f26beb7d5"
 dependencies = [
  "bitfield-struct",
  "bon",
@@ -656,8 +656,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-dotfile"
-version = "1.0.0-preview.20"
-source = "git+https://github.com/jac3km4/redscript?rev=f74054d#f74054dda8fd93903a786911b5113b8f3a936c26"
+version = "1.0.0-preview.21"
+source = "git+https://github.com/jac3km4/redscript?rev=4fc7018#4fc701817e020f8d43cdbace6869131f26beb7d5"
 dependencies = [
  "anyhow",
  "hashbrown 0.16.0",
@@ -668,8 +668,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-formatter"
-version = "1.0.0-preview.20"
-source = "git+https://github.com/jac3km4/redscript?rev=f74054d#f74054dda8fd93903a786911b5113b8f3a936c26"
+version = "1.0.0-preview.21"
+source = "git+https://github.com/jac3km4/redscript?rev=4fc7018#4fc701817e020f8d43cdbace6869131f26beb7d5"
 dependencies = [
  "hashbrown 0.16.0",
  "pretty_dtoa",
@@ -702,8 +702,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-io"
-version = "1.0.0-preview.20"
-source = "git+https://github.com/jac3km4/redscript?rev=f74054d#f74054dda8fd93903a786911b5113b8f3a936c26"
+version = "1.0.0-preview.21"
+source = "git+https://github.com/jac3km4/redscript?rev=4fc7018#4fc701817e020f8d43cdbace6869131f26beb7d5"
 dependencies = [
  "bitfield-struct",
  "byte",
@@ -716,8 +716,8 @@ dependencies = [
 
 [[package]]
 name = "redscript-parser"
-version = "1.0.0-preview.20"
-source = "git+https://github.com/jac3km4/redscript?rev=f74054d#f74054dda8fd93903a786911b5113b8f3a936c26"
+version = "1.0.0-preview.21"
+source = "git+https://github.com/jac3km4/redscript?rev=4fc7018#4fc701817e020f8d43cdbace6869131f26beb7d5"
 dependencies = [
  "chumsky",
  "redscript-ast",
