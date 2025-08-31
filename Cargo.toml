@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-hashbrown = "0.15"
+hashbrown = "0.16"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
@@ -19,24 +19,24 @@ lsp-types = "0.97"
 
 [dependencies.redscript-parser]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.19"
+rev = "v1.0.0-preview.20"
 
 [dependencies.redscript-formatter]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.19"
+rev = "v1.0.0-preview.20"
 
 [dependencies.redscript-compiler-api]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.19"
+rev = "v1.0.0-preview.20"
 features = ["ignore"]
 
 [dependencies.redscript-dotfile]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.19"
+rev = "v1.0.0-preview.20"
 
 [dependencies.redscript-code-edit]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.19"
+rev = "v1.0.0-preview.20"
 
 
 [patch.crates-io]
