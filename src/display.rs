@@ -24,6 +24,12 @@ impl fmt::Display for ExprAtDisplay<'_, '_> {
                 writeln!(f, "### Signature")?;
                 writeln!(f, "{}", CallDisplay::new(call, inner.symbols()))?;
                 true
+            } else if let ir::Expr::Field { field, .. } = expr {
+                writeln!(f, "### Field")?;
+                let (name, field) = inner.symbols().get_field(*field).ok_or(fmt::Error)?;
+                writeln!(f, "```{name}: {}```", field.type_())?;
+                writeln!(f, "{}", DocDisplay::new(field.doc()))?;
+                true
             } else if let Some(typ) = type_of(expr, func, inner.symbols()) {
                 writeln!(f, "### Type")?;
                 writeln!(f, "```\n{typ}\n```")?;
