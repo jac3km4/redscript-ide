@@ -180,10 +180,7 @@ pub fn type_of<'ctx>(
         },
         ir::Expr::Conditional { then, .. } => return type_of(then, func, symbols),
         ir::Expr::DynCast { target_type, .. } => target_type,
-        &ir::Expr::Local(local, _) => {
-            return func.find_local(local)?.coalesce(symbols).ok();
-        }
-        &ir::Expr::Capture(local, _) => {
+        &ir::Expr::Local(local, _) | &ir::Expr::Capture(local, _) => {
             return func.find_local(local)?.coalesce(symbols).ok();
         }
         ir::Expr::Const(const_, _) => return Some(Type::nullary(const_.type_id())),
