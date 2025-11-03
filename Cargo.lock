@@ -91,9 +91,9 @@ dependencies = [
 
 [[package]]
 name = "borrow-or-share"
-version = "0.2.2"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eeab4423108c5d7c744f4d234de88d18d636100093ae04caf4825134b9c3a32"
+checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "bstr"
@@ -274,12 +274,13 @@ dependencies = [
 
 [[package]]
 name = "fluent-uri"
-version = "0.3.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1918b65d96df47d3591bed19c5cca17e3fa5d0707318e4b5ef2eae01764df7e5"
+checksum = "d56843a3da84c804e75db9866c171096f278b48044be58964c2bb5f8464fe3de"
 dependencies = [
  "borrow-or-share",
  "ref-cast",
+ "serde",
 ]
 
 [[package]]
@@ -690,7 +691,7 @@ version = "0.2.25"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
- "fluent-uri 0.3.2",
+ "fluent-uri 0.4.0",
  "hashbrown 0.16.0",
  "lsp-server",
  "lsp-types",
