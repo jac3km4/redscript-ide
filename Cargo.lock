@@ -336,14 +336,15 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.16.0"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d"
+checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
  "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -387,7 +388,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b0f83760fb341a774ed326568e19f5a863af4a952def8c39f9ab92fd95b88e5"
 dependencies = [
  "equivalent",
- "hashbrown 0.16.0",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
@@ -630,7 +631,7 @@ source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.22#6b76cda
 dependencies = [
  "bitfield-struct",
  "bon",
- "hashbrown 0.16.0",
+ "hashbrown 0.16.1",
  "identity-hash",
  "indexmap",
  "redscript-compiler-frontend",
@@ -649,7 +650,7 @@ dependencies = [
  "bon",
  "derive-where",
  "elsa",
- "hashbrown 0.16.0",
+ "hashbrown 0.16.1",
  "identity-hash",
  "indexmap",
  "paste",
@@ -667,7 +668,7 @@ version = "1.0.0-preview.22"
 source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.22#6b76cda1ac6226b3b53f58da580ca2904a98368b"
 dependencies = [
  "anyhow",
- "hashbrown 0.16.0",
+ "hashbrown 0.16.1",
  "leon",
  "serde",
  "toml",
@@ -678,7 +679,7 @@ name = "redscript-formatter"
 version = "1.0.0-preview.22"
 source = "git+https://github.com/jac3km4/redscript?rev=v1.0.0-preview.22#6b76cda1ac6226b3b53f58da580ca2904a98368b"
 dependencies = [
- "hashbrown 0.16.0",
+ "hashbrown 0.16.1",
  "pretty_dtoa",
  "redscript-ast",
  "redscript-parser",
@@ -691,7 +692,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "fluent-uri 0.3.2",
- "hashbrown 0.16.0",
+ "hashbrown 0.16.1",
  "lsp-server",
  "lsp-types",
  "mimalloc",
