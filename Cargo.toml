@@ -19,24 +19,24 @@ lsp-types = "0.97"
 
 [dependencies.redscript-parser]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.22"
+rev = "8671afb"
 
 [dependencies.redscript-formatter]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.22"
+rev = "8671afb"
 
 [dependencies.redscript-compiler-api]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.22"
+rev = "8671afb"
 features = ["ignore"]
 
 [dependencies.redscript-dotfile]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.22"
+rev = "8671afb"
 
 [dependencies.redscript-code-edit]
 git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0-preview.22"
+rev = "8671afb"
 
 
 [patch.crates-io]
