@@ -363,8 +363,9 @@ impl RedscriptLanguageServer {
         let mut fixes = self.cached_fixes.borrow_mut();
         fixes.clear();
 
+        let mut publications = Vec::new();
         let mut current_files = HashSet::new();
-        for (file, diags) in file_diags {
+        for (file, mut diags) in file_diags {
             let file = sources.get(file).context("missing source file")?;
             let path = file.path();
 
@@ -378,37 +379,52 @@ impl RedscriptLanguageServer {
                 }
             }
 
-            ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
-                uri: ctx.uri(path)?,
-                diagnostics: diags
-                    .into_iter()
-                    .filter_map(|diag| {
-                        Some(lsp::Diagnostic {
-                            range: range(diag.span(), file)?,
-                            severity: Some(if diag.is_error() {
-                                lsp::DiagnosticSeverity::ERROR
-                            } else {
-                                lsp::DiagnosticSeverity::WARNING
-                            }),
-                            code: Some(lsp::NumberOrString::String(diag.code().into())),
-                            source: Some("redscript".into()),
-                            message: diag.to_string(),
-                            tags: (matches!(diag, Diagnostic::UnusedLocal(_))
-                                && ctx.supports_diagnostic_tag(lsp::DiagnosticTag::UNNECESSARY))
-                            .then(|| vec![lsp::DiagnosticTag::UNNECESSARY]),
-                            ..Default::default()
-                        })
-                    })
-                    .collect(),
-                version: None,
+            diags.sort_by_cached_key(|diag| {
+                let span = diag.span();
+                (span.start, span.end, diag.code(), diag.to_string())
             });
+            publications.push((
+                path,
+                lsp::PublishDiagnosticsParams {
+                    uri: ctx.uri(path)?,
+                    diagnostics: diags
+                        .into_iter()
+                        .filter_map(|diag| {
+                            Some(lsp::Diagnostic {
+                                range: range(diag.span(), file)?,
+                                severity: Some(if diag.is_error() {
+                                    lsp::DiagnosticSeverity::ERROR
+                                } else {
+                                    lsp::DiagnosticSeverity::WARNING
+                                }),
+                                code: Some(lsp::NumberOrString::String(diag.code().into())),
+                                source: Some("redscript".into()),
+                                message: diag.to_string(),
+                                tags: (matches!(diag, Diagnostic::UnusedLocal(_))
+                                    && ctx
+                                        .supports_diagnostic_tag(lsp::DiagnosticTag::UNNECESSARY))
+                                .then(|| vec![lsp::DiagnosticTag::UNNECESSARY]),
+                                ..Default::default()
+                            })
+                        })
+                        .collect(),
+                    version: None,
+                },
+            ));
         }
         for path in last_diagnostics.difference(&current_files) {
-            ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
-                uri: ctx.uri(path)?,
-                diagnostics: vec![],
-                version: None,
-            });
+            publications.push((
+                path.as_path(),
+                lsp::PublishDiagnosticsParams {
+                    uri: ctx.uri(path)?,
+                    diagnostics: vec![],
+                    version: None,
+                },
+            ));
+        }
+        publications.sort_by_key(|(path, _)| *path);
+        for (_, params) in publications {
+            ctx.notify::<lsp::notification::PublishDiagnostics>(params);
         }
         *last_diagnostics = current_files;
         Ok(())
@@ -902,7 +918,7 @@ mod tests {
             };
             let params: lsp::PublishDiagnosticsParams =
                 serde_json::from_value(notification.params).unwrap();
-            let unused = &params.diagnostics[0];
+            let unused = &params.diagnostics[1];
             assert_eq!(
                 unused.code,
                 Some(lsp::NumberOrString::String("UNUSED_LOCAL".into()))
@@ -914,10 +930,10 @@ mod tests {
                 supports_tags.then(|| vec![lsp::DiagnosticTag::UNNECESSARY])
             );
             assert_eq!(
-                params.diagnostics[1].severity,
+                params.diagnostics[0].severity,
                 Some(lsp::DiagnosticSeverity::ERROR)
             );
-            assert_eq!(params.diagnostics[1].tags, None);
+            assert_eq!(params.diagnostics[0].tags, None);
         }
     }
 
@@ -967,6 +983,88 @@ mod tests {
             .publish_diagnostics(&[], &symbols, &sources, &ctx)
             .unwrap();
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn publications_are_sorted_by_path_and_diagnostics_by_span_code_message() {
+        let mut server = server();
+        let root = PathBuf::from("C:/scripts");
+        server.workspaces.insert(
+            root.clone(),
+            WorkspaceDir {
+                roots: vec![root.clone()],
+                format_settings: FormatSettings::default(),
+            },
+        );
+        let sources = ast::SourceMap::new();
+        let z = sources.push_back(root.join("z.reds"), "test");
+        let a = sources.push_back(root.join("a.reds"), "test");
+        let mut diags = vec![
+            Diagnostic::UnusedLocal(Span::new(0, 1, z)),
+            Diagnostic::UnusedLocal(Span::new(2, 3, a)),
+            Diagnostic::UnknownIntrinsic("z", Span::new(0, 2, a)),
+            Diagnostic::UnknownIntrinsic("a", Span::new(0, 2, a)),
+            Diagnostic::MissingFunctionBody(Span::new(0, 2, a)),
+            Diagnostic::UnusedLocal(Span::new(0, 1, a)),
+        ];
+        let expected = [5, 3, 2, 4, 1].map(|i| diags[i].to_string());
+        let symbols = Symbols::with_default_types();
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let ctx = LspContext::new(sender);
+
+        for _ in 0..2 {
+            server
+                .last_published_files
+                .borrow_mut()
+                .extend([root.join("0.reds"), root.join("zz.reds")]);
+            server
+                .publish_diagnostics(&diags, &symbols, &sources, &ctx)
+                .unwrap();
+            let params = receiver
+                .try_iter()
+                .map(|message| {
+                    let lsp_server::Message::Notification(notification) = message else {
+                        panic!("expected diagnostics notification");
+                    };
+                    serde_json::from_value::<lsp::PublishDiagnosticsParams>(notification.params)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                params.iter().map(|p| p.uri.clone()).collect::<Vec<_>>(),
+                ["0.reds", "a.reds", "z.reds", "zz.reds"]
+                    .map(|name| ctx.uri(&root.join(name)).unwrap())
+            );
+            assert!(params[0].diagnostics.is_empty());
+            assert!(params[3].diagnostics.is_empty());
+            assert_eq!(
+                params[1]
+                    .diagnostics
+                    .iter()
+                    .map(|d| d.message.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            diags.reverse();
+        }
+        server
+            .publish_diagnostics(&[], &symbols, &sources, &ctx)
+            .unwrap();
+        let cleared = receiver
+            .try_iter()
+            .map(|message| {
+                let lsp_server::Message::Notification(notification) = message else {
+                    panic!("expected diagnostics notification");
+                };
+                serde_json::from_value::<lsp::PublishDiagnosticsParams>(notification.params)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cleared.iter().map(|p| p.uri.clone()).collect::<Vec<_>>(),
+            ["a.reds", "z.reds"].map(|name| ctx.uri(&root.join(name)).unwrap())
+        );
+        assert!(cleared.iter().all(|p| p.diagnostics.is_empty()));
     }
 
     #[test]
