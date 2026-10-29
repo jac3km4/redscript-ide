@@ -14,17 +14,17 @@ jobs:
       matrix:
         os:
           - windows-latest
-          - macos-14
-          - macos-latest
+          - macos-15
+          - macos-15-intel
           - ubuntu-latest
         include:
           - os: windows-latest
             name: Windows
             triplet: x86_64-pc-windows-msvc
-          - os: macos-14
+          - os: macos-15
             name: MacOS Silicon
             triplet: aarch64-apple-darwin
-          - os: macos-latest
+          - os: macos-15-intel
             name: MacOS Intel
             triplet: x86_64-apple-darwin
           - os: ubuntu-latest

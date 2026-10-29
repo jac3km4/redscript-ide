@@ -2,6 +2,8 @@
 
 Language server for [redscript](https://github.com/jac3km4/redscript)
 
+For development setup and validation commands, see [Contributing](CONTRIBUTING.md).
+
 ## features
 
 - error and warning diagnostics
