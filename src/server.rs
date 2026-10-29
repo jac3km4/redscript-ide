@@ -31,10 +31,11 @@ impl LspServer<'_> {
         ) -> anyhow::Result<Box<dyn LanguageServer + 'a>>,
     ) -> anyhow::Result<()> {
         let (connection, _io) = Connection::stdio();
-        let context = LspContext::new(connection.sender.clone());
+        let mut context = LspContext::new(connection.sender.clone());
         let (id, params) = connection.initialize_start()?;
 
         let init_params: lsp::InitializeParams = serde_json::from_value(params)?;
+        context.set_diagnostic_capabilities(&init_params.capabilities);
         let workspace_folders = init_params
             .workspace_folders
             .unwrap_or_default()
@@ -327,11 +328,29 @@ pub trait LanguageServer {
 #[derive(Debug, Clone)]
 pub struct LspContext {
     sender: Sender<Message>,
+    diagnostic_tags: Vec<lsp::DiagnosticTag>,
 }
 
 impl LspContext {
     pub(crate) fn new(sender: Sender<Message>) -> Self {
-        Self { sender }
+        Self {
+            sender,
+            diagnostic_tags: vec![],
+        }
+    }
+
+    pub(crate) fn set_diagnostic_capabilities(&mut self, capabilities: &lsp::ClientCapabilities) {
+        self.diagnostic_tags = capabilities
+            .text_document
+            .as_ref()
+            .and_then(|doc| doc.publish_diagnostics.as_ref())
+            .and_then(|diags| diags.tag_support.as_ref())
+            .map(|support| support.value_set.clone())
+            .unwrap_or_default();
+    }
+
+    pub fn supports_diagnostic_tag(&self, tag: lsp::DiagnosticTag) -> bool {
+        self.diagnostic_tags.contains(&tag)
     }
 
     pub fn logger(&self) -> LspLog<'_> {

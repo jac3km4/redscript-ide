@@ -390,7 +390,12 @@ impl RedscriptLanguageServer {
                             } else {
                                 lsp::DiagnosticSeverity::WARNING
                             }),
+                            code: Some(lsp::NumberOrString::String(diag.code().into())),
+                            source: Some("redscript".into()),
                             message: diag.to_string(),
+                            tags: (matches!(diag, Diagnostic::UnusedLocal(_))
+                                && ctx.supports_diagnostic_tag(lsp::DiagnosticTag::UNNECESSARY))
+                            .then(|| vec![lsp::DiagnosticTag::UNNECESSARY]),
                             ..Default::default()
                         })
                     })
@@ -835,6 +840,17 @@ impl From<&CodeEdit<'_>> for FixKind {
     }
 }
 
+impl fmt::Display for FixKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FixStructNewConstructor => write!(f, "Fix by using struct constructor"),
+            Self::MakeMethodPublic => write!(f, "Make method public"),
+            Self::MakeFieldPublic => write!(f, "Make field public"),
+            Self::MakeTypePublic => write!(f, "Make type public"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -846,6 +862,62 @@ mod tests {
             cached_completions: RefCell::new(None),
             cached_fixes: RefCell::new(HashMap::new()),
             last_published_files: RefCell::new(HashSet::new()),
+        }
+    }
+
+    #[test]
+    fn diagnostics_include_codes_and_supported_tags() {
+        let mut server = server();
+        let root = PathBuf::from("C:/scripts");
+        server.workspaces.insert(
+            root.clone(),
+            WorkspaceDir {
+                roots: vec![root.clone()],
+                format_settings: FormatSettings::default(),
+            },
+        );
+        let sources = ast::SourceMap::new();
+        let id = sources.push_back(root.join("test.reds"), "let unused = 1;\n");
+        let diags = [
+            Diagnostic::UnusedLocal(Span::new(4, 10, id)),
+            Diagnostic::MissingFunctionBody(Span::new(0, 3, id)),
+        ];
+        let symbols = Symbols::with_default_types();
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut ctx = LspContext::new(sender);
+        for supports_tags in [false, true] {
+            if supports_tags {
+                let capabilities = serde_json::from_value(serde_json::json!({
+                    "textDocument": { "publishDiagnostics": { "tagSupport": { "valueSet": [1] } } }
+                }))
+                .unwrap();
+                ctx.set_diagnostic_capabilities(&capabilities);
+            }
+            server
+                .publish_diagnostics(&diags, &symbols, &sources, &ctx)
+                .unwrap();
+            let lsp_server::Message::Notification(notification) = receiver.try_recv().unwrap()
+            else {
+                panic!("expected diagnostics notification");
+            };
+            let params: lsp::PublishDiagnosticsParams =
+                serde_json::from_value(notification.params).unwrap();
+            let unused = &params.diagnostics[0];
+            assert_eq!(
+                unused.code,
+                Some(lsp::NumberOrString::String("UNUSED_LOCAL".into()))
+            );
+            assert_eq!(unused.source.as_deref(), Some("redscript"));
+            assert_eq!(unused.severity, Some(lsp::DiagnosticSeverity::WARNING));
+            assert_eq!(
+                unused.tags,
+                supports_tags.then(|| vec![lsp::DiagnosticTag::UNNECESSARY])
+            );
+            assert_eq!(
+                params.diagnostics[1].severity,
+                Some(lsp::DiagnosticSeverity::ERROR)
+            );
+            assert_eq!(params.diagnostics[1].tags, None);
         }
     }
 
@@ -947,8 +1019,7 @@ mod tests {
                 ..Default::default()
             };
             let resolved = server.code_action_resolve(action, &ctx).unwrap();
-            let edits = resolved.edit.unwrap().changes.unwrap();
-            assert_eq!(edits[&uri].len(), 1);
+            assert_eq!(resolved.edit.unwrap().changes.unwrap()[&uri].len(), 1);
             assert_eq!(
                 server
                     .cached_fixes
@@ -958,17 +1029,6 @@ mod tests {
                     .sum::<usize>(),
                 2
             );
-        }
-    }
-}
-
-impl fmt::Display for FixKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FixStructNewConstructor => write!(f, "Fix by using struct constructor"),
-            Self::MakeMethodPublic => write!(f, "Make method public"),
-            Self::MakeFieldPublic => write!(f, "Make field public"),
-            Self::MakeTypePublic => write!(f, "Make type public"),
         }
     }
 }
