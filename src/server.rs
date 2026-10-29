@@ -330,7 +330,7 @@ pub struct LspContext {
 }
 
 impl LspContext {
-    fn new(sender: Sender<Message>) -> Self {
+    pub(crate) fn new(sender: Sender<Message>) -> Self {
         Self { sender }
     }
 

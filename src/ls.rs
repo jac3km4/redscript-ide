@@ -294,13 +294,16 @@ impl RedscriptLanguageServer {
                 let mut edits = std::collections::HashMap::<lsp::Uri, Vec<lsp::TextEdit>>::new();
                 for (_, fix) in self
                     .cached_fixes
-                    .borrow_mut()
-                    .drain()
-                    .flat_map(|(_, f)| f)
+                    .borrow()
+                    .values()
+                    .flat_map(|f| f.iter())
                     .filter(|(_, f)| f.kind == kind)
                 {
                     if unique.insert((fix.uri.clone(), fix.edit.range)) {
-                        edits.entry(fix.uri).or_default().push(fix.edit);
+                        edits
+                            .entry(fix.uri.clone())
+                            .or_default()
+                            .push(fix.edit.clone());
                     }
                 }
 
@@ -836,6 +839,74 @@ impl From<&CodeEdit<'_>> for FixKind {
             CodeEdit::MakeMethodPublic(_) => Self::MakeMethodPublic,
             CodeEdit::MakeFieldPublic(_) => Self::MakeFieldPublic,
             CodeEdit::MakeTypePublic(_) => Self::MakeTypePublic,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server() -> RedscriptLanguageServer {
+        RedscriptLanguageServer {
+            workspaces: HashMap::new(),
+            compilation_cache: CompilationCache::default(),
+            cached_completions: RefCell::new(None),
+            cached_fixes: RefCell::new(HashMap::new()),
+            last_published_files: RefCell::new(HashSet::new()),
+        }
+    }
+
+    #[test]
+    fn resolving_fix_all_preserves_cached_fixes() {
+        let server = server();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let ctx = LspContext::new(sender);
+        let uri: lsp::Uri = "file:///C:/scripts/test.reds".parse().unwrap();
+        let kinds = [FixKind::MakeMethodPublic, FixKind::MakeFieldPublic];
+        let fixes = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| {
+                let start = i as u32;
+                (
+                    (start, start + 1),
+                    Fix {
+                        kind,
+                        uri: uri.clone(),
+                        edit: lsp::TextEdit::new(
+                            lsp::Range::new(
+                                lsp::Position::new(0, start),
+                                lsp::Position::new(0, start + 1),
+                            ),
+                            "public".into(),
+                        ),
+                    },
+                )
+            })
+            .collect();
+        server
+            .cached_fixes
+            .borrow_mut()
+            .insert(PathBuf::from("test.reds"), fixes);
+
+        for kind in [kinds[0], kinds[0], kinds[1]] {
+            let action = lsp::CodeAction {
+                data: Some(serde_json::to_value(FixRequest::FixAll(kind)).unwrap()),
+                ..Default::default()
+            };
+            let resolved = server.code_action_resolve(action, &ctx).unwrap();
+            let edits = resolved.edit.unwrap().changes.unwrap();
+            assert_eq!(edits[&uri].len(), 1);
+            assert_eq!(
+                server
+                    .cached_fixes
+                    .borrow()
+                    .values()
+                    .map(BTreeMap::len)
+                    .sum::<usize>(),
+                2
+            );
         }
     }
 }
