@@ -216,15 +216,10 @@ impl RedscriptLanguageServer {
         if let Some(module) = module
             && errors.is_empty()
         {
-            let last_line = contents.len_lines() - 1;
+            let end = crate::positions::position(file.source(), file.source().len() as u32)
+                .context("invalid document end")?;
             let edit = lsp::TextEdit::new(
-                lsp::Range::new(
-                    lsp::Position::new(0, 0),
-                    lsp::Position::new(
-                        last_line as u32,
-                        contents.chars_at(contents.line_to_char(last_line)).count() as u32,
-                    ),
-                ),
+                lsp::Range::new(lsp::Position::new(0, 0), end),
                 module.to_string(),
             );
             return Ok(vec![edit]);
@@ -656,11 +651,9 @@ fn location(span: ast::Span, sources: &ast::SourceMap, ctx: &LspContext) -> Opti
 }
 
 fn range(span: ast::Span, file: &ast::File) -> Option<lsp::Range> {
-    let start = file.lookup(span.start);
-    let end = file.lookup(span.end);
     Some(lsp::Range {
-        start: lsp::Position::new(start.line as u32, start.col as u32),
-        end: lsp::Position::new(end.line as u32, end.col as u32),
+        start: crate::positions::position(file.source(), span.start)?,
+        end: crate::positions::position(file.source(), span.end)?,
     })
 }
 
@@ -855,6 +848,17 @@ mod tests {
             cached_fixes: RefCell::new(HashMap::new()),
             last_published_files: RefCell::new(HashSet::new()),
         }
+    }
+
+    #[test]
+    fn diagnostic_and_fix_ranges_use_utf16() {
+        let sources = ast::SourceMap::new();
+        let id = sources.push_back("test.reds", "let s = \"😀\"; error");
+        let file = sources.get(id).unwrap();
+        let start = file.source().find("error").unwrap() as u32;
+        let range = range(Span::new(start, start + 5, id), file).unwrap();
+        assert_eq!(range.start, lsp::Position::new(0, 14));
+        assert_eq!(range.end, lsp::Position::new(0, 19));
     }
 
     #[test]

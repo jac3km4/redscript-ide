@@ -10,6 +10,7 @@ mod buffers;
 mod completions;
 mod display;
 mod ls;
+mod positions;
 mod query;
 mod server;
 
