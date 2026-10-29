@@ -363,21 +363,12 @@ impl RedscriptLanguageServer {
         let mut fixes = self.cached_fixes.borrow_mut();
         fixes.clear();
 
-        for path in last_diagnostics.drain() {
-            ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
-                uri: ctx.uri(&path)?,
-                diagnostics: vec![],
-                version: None,
-            });
-        }
-
+        let mut current_files = HashSet::new();
         for (file, diags) in file_diags {
             let file = sources.get(file).context("missing source file")?;
             let path = file.path();
 
-            if !last_diagnostics.contains(path) {
-                last_diagnostics.insert(path.to_owned());
-            }
+            current_files.insert(path.to_owned());
 
             let slots = fixes.entry_ref(path).or_default();
             for diag in &diags {
@@ -407,6 +398,14 @@ impl RedscriptLanguageServer {
                 version: None,
             });
         }
+        for path in last_diagnostics.difference(&current_files) {
+            ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
+                uri: ctx.uri(path)?,
+                diagnostics: vec![],
+                version: None,
+            });
+        }
+        *last_diagnostics = current_files;
         Ok(())
     }
 
@@ -848,6 +847,54 @@ mod tests {
             cached_fixes: RefCell::new(HashMap::new()),
             last_published_files: RefCell::new(HashSet::new()),
         }
+    }
+
+    #[test]
+    fn publishing_replaces_diagnostics_without_clearing_first() {
+        let mut server = server();
+        let root = PathBuf::from("C:/scripts");
+        server.workspaces.insert(
+            root.clone(),
+            WorkspaceDir {
+                roots: vec![root.clone()],
+                format_settings: FormatSettings::default(),
+            },
+        );
+        let sources = ast::SourceMap::new();
+        let id = sources.push_back(root.join("test.reds"), "let unused = 1;\n");
+        let diags = [Diagnostic::UnusedLocal(Span::new(4, 10, id))];
+        let symbols = Symbols::with_default_types();
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let ctx = LspContext::new(sender);
+
+        for _ in 0..2 {
+            server
+                .publish_diagnostics(&diags, &symbols, &sources, &ctx)
+                .unwrap();
+            let messages: Vec<_> = receiver.try_iter().collect();
+            assert_eq!(messages.len(), 1);
+            let lsp_server::Message::Notification(notification) = &messages[0] else {
+                panic!("expected diagnostics notification");
+            };
+            let params: lsp::PublishDiagnosticsParams =
+                serde_json::from_value(notification.params.clone()).unwrap();
+            assert_eq!(params.diagnostics.len(), 1);
+        }
+        server
+            .publish_diagnostics(&[], &symbols, &sources, &ctx)
+            .unwrap();
+        let messages: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(messages.len(), 1);
+        let lsp_server::Message::Notification(notification) = &messages[0] else {
+            panic!("expected diagnostics notification");
+        };
+        let params: lsp::PublishDiagnosticsParams =
+            serde_json::from_value(notification.params.clone()).unwrap();
+        assert!(params.diagnostics.is_empty());
+        server
+            .publish_diagnostics(&[], &symbols, &sources, &ctx)
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
