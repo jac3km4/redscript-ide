@@ -10,6 +10,15 @@ pub fn position(source: &str, offset: u32) -> Option<Position> {
     ))
 }
 
+pub fn file_position(file: &redscript_compiler_api::ast::File, offset: u32) -> Option<Position> {
+    let (line, start) = file.line_and_offset(offset);
+    let prefix = file.source().get(start as usize..offset as usize)?;
+    Some(Position::new(
+        u32::try_from(line).ok()?,
+        u32::try_from(prefix.encode_utf16().count()).ok()?,
+    ))
+}
+
 pub fn byte_offset(chars: impl Iterator<Item = char>, column: u32) -> Option<usize> {
     let mut units = 0;
     let mut bytes = 0;
@@ -41,6 +50,41 @@ mod tests {
         assert_eq!(byte_offset("é😀error".chars(), 3), Some(6));
         assert_eq!(position("", 0), Some(Position::new(0, 0)));
         assert_eq!(position("😀", 4), Some(Position::new(0, 2)));
+    }
+
+    #[test]
+    fn indexed_file_positions_match_scanning_positions() {
+        for source in ["", "abc", "a\r\né😀error\n", "\n\n", "é😀"] {
+            let file = redscript_compiler_api::ast::File::new("positions.reds", source);
+            for offset in 0..=source.len() + 1 {
+                assert_eq!(
+                    file_position(&file, offset as u32),
+                    position(source, offset as u32),
+                    "source={source:?} offset={offset}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual position-conversion timing comparison"]
+    fn indexed_position_timing() {
+        let source = "let value = 1;\r\n".repeat(10_000);
+        let file = redscript_compiler_api::ast::File::new("large.reds", source.as_str());
+        let offset = source.len() as u32;
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(position(std::hint::black_box(&source), offset));
+        }
+        let scanning = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(file_position(std::hint::black_box(&file), offset));
+        }
+        eprintln!(
+            "100 positions: scanning={scanning:?}, indexed={:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

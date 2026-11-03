@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{LazyCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,15 @@ pub struct RedscriptLanguageServer {
     standalone: HashMap<PathBuf, CompilationCache>,
     generation: u64,
     missing_roots: RefCell<BTreeSet<PathBuf>>,
+    completion_cache: RefCell<Option<CachedCompletion>>,
+}
+
+struct CachedCompletion {
+    path: PathBuf,
+    receiver_end: usize,
+    source_without_member: String,
+    other_overlays: BTreeMap<PathBuf, String>,
+    response: Rc<lsp::CompletionResponse>,
 }
 
 impl RedscriptLanguageServer {
@@ -72,6 +81,7 @@ impl RedscriptLanguageServer {
             standalone: HashMap::new(),
             generation: 0,
             missing_roots: RefCell::new(missing_roots),
+            completion_cache: RefCell::new(None),
         })
     }
 
@@ -79,6 +89,39 @@ impl RedscriptLanguageServer {
         self.generation = self.generation.wrapping_add(1);
 
         self.cached_fixes.borrow_mut().clear();
+    }
+
+    fn make_edit_snapshot(&self) -> anyhow::Result<CompilationCache> {
+        let sources = ast::SourceMap::new();
+        let mut files = BTreeMap::new();
+        self.compilation_cache.with_sources(|active| {
+            for (_, file) in active.files() {
+                if self
+                    .compilation_cache
+                    .borrow_file_ids()
+                    .contains_key(file.path())
+                {
+                    let text = self
+                        .overlays
+                        .get(file.path())
+                        .map_or_else(|| file.source().to_owned(), |overlay| overlay.text.clone());
+                    files.insert(file.path().to_owned(), text);
+                }
+            }
+        });
+        for (path, overlay) in &self.overlays {
+            if self.resolve_file(path).as_workspace().is_some() {
+                files.insert(path.clone(), overlay.text.clone());
+            }
+        }
+        for (path, text) in files {
+            sources.push_back(path, text);
+        }
+        CompilationCache::from_sources(
+            self.compilation_cache.borrow_cache_bytes().clone(),
+            sources,
+            TypeInterner::default(),
+        )
     }
 
     fn make_snapshot(
@@ -116,12 +159,59 @@ impl RedscriptLanguageServer {
     }
 
     fn rebuild(&mut self, ctx: &LspContext) -> anyhow::Result<()> {
+        self.rebuild_with_reload(ctx, true)
+    }
+
+    fn rebuild_with_reload(&mut self, ctx: &LspContext, reload: bool) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        ctx.logger().info(format!(
+            "Rebuild started reload={reload} overlays={} versions={:?}",
+            self.overlays.len(),
+            self.overlays
+                .iter()
+                .map(|(path, overlay)| (path, overlay.version))
+                .collect::<Vec<_>>(),
+        ));
+        let result = self.rebuild_inner(ctx, reload);
+        match &result {
+            Ok(()) => ctx.logger().info(format!(
+                "Rebuild finished generation={} elapsed_ms={:.3}",
+                self.generation,
+                started.elapsed().as_secs_f64() * 1000.0,
+            )),
+            Err(error) => ctx.logger().error(format!(
+                "Rebuild failed generation={} elapsed_ms={:.3}: {error:#}",
+                self.generation,
+                started.elapsed().as_secs_f64() * 1000.0,
+            )),
+        }
+        result
+    }
+
+    fn rebuild_inner(&mut self, ctx: &LspContext, reload: bool) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
         self.invalidate();
-        let workspace = self.make_snapshot(
-            self.workspaces
-                .values()
-                .flat_map(|workspace| workspace.roots.clone()),
-        )?;
+        if reload {
+            self.completion_cache.borrow_mut().take();
+        }
+        let workspace = if reload {
+            ctx.logger()
+                .info("Rebuild phase=workspace discovery, parsing and analysis");
+            self.make_snapshot(
+                self.workspaces
+                    .values()
+                    .flat_map(|workspace| workspace.roots.clone()),
+            )?
+        } else {
+            ctx.logger()
+                .info("Rebuild phase=cached sources, overlays and analysis (no workspace scan)");
+            self.make_edit_snapshot()?
+        };
+        ctx.logger().info(format!(
+            "Rebuild workspace ready elapsed_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0,
+        ));
+        ctx.logger().info("Rebuild phase=standalone analysis");
         let paths: HashSet<_> = self
             .standalone
             .keys()
@@ -155,6 +245,11 @@ impl RedscriptLanguageServer {
         }
         self.compilation_cache = workspace;
         self.standalone = standalone;
+        self.log_missing_roots(ctx);
+        Ok(())
+    }
+
+    pub fn publish_all_diagnostics(&self, ctx: &LspContext) -> anyhow::Result<()> {
         self.check_workspace_and_publish(ctx)?;
         for cache in self.standalone.values() {
             cache.analyze(|_, symbols, diagnostics, sources| {
@@ -212,6 +307,7 @@ impl RedscriptLanguageServer {
     }
 
     fn hover_at(&self, loc: CodeLocation<'_>, ctx: &LspContext) -> anyhow::Result<lsp::Hover> {
+        let requested_pos = loc.pos();
         self.expr_at(
             loc,
             |at| {
@@ -219,10 +315,17 @@ impl RedscriptLanguageServer {
                     let span = e.span();
                     range(span, at.sources().get(span.file)?)
                 });
+                let span = at.expr().map(redscript_compiler_api::ir::Expr::span);
+                let value = at.display().to_string();
+                ctx.logger().info(format!(
+                    "Hover payload content_bytes={} range={range:?} expression_span={span:?} contains_requested_byte={:?}",
+                    value.len(),
+                    span.map(|span| span.contains(requested_pos)),
+                ));
                 Ok(lsp::Hover {
                     contents: lsp::HoverContents::Markup(lsp::MarkupContent {
                         kind: lsp::MarkupKind::Markdown,
-                        value: at.display().to_string(),
+                        value,
                     }),
                     range,
                 })
@@ -238,8 +341,38 @@ impl RedscriptLanguageServer {
     ) -> anyhow::Result<Rc<lsp::CompletionResponse>> {
         let contents = loc.doc().buffer().contents().to_string();
         let Some(member) = member_completion_range(&contents, loc.pos()) else {
+            ctx.logger().info(format!(
+                "Completion empty path={} byte_offset={}: cursor is not after a member-access dot (only member completion is supported)",
+                loc.doc().path().display(),
+                loc.pos(),
+            ));
             return Ok(Rc::new(lsp::CompletionResponse::Array(vec![])));
         };
+        ctx.logger().info(format!(
+            "Completion receiver path={} byte_offset={} erased_member_range={member:?}",
+            loc.doc().path().display(),
+            loc.pos(),
+        ));
+        let path = dialect::identity(loc.doc().path());
+        let mut source_without_member = contents;
+        source_without_member.replace_range(member.clone(), "");
+        let other_overlays: BTreeMap<_, _> = self
+            .overlays
+            .iter()
+            .filter(|(other, _)| **other != path)
+            .map(|(path, overlay)| (path.clone(), overlay.text.clone()))
+            .collect();
+        if let Some(cached) = self.completion_cache.borrow().as_ref()
+            && cached.path == path
+            && cached.receiver_end == member.start
+            && cached.source_without_member == source_without_member
+            && cached.other_overlays == other_overlays
+        {
+            ctx.logger()
+                .info("Completion analysis=reused member results");
+            return Ok(cached.response.clone());
+        }
+        let receiver_end = member.start;
         let dialect = Dialect::of(loc.doc().path());
         let completions = self.expr_at_with(
             loc.with_pos(member.start as u32),
@@ -247,7 +380,15 @@ impl RedscriptLanguageServer {
             |at| generate_completions(at, dialect),
             ctx,
         )?;
-        Ok(Rc::new(lsp::CompletionResponse::Array(completions)))
+        let response = Rc::new(lsp::CompletionResponse::Array(completions));
+        *self.completion_cache.borrow_mut() = Some(CachedCompletion {
+            path,
+            receiver_end,
+            source_without_member,
+            other_overlays,
+            response: response.clone(),
+        });
+        Ok(response)
     }
 
     fn definition_at(
@@ -489,7 +630,7 @@ impl RedscriptLanguageServer {
         }
     }
 
-    pub fn check_workspace_and_publish(&self, ctx: &LspContext) -> anyhow::Result<()> {
+    pub fn log_missing_roots(&self, ctx: &LspContext) {
         for root in std::mem::take(&mut *self.missing_roots.borrow_mut()) {
             ctx.notify::<lsp::notification::LogMessage>(lsp::LogMessageParams {
                 typ: lsp::MessageType::WARNING,
@@ -499,6 +640,9 @@ impl RedscriptLanguageServer {
                 ),
             });
         }
+    }
+
+    fn check_workspace_and_publish(&self, ctx: &LspContext) -> anyhow::Result<()> {
         self.check_workspace(|_, symbols, diags, sources| {
             self.publish_diagnostics(diags, symbols, sources, ctx)
         })
@@ -683,7 +827,7 @@ impl RedscriptLanguageServer {
         loc: CodeLocation<'_>,
         patch: Option<Range<usize>>,
         cb: impl Fn(ExprAt<'_, '_>) -> anyhow::Result<A>,
-        _ctx: &LspContext,
+        ctx: &LspContext,
     ) -> anyhow::Result<A> {
         anyhow::ensure!(
             Dialect::of(loc.doc().path()).is_some(),
@@ -698,6 +842,29 @@ impl RedscriptLanguageServer {
                 .get(&path)
                 .unwrap_or(&self.compilation_cache)
         };
+        ctx.logger().info(format!(
+            "Query path={} dialect={:?} byte_offset={} version={:?} workspace={} generation={} source_files={} overlays={} speculative_patch={patch:?}",
+            path.display(),
+            Dialect::of(&path),
+            loc.pos(),
+            loc.doc().buffer().version(),
+            workspace,
+            self.generation,
+            base.borrow_file_ids().len(),
+            self.overlays.len(),
+        ));
+        if patch.is_none()
+            && let Some(&id) = base.borrow_file_ids().get(&path)
+            && base.with_sources(|sources| {
+                sources
+                    .get(id)
+                    .is_some_and(|file| file.source() == loc.doc().buffer().contents())
+            })
+        {
+            ctx.logger().info("Query analysis=reused active snapshot");
+            return base.query_at(id, loc.pos(), cb, ctx);
+        }
+        ctx.logger().info("Query analysis=speculative snapshot");
         // A query owns its storage; speculative sources never enter the active cache.
         let sources = ast::SourceMap::new();
         base.with_sources(|active| {
@@ -715,22 +882,34 @@ impl RedscriptLanguageServer {
             contents.replace_range(range.clone(), &" ".repeat(range.len()));
         }
 
-        let preceding_pos = loc.pos().saturating_sub(1);
         let id = sources.push_back(&path, contents);
         let query_cache = CompilationCache::from_sources(
             base.borrow_cache_bytes().clone(),
             sources,
             TypeInterner::default(),
         )?;
-        query_cache.with(|cache| {
-            let mut reporter = CompileErrorReporter::default();
+        query_cache.query_at(id, loc.pos(), cb, ctx)
+    }
+}
+
+impl CompilationCache {
+    fn query_at<A>(
+        &self,
+        id: ast::FileId,
+        pos: u32,
+        cb: impl Fn(ExprAt<'_, '_>) -> anyhow::Result<A>,
+        ctx: &LspContext,
+    ) -> anyhow::Result<A> {
+        let preceding_pos = pos.saturating_sub(1);
+        self.with(|cache| {
             let match_ = cache
+                .analysis
                 .parsed
                 .modules
                 .iter()
                 .find(|(file, _)| *file == id)
                 .and_then(|(_, module)| module.module().find_at(preceding_pos));
-            let (ctx, typ) = match match_ {
+            let (query_context, typ) = match match_ {
                 Some(ast::QueryResult::Type(&ast::Type::Named { name, .. })) => (None, Some(name)),
                 Some(ast::QueryResult::Expr(&ast::Expr::Ident(name))) => {
                     (Some(AtContext::Expr), Some(name))
@@ -738,10 +917,9 @@ impl RedscriptLanguageServer {
                 _ => (None, None),
             };
 
-            let (unit, syms) =
-                cache
-                    .parsed
-                    .process(cache.symbols.clone(), &mut reporter, cache.interner);
+            let analysis = cache.analysis;
+            let unit = &analysis.unit;
+            let syms = &analysis.symbols;
             let func = unit
                 .all_functions()
                 .find(|f| f.span.file == id && f.span.contains(preceding_pos));
@@ -750,7 +928,19 @@ impl RedscriptLanguageServer {
             let typ = typ
                 .and_then(|t| unit.scopes.get(&id)?.get(t)?.id())
                 .or_else(|| cache.interner.get_index(cache.interner.get_index_of(typ?)?));
-            cb(ExprAt::new(expr, func, typ, &syms, cache.sources, ctx))
+            let at = ExprAt::new(expr, func, typ, syms, cache.sources, query_context);
+            ctx.logger().info(format!(
+                "Query result lookup_byte_offset={preceding_pos} parsed_module={} ast_match={} function={} expression={} named_type={} receiver_type={} context={query_context:?} parse_diagnostics={} semantic_diagnostics={}",
+                analysis.parsed.modules.iter().any(|(file, _)| *file == id),
+                match_.is_some(),
+                func.is_some(),
+                expr.is_some(),
+                typ.is_some(),
+                at.expr_type().is_some(),
+                analysis.parsed.diagnostics.len(),
+                analysis.diagnostics.len(),
+            ));
+            cb(at)
         })
     }
 }
@@ -907,7 +1097,9 @@ impl LanguageServer for RedscriptLanguageServer {
             self.overlays.remove(&path);
             self.standalone.remove(&path);
         }
-        self.rebuild(ctx)
+        // Closing must restore disk contents (or remove an unsaved file).
+        // Open/change use known sources; filesystem notifications refresh discovery.
+        self.rebuild_with_reload(ctx, buffer.is_none())
     }
 
     fn files_changed(&mut self, _paths: Vec<PathBuf>, ctx: &LspContext) -> anyhow::Result<()> {
@@ -922,7 +1114,8 @@ impl LanguageServer for RedscriptLanguageServer {
 
     fn check(&mut self, path: PathBuf, ctx: &LspContext) -> anyhow::Result<()> {
         if path.file_name().is_some_and(|name| name == ".redscript") {
-            return self.files_changed(vec![path], ctx);
+            self.files_changed(vec![path], ctx)?;
+            return self.publish_all_diagnostics(ctx);
         }
 
         let path = dialect::identity(&path);
@@ -946,7 +1139,8 @@ impl LanguageServer for RedscriptLanguageServer {
                 )?,
             );
         }
-        self.rebuild(ctx)
+        self.rebuild(ctx)?;
+        self.publish_all_diagnostics(ctx)
     }
 
     fn change_workspace_folders(
@@ -1030,8 +1224,8 @@ fn location(span: ast::Span, sources: &ast::SourceMap, ctx: &LspContext) -> Opti
 
 fn range(span: ast::Span, file: &ast::File) -> Option<lsp::Range> {
     Some(lsp::Range {
-        start: crate::positions::position(file.source(), span.start)?,
-        end: crate::positions::position(file.source(), span.end)?,
+        start: crate::positions::file_position(file, span.start)?,
+        end: crate::positions::file_position(file, span.end)?,
     })
 }
 
@@ -1044,11 +1238,45 @@ struct CompilationCache {
 
     #[borrows(cache_bytes, interner, sources)]
     #[not_covariant]
-    symbols: Symbols<'this>,
+    analysis: DeferredAnalysis<'this>,
+}
 
-    #[borrows(sources)]
-    #[not_covariant]
-    parsed: ParsedSources<'this>,
+type DeferredAnalysis<'ctx> =
+    LazyCell<AnalyzedSources<'ctx>, Box<dyn FnOnce() -> AnalyzedSources<'ctx> + 'ctx>>;
+
+struct AnalyzedSources<'ctx> {
+    parsed: ParsedSources<'ctx>,
+    unit: LoweredCompilationUnit<'ctx>,
+    symbols: Symbols<'ctx>,
+    diagnostics: Vec<Diagnostic<'ctx>>,
+}
+
+impl<'ctx> AnalyzedSources<'ctx> {
+    fn deferred(
+        sources: &'ctx ast::SourceMap,
+        symbols: Symbols<'ctx>,
+        interner: &'ctx TypeInterner,
+    ) -> DeferredAnalysis<'ctx> {
+        LazyCell::new(Box::new(move || {
+            Self::new(dialect::parse(sources), symbols, interner)
+        }))
+    }
+
+    fn new(
+        parsed: ParsedSources<'ctx>,
+        symbols: Symbols<'ctx>,
+        interner: &'ctx TypeInterner,
+    ) -> Self {
+        let mut reporter = CompileErrorReporter::default();
+        let (unit, symbols) = parsed.process(symbols, &mut reporter, interner);
+        unit.run_diagnostics(DIAGNOSTIC_PASSES, &mut reporter);
+        Self {
+            parsed,
+            unit,
+            symbols,
+            diagnostics: reporter.into_reported(),
+        }
+    }
 }
 
 impl CompilationCache {
@@ -1062,26 +1290,21 @@ impl CompilationCache {
         ) -> anyhow::Result<A>,
     ) -> anyhow::Result<A> {
         self.with(|cache| {
-            let mut reporter = CompileErrorReporter::default();
-            let (unit, symbols) =
-                cache
-                    .parsed
-                    .process(cache.symbols.clone(), &mut reporter, cache.interner);
-            unit.run_diagnostics(DIAGNOSTIC_PASSES, &mut reporter);
+            let analysis = cache.analysis;
             // Keep syntax errors, but suppress recovery-induced semantic cascades.
-            let invalid_files = cache.parsed.diagnostic_files();
-            let diags: Vec<_> = cache
+            let invalid_files = analysis.parsed.diagnostic_files();
+            let diags: Vec<_> = analysis
                 .parsed
                 .diagnostics
                 .iter()
                 .chain(
-                    reporter
-                        .reported()
+                    analysis
+                        .diagnostics
                         .iter()
                         .filter(|diag| !invalid_files.contains(&diag.span().file)),
                 )
                 .collect();
-            cb(&unit, &symbols, &diags, cache.sources)
+            cb(&analysis.unit, &analysis.symbols, &diags, cache.sources)
         })
     }
 
@@ -1111,15 +1334,15 @@ impl CompilationCache {
             interner,
             sources,
             file_ids,
-            |bytes, interner, _| {
+            |bytes, interner, sources| {
                 let bundle = ScriptBundle::from_bytes(bytes)?;
-                Ok(CompilationInputs::load_without_mapping(
+                let symbols = CompilationInputs::load_without_mapping(
                     &bundle,
                     interner,
                     &TypeFlagRegistry::default(),
-                )?)
+                )?;
+                Ok(AnalyzedSources::deferred(sources, symbols, interner))
             },
-            |sources| Ok(dialect::parse(sources)),
         )
     }
 }
@@ -1131,10 +1354,17 @@ impl Default for CompilationCache {
             TypeInterner::default(),
             ast::SourceMap::default(),
             HashMap::default(),
-            |_, _, _| Symbols::with_default_types(),
-            |_| ParsedSources {
-                modules: vec![],
-                diagnostics: vec![],
+            |_, interner, _| {
+                LazyCell::new(Box::new(move || {
+                    AnalyzedSources::new(
+                        ParsedSources {
+                            modules: vec![],
+                            diagnostics: vec![],
+                        },
+                        Symbols::with_default_types(),
+                        interner,
+                    )
+                }))
             },
         )
     }
@@ -1288,6 +1518,273 @@ mod tests {
     }
 
     #[test]
+    fn startup_publishes_workspace_diagnostics() {
+        let (temp, _server, ctx, receiver) = fixture();
+        let path = temp.path().join("broken.reds");
+        fs::write(&path, "public class {").unwrap();
+        let server =
+            RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
+        server.log_missing_roots(&ctx);
+        server.publish_all_diagnostics(&ctx).unwrap();
+        assert!(receiver.try_iter().any(|message| {
+            let lsp_server::Message::Notification(notification) = message else {
+                return false;
+            };
+            notification.method == "textDocument/publishDiagnostics"
+                && serde_json::from_value::<lsp::PublishDiagnosticsParams>(notification.params)
+                    .is_ok_and(|params| {
+                        params.uri == ctx.uri(&path).unwrap() && !params.diagnostics.is_empty()
+                    })
+        }));
+    }
+
+    #[test]
+    fn member_results_are_reused_only_for_prefix_changes() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let path = temp.path().join("completion.reds");
+        let dependency = temp.path().join("dependency.reds");
+        let mut previous = None;
+        for (version, prefix) in [(1, ""), (2, "V"), (3, "Val")] {
+            let text = format!(
+                "public class Host {{ public func Value() -> Int32 {{ return 1; }} }} \
+                 public func Test(host: ref<Host>) {{ host.{prefix}; }}"
+            );
+            let buffers = open(&mut server, &ctx, &path, &text, version);
+            let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+            let loc = CodeLocation::new(
+                Document::new(path.clone(), buffer),
+                text.rfind("; }").unwrap() as u32,
+            );
+            let response = server.completion_at(loc, &ctx).unwrap();
+            let lsp::CompletionResponse::Array(items) = &*response else {
+                panic!("expected completion items");
+            };
+            assert!(items.iter().any(|item| item.label.starts_with("Value")));
+            if let Some(previous) = previous {
+                assert!(Rc::ptr_eq(&previous, &response));
+            }
+            previous = Some(response);
+        }
+        let _buffers = open(&mut server, &ctx, &dependency, "public class Other {}", 1);
+        let text = "public class Host { public func Value() -> Int32 { return 1; } } \
+                    public func Test(host: ref<Host>) { host.Val; }";
+        let buffers = open(&mut server, &ctx, &path, text, 4);
+        let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+        let loc = CodeLocation::new(
+            Document::new(path.clone(), buffer),
+            text.rfind("; }").unwrap() as u32,
+        );
+        let changed = server.completion_at(loc.clone(), &ctx).unwrap();
+        assert!(!Rc::ptr_eq(&previous.unwrap(), &changed));
+        server.files_changed(vec![dependency], &ctx).unwrap();
+        let refreshed = server.completion_at(loc, &ctx).unwrap();
+        assert!(!Rc::ptr_eq(&changed, &refreshed));
+    }
+
+    #[test]
+    fn diagnostics_are_only_published_on_save() {
+        for standalone in [false, true] {
+            let (temp, mut server, ctx, receiver) = fixture();
+            let external = tempfile::tempdir().unwrap();
+            let directory = if standalone {
+                external.path()
+            } else {
+                temp.path()
+            };
+            let path = directory.join("test.script");
+            fs::write(&path, "class {").unwrap();
+            let publications = || {
+                receiver
+                    .try_iter()
+                    .filter_map(|message| {
+                        let lsp_server::Message::Notification(notification) = message else {
+                            return None;
+                        };
+                        (notification.method == "textDocument/publishDiagnostics").then(|| {
+                            serde_json::from_value::<lsp::PublishDiagnosticsParams>(
+                                notification.params,
+                            )
+                            .unwrap()
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            server.files_changed(vec![path.clone()], &ctx).unwrap();
+            let _buffers = open(&mut server, &ctx, &path, "class {", 1);
+            assert!(publications().is_empty());
+
+            server.check(path.clone(), &ctx).unwrap();
+            let saved = publications();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].uri, ctx.uri(&path).unwrap());
+            assert_eq!(saved[0].version, Some(1));
+            assert!(!saved[0].diagnostics.is_empty());
+
+            let _buffers = open(&mut server, &ctx, &path, "class Fixed {}", 2);
+            fs::write(&path, "class Fixed {}").unwrap();
+            server.files_changed(vec![path.clone()], &ctx).unwrap();
+            assert!(publications().is_empty());
+            assert!(
+                server
+                    .last_published_files
+                    .borrow()
+                    .contains(&dialect::identity(&path))
+            );
+
+            server.check(path.clone(), &ctx).unwrap();
+            let saved = publications();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].version, Some(2));
+            assert!(saved[0].diagnostics.is_empty());
+
+            let _buffers = open(&mut server, &ctx, &path, "class {", 3);
+            server.check(path.clone(), &ctx).unwrap();
+            assert!(!publications()[0].diagnostics.is_empty());
+            server.document_changed(path.clone(), None, &ctx).unwrap();
+            server
+                .change_workspace_folders(vec![], vec![], &ctx)
+                .unwrap();
+            assert!(publications().is_empty());
+            server.check(path, &ctx).unwrap();
+            assert!(publications()[0].diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn query_logging_explains_missing_hover_and_non_member_completion() {
+        let (temp, mut server, ctx, receiver) = fixture();
+        let path = temp.path().join("empty.script");
+        let buffers = open(&mut server, &ctx, &path, "", 7);
+        let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+        let loc = CodeLocation::new(Document::new(path, buffer), 0);
+        server.hover_at(loc.clone(), &ctx).unwrap();
+        server.completion_at(loc, &ctx).unwrap();
+        let logs: Vec<lsp::LogMessageParams> = receiver
+            .try_iter()
+            .filter_map(|message| {
+                let lsp_server::Message::Notification(notification) = message else {
+                    return None;
+                };
+                (notification.method == "window/logMessage")
+                    .then(|| serde_json::from_value(notification.params).unwrap())
+            })
+            .collect();
+        assert!(
+            logs.iter()
+                .any(|log| log.message.contains("Rebuild started"))
+        );
+        assert!(logs.iter().any(|log| {
+            log.message.contains("Rebuild finished generation=")
+                && log.message.contains("elapsed_ms=")
+        }));
+        assert!(logs.iter().any(|log| {
+            log.message.contains("Query path=")
+                && log.message.contains("version=Some(7)")
+                && log.message.contains("workspace=true")
+        }));
+        assert!(logs.iter().any(|log| {
+            log.message.contains("Query result")
+                && log.message.contains("ast_match=false")
+                && log.message.contains("expression=false")
+        }));
+        assert!(logs.iter().any(|log| {
+            log.message.contains("Hover payload content_bytes=0")
+                && log.message.contains("range=None")
+                && log.message.contains("contains_requested_byte=None")
+        }));
+        assert!(logs.iter().any(|log| {
+            log.message.contains("Completion empty")
+                && log.message.contains("only member completion is supported")
+        }));
+    }
+
+    #[test]
+    fn hover_reuses_analysis_and_edits_replace_it() {
+        let (temp, mut server, ctx, receiver) = fixture();
+        let path = temp.path().join("hover.reds");
+        for (version, typ, value) in [(1, "Int32", "1"), (2, "Bool", "true")] {
+            let text = format!(
+                "public func Test() -> {typ} {{ let value: {typ} = {value}; return value; }}"
+            );
+            let buffers = open(&mut server, &ctx, &path, &text, version);
+            let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+            let loc = CodeLocation::new(
+                Document::new(path.clone(), buffer),
+                text.rfind("value").unwrap() as u32 + 1,
+            );
+            let unit_address = server
+                .compilation_cache
+                .with(|cache| &cache.analysis.unit as *const _ as usize);
+            for _ in 0..2 {
+                let hover = server.hover_at(loc.clone(), &ctx).unwrap();
+                let lsp::HoverContents::Markup(contents) = hover.contents else {
+                    panic!("expected markup hover");
+                };
+                assert!(contents.value.contains(typ), "{}", contents.value);
+                assert_eq!(
+                    server
+                        .compilation_cache
+                        .with(|cache| &cache.analysis.unit as *const _ as usize),
+                    unit_address,
+                );
+            }
+        }
+        let logs: Vec<lsp::LogMessageParams> = receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                lsp_server::Message::Notification(notification)
+                    if notification.method == "window/logMessage" =>
+                {
+                    Some(serde_json::from_value(notification.params).unwrap())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            logs.iter()
+                .filter(|log| log.message == "Query analysis=reused active snapshot")
+                .count(),
+            4,
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|log| log.message == "Query analysis=speculative snapshot")
+        );
+    }
+
+    #[test]
+    fn edits_use_cached_dependencies_until_filesystem_refresh() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let dependency = temp.path().join("dependency.reds");
+        fs::write(&dependency, "public class Before {}").unwrap();
+        server
+            .files_changed(vec![dependency.clone()], &ctx)
+            .unwrap();
+        fs::write(&dependency, "public class After {}").unwrap();
+        let path = temp.path().join("open.reds");
+        let _buffers = open(&mut server, &ctx, &path, "public class Open {}", 1);
+        server
+            .check_workspace(|_, symbols, _, _| {
+                assert!(symbols.types().any(|(id, _)| id.as_str() == "Before"));
+                assert!(!symbols.types().any(|(id, _)| id.as_str() == "After"));
+                assert!(symbols.types().any(|(id, _)| id.as_str() == "Open"));
+                Ok(())
+            })
+            .unwrap();
+        server.files_changed(vec![dependency], &ctx).unwrap();
+        server
+            .check_workspace(|_, symbols, _, _| {
+                assert!(symbols.types().any(|(id, _)| id.as_str() == "After"));
+                assert!(!symbols.types().any(|(id, _)| id.as_str() == "Before"));
+                assert!(symbols.types().any(|(id, _)| id.as_str() == "Open"));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn mixed_case_redmod_saved_and_live_snapshots() {
         let (temp, mut server, ctx, _receiver) = fixture();
         let community = temp.path().join("community.reds");
@@ -1355,7 +1852,14 @@ mod tests {
             .unwrap();
         server.compilation_cache.with(|cache| {
             let id = cache.file_ids[&dialect::identity(&redmod)];
-            assert!(cache.parsed.modules.iter().any(|(file, _)| *file == id));
+            assert!(
+                cache
+                    .analysis
+                    .parsed
+                    .modules
+                    .iter()
+                    .any(|(file, _)| *file == id)
+            );
         });
         let external = tempfile::tempdir().unwrap();
         let standalone = external.path().join("solo.script");
@@ -1369,6 +1873,7 @@ mod tests {
             1
         );
         let _buffers = open(&mut server, &ctx, &redmod, "class {", 6);
+        server.check(redmod.clone(), &ctx).unwrap();
         let params: Vec<lsp::PublishDiagnosticsParams> = receiver
             .try_iter()
             .filter_map(|message| {
@@ -1438,6 +1943,37 @@ mod tests {
     }
 
     #[test]
+    fn implicit_redmod_members_keep_hover_and_definition_targets() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let path = temp.path().join("implicit.script");
+        let text = "class Host { var value: Int32; function Value(): Int32 { return 1; } function Read(): Int32 { return value; } function Run(): Int32 { return Value(); } }";
+        let buffers = open(&mut server, &ctx, &path, text, 1);
+        let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+        for (name, heading) in [("value", "### Field"), ("Value", "### Signature")] {
+            let declaration = text.find(name).unwrap() as u32;
+            let usage = text.rfind(name).unwrap() as u32;
+            for offset in 1..=name.len() as u32 {
+                server
+                    .expr_at(
+                        CodeLocation::new(Document::new(path.clone(), buffer), usage + offset),
+                        |at| {
+                            let span = at.definition_span().unwrap_or_else(|| {
+                                panic!("missing definition for {name} at {offset}: {:?}", at.expr())
+                            });
+                            assert!(span.contains(declaration));
+                            let hover = at.display().to_string();
+                            assert!(hover.contains(heading), "{hover}");
+                            assert!(hover.contains("Int32"), "{hover}");
+                            Ok(())
+                        },
+                        &ctx,
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn redmod_cast_type_navigation_and_unicode_syntax_diagnostics() {
         let (temp, mut server, ctx, receiver) = fixture();
         let target = temp.path().join("target.script");
@@ -1465,6 +2001,7 @@ mod tests {
         receiver.try_iter().for_each(drop);
         let text = "// é😀\r\nclass User { function Test() { var value : ; } }";
         let _buffers = open(&mut server, &ctx, &path, text, 3);
+        server.check(path.clone(), &ctx).unwrap();
         let params: Vec<lsp::PublishDiagnosticsParams> = receiver
             .try_iter()
             .filter_map(|message| {
@@ -1567,6 +2104,7 @@ mod tests {
         server.compilation_cache.with(|cache| {
             let id = cache.file_ids[&dialect::identity(&path)];
             let (_, crate::dialect::ParsedModule::Redmod(parsed)) = cache
+                .analysis
                 .parsed
                 .modules
                 .iter()
@@ -1611,6 +2149,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        server.check(path.clone(), &ctx).unwrap();
         let publications: Vec<lsp::PublishDiagnosticsParams> = receiver
             .try_iter()
             .filter_map(|message| {
@@ -1876,7 +2415,7 @@ mod tests {
             server.missing_roots.borrow().len(),
             usize::from(initially_missing)
         );
-        server.check_workspace_and_publish(&ctx).unwrap();
+        server.log_missing_roots(&ctx);
         let startup: Vec<_> = receiver.try_iter().collect();
         assert_eq!(
             startup.iter().any(|message| {
@@ -1939,8 +2478,13 @@ mod tests {
                 && params.message.contains("source_roots")
                 && params.message.contains("Restore/create")
         }));
-        let publications: Vec<lsp::PublishDiagnosticsParams> = messages
-            .into_iter()
+        assert!(!messages.iter().any(|message| {
+            matches!(message, lsp_server::Message::Notification(notification)
+                if notification.method == "textDocument/publishDiagnostics")
+        }));
+        server.check(healthy.clone(), &ctx).unwrap();
+        let publications: Vec<lsp::PublishDiagnosticsParams> = receiver
+            .try_iter()
             .filter_map(|message| {
                 let lsp_server::Message::Notification(notification) = message else {
                     return None;
@@ -1964,10 +2508,11 @@ mod tests {
         assert!(server.resolve_file(&removed).as_workspace().is_some());
         assert_eq!(server.compilation_cache.borrow_file_ids().len(), 1);
         assert_eq!(server.standalone.len(), 1);
-        // Missing roots must not block subsequent live diagnostic updates either.
+        // Missing roots must not block diagnostic updates on save either.
         for path in [&healthy, &standalone] {
             let _buffer = open(&mut server, &ctx, path, "class {", 7);
         }
+        server.check(healthy.clone(), &ctx).unwrap();
         let publications: Vec<lsp::PublishDiagnosticsParams> = receiver
             .try_iter()
             .filter_map(|message| {
@@ -2372,6 +2917,7 @@ mod tests {
             standalone: HashMap::new(),
             generation: 0,
             missing_roots: RefCell::new(BTreeSet::new()),
+            completion_cache: RefCell::new(None),
         }
     }
 

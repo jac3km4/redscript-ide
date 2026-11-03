@@ -3,6 +3,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
+use std::time::Instant;
 
 use anyhow::{Context, anyhow, bail};
 use crossbeam_channel::Sender;
@@ -39,6 +40,7 @@ impl LspServer<'_> {
 
         let init_params: lsp::InitializeParams = serde_json::from_value(params)?;
         context.set_diagnostic_capabilities(&init_params.capabilities);
+        log_initialization(&context, &init_params);
         let watch_files = init_params
             .capabilities
             .workspace
@@ -53,7 +55,11 @@ impl LspServer<'_> {
             .map(|folder| path_from_uri(&folder.uri))
             .collect::<Result<Vec<PathBuf>, _>>()?;
         let options = Options::new(workspace_folders, init_params.initialization_options);
-        let props = create_props(options, &context)?;
+        let props = create_props(options, &context).inspect_err(|err| {
+            context
+                .logger()
+                .error(format!("Initialization options failed: {err:#}"));
+        })?;
 
         let server_capabilities = capabilities();
         let initialize_data = json!({
@@ -65,7 +71,11 @@ impl LspServer<'_> {
         });
         connection.initialize_finish(id, initialize_data)?;
 
-        let server = create_server(&props, &context)?;
+        let server = create_server(&props, &context).inspect_err(|err| {
+            context
+                .logger()
+                .error(format!("Language server startup failed: {err:#}"));
+        })?;
         let mut this = LspServer {
             connection,
             server,
@@ -81,7 +91,54 @@ impl LspServer<'_> {
     }
 
     fn run(&mut self) -> anyhow::Result<()> {
-        while let Ok(message) = self.connection.receiver.recv() {
+        let mut next_message = None;
+        while let Ok(message) = next_message
+            .take()
+            .map(Ok)
+            .unwrap_or_else(|| self.connection.receiver.recv())
+        {
+            if !self.shutdown
+                && matches!(&message, Message::Notification(notif) if notif.method == lsp::notification::DidChangeTextDocument::METHOD)
+            {
+                let mut pending = Vec::new();
+                let mut message = message;
+                loop {
+                    let Message::Notification(notif) = message else {
+                        unreachable!();
+                    };
+                    match self.apply_document_change(notif.params) {
+                        Ok(Some(uri)) if !pending.contains(&uri) => pending.push(uri),
+                        Ok(_) => {}
+                        Err(err) => self.context.logger().error(err),
+                    }
+                    // Only drain changes already queued; every other message is a barrier.
+                    match self.connection.receiver.try_recv() {
+                        Ok(Message::Notification(notif))
+                            if notif.method == lsp::notification::DidChangeTextDocument::METHOD =>
+                        {
+                            message = Message::Notification(notif);
+                        }
+                        other => {
+                            next_message = other.ok();
+                            break;
+                        }
+                    }
+                }
+                for uri in pending {
+                    let result = (|| {
+                        self.server.document_changed(
+                            path_from_uri(&uri)?,
+                            self.buffers.get(&uri),
+                            &self.context,
+                        )?;
+                        self.update_watchers()
+                    })();
+                    if let Err(err) = result {
+                        self.context.logger().error(err);
+                    }
+                }
+                continue;
+            }
             if matches!(&message, Message::Notification(notif) if notif.method == lsp::notification::Exit::METHOD)
             {
                 if !self.shutdown {
@@ -226,10 +283,64 @@ impl LspServer<'_> {
     fn handle(&mut self, message: Message) -> anyhow::Result<()> {
         match message {
             Message::Request(request) => {
+                let started = Instant::now();
+                let log_summary = matches!(
+                    request.method.as_str(),
+                    lsp::request::HoverRequest::METHOD | lsp::request::Completion::METHOD
+                );
+                if log_summary {
+                    let params = &request.params;
+                    self.context.logger().info(format!(
+                        "Request method={} id={} uri={} line={:?} character={:?}",
+                        request.method,
+                        request.id,
+                        params
+                            .pointer("/textDocument/uri")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<missing>"),
+                        params.pointer("/position/line").and_then(Value::as_u64),
+                        params
+                            .pointer("/position/character")
+                            .and_then(Value::as_u64),
+                    ));
+                    if request.method == lsp::request::Completion::METHOD {
+                        self.context.logger().info(format!(
+                            "Completion context id={} trigger_kind={:?} trigger_character={:?}",
+                            request.id,
+                            params
+                                .pointer("/context/triggerKind")
+                                .and_then(Value::as_u64),
+                            params
+                                .pointer("/context/triggerCharacter")
+                                .and_then(Value::as_str),
+                        ));
+                    }
+                }
                 let result = self.dispatch(&request.method, request.params);
                 let (result, error) = match result {
-                    Ok(value) => (Some(value), None),
-                    Err(error) => (None, Some(error)),
+                    Ok(value) => {
+                        if log_summary {
+                            self.context.logger().info(format!(
+                                "Response method={} id={} {} elapsed_ms={:.3}",
+                                request.method,
+                                request.id,
+                                response_summary(&request.method, &value),
+                                started.elapsed().as_secs_f64() * 1000.0,
+                            ));
+                        }
+                        (Some(value), None)
+                    }
+                    Err(error) => {
+                        self.context.logger().error(format!(
+                            "Request failed method={} id={} code={} message={} elapsed_ms={:.3}",
+                            request.method,
+                            request.id,
+                            error.code,
+                            error.message,
+                            started.elapsed().as_secs_f64() * 1000.0,
+                        ));
+                        (None, Some(error))
+                    }
                 };
                 self.connection.sender.send(Message::Response(Response {
                     id: request.id,
@@ -240,16 +351,33 @@ impl LspServer<'_> {
             Message::Notification(_) if self.shutdown => return Ok(()),
             Message::Notification(notif) => match notif.method.as_str() {
                 lsp::notification::Initialized::METHOD => {}
+                lsp::notification::Cancel::METHOD => {
+                    let params: lsp::CancelParams = serde_json::from_value(notif.params)?;
+                    self.context.logger().info(format!(
+                        "Cancellation received id={:?}; synchronous request handling may have already sent its response (receipt order does not establish when the client cancelled)",
+                        params.id,
+                    ));
+                }
                 lsp::notification::DidSaveTextDocument::METHOD => {
                     let lsp::DidSaveTextDocumentParams {
                         text_document: doc, ..
                     } = serde_json::from_value(notif.params)?;
+                    self.context.logger().info(format!(
+                        "Document save uri={} version={:?}",
+                        doc.uri.as_str(),
+                        self.buffers.get(&doc.uri).and_then(Buffer::version),
+                    ));
                     self.server.check(path_from_uri(&doc.uri)?, &self.context)?;
                 }
                 lsp::notification::DidOpenTextDocument::METHOD => {
                     let lsp::DidOpenTextDocumentParams { text_document: doc } =
                         serde_json::from_value(notif.params)?;
                     let uri = doc.uri;
+                    self.context.logger().info(format!(
+                        "Document open uri={} version={}",
+                        uri.as_str(),
+                        doc.version,
+                    ));
                     self.buffers.open(uri.clone(), doc.text, doc.version);
                     self.server.document_changed(
                         path_from_uri(&uri)?,
@@ -260,19 +388,20 @@ impl LspServer<'_> {
                 lsp::notification::DidCloseTextDocument::METHOD => {
                     let lsp::DidCloseTextDocumentParams { text_document: doc } =
                         serde_json::from_value(notif.params)?;
+                    self.context.logger().info(format!(
+                        "Document close uri={} version={:?}",
+                        doc.uri.as_str(),
+                        self.buffers.get(&doc.uri).and_then(Buffer::version),
+                    ));
                     self.buffers.remove(&doc.uri);
                     self.server
                         .document_changed(path_from_uri(&doc.uri)?, None, &self.context)?;
                 }
                 lsp::notification::DidChangeTextDocument::METHOD => {
-                    let lsp::DidChangeTextDocumentParams {
-                        text_document: doc,
-                        content_changes,
-                    } = serde_json::from_value(notif.params)?;
-                    if self.buffers.change(&doc.uri, doc.version, content_changes) {
+                    if let Some(uri) = self.apply_document_change(notif.params)? {
                         self.server.document_changed(
-                            path_from_uri(&doc.uri)?,
-                            self.buffers.get(&doc.uri),
+                            path_from_uri(&uri)?,
+                            self.buffers.get(&uri),
                             &self.context,
                         )?;
                     }
@@ -337,6 +466,34 @@ impl LspServer<'_> {
         Ok(())
     }
 
+    fn apply_document_change(&mut self, params: Value) -> anyhow::Result<Option<lsp::Uri>> {
+        let lsp::DidChangeTextDocumentParams {
+            text_document: doc,
+            content_changes,
+        } = serde_json::from_value(params)?;
+        let current_version = self.buffers.get(&doc.uri).and_then(Buffer::version);
+        if self.buffers.change(&doc.uri, doc.version, content_changes) {
+            self.context.logger().info(format!(
+                "Document change uri={} version={}",
+                doc.uri.as_str(),
+                doc.version,
+            ));
+            Ok(Some(doc.uri))
+        } else {
+            self.context.logger().info(format!(
+                "Document change ignored ({}) uri={} version={} current_version={current_version:?}",
+                if current_version.is_some_and(|version| version >= doc.version) {
+                    "stale"
+                } else {
+                    "not open"
+                },
+                doc.uri.as_str(),
+                doc.version,
+            ));
+            Ok(None)
+        }
+    }
+
     fn document(&self, uri: &lsp::Uri) -> anyhow::Result<Document<'_>> {
         let path = path_from_uri(uri)?;
         let content = self.buffers.get(uri).context("URI not found")?;
@@ -367,6 +524,40 @@ impl LspServer<'_> {
             .get_pos(range.end.line, range.end.character)
             .context("end position not found")?;
         Ok(start..end)
+    }
+}
+
+fn log_initialization(context: &LspContext, params: &lsp::InitializeParams) {
+    context.logger().info(format!(
+        "Initializing {} version={} client={:?} workspace_folders={:?}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        params.client_info,
+        params.workspace_folders.as_ref().map(|folders| folders
+            .iter()
+            .map(|folder| folder.uri.as_str())
+            .collect::<Vec<_>>()),
+    ));
+}
+
+fn response_summary(method: &str, value: &Value) -> String {
+    if method == lsp::request::Completion::METHOD {
+        let count = value
+            .as_array()
+            .or_else(|| value.get("items").and_then(Value::as_array))
+            .map_or(0, Vec::len);
+        format!("completion_count={count}")
+    } else {
+        let empty = match value.get("contents") {
+            None | Some(Value::Null) => true,
+            Some(Value::String(text)) => text.is_empty(),
+            Some(Value::Array(items)) => items.is_empty(),
+            Some(contents) => contents
+                .get("value")
+                .and_then(Value::as_str)
+                .is_some_and(str::is_empty),
+        };
+        format!("hover={}", if empty { "empty" } else { "nonempty" })
     }
 }
 
@@ -644,24 +835,43 @@ fn capabilities() -> lsp::ServerCapabilities {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::time::Duration;
 
     use super::*;
 
-    struct StubServer;
+    #[derive(Default)]
+    struct StubServer {
+        hover: Option<lsp::Hover>,
+        completion: Option<lsp::CompletionResponse>,
+        allow_document_changes: bool,
+        events: Option<Rc<RefCell<Vec<String>>>>,
+    }
 
     impl LanguageServer for StubServer {
         fn watch_roots(&self) -> Vec<PathBuf> {
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("watchers".into());
+            }
             vec![]
         }
 
         fn document_changed(
             &mut self,
             _path: PathBuf,
-            _buffer: Option<&Buffer>,
+            buffer: Option<&Buffer>,
             _ctx: &LspContext,
         ) -> anyhow::Result<()> {
-            panic!("unexpected document change");
+            assert!(self.allow_document_changes, "unexpected document change");
+            if let Some(events) = &self.events {
+                let buffer = buffer.unwrap();
+                events.borrow_mut().push(format!(
+                    "change:{}:{:?}",
+                    buffer.contents(),
+                    buffer.version(),
+                ));
+            }
+            Ok(())
         }
 
         fn files_changed(&mut self, _paths: Vec<PathBuf>, _ctx: &LspContext) -> anyhow::Result<()> {
@@ -669,7 +879,11 @@ mod tests {
         }
 
         fn check(&mut self, _path: PathBuf, _ctx: &LspContext) -> anyhow::Result<()> {
-            panic!("unexpected check");
+            assert!(self.allow_document_changes, "unexpected check");
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("save".into());
+            }
+            Ok(())
         }
 
         fn change_workspace_folders(
@@ -681,8 +895,13 @@ mod tests {
             panic!("unexpected workspace change");
         }
 
-        fn hover(&self, _doc: CodeLocation<'_>, _ctx: &LspContext) -> anyhow::Result<lsp::Hover> {
-            bail!("stub handler failed");
+        fn hover(&self, doc: CodeLocation<'_>, _ctx: &LspContext) -> anyhow::Result<lsp::Hover> {
+            if let Some(events) = &self.events {
+                events
+                    .borrow_mut()
+                    .push(format!("hover:{}", doc.doc().buffer().contents()));
+            }
+            self.hover.clone().context("stub handler failed")
         }
 
         fn completion(
@@ -690,7 +909,11 @@ mod tests {
             _doc: CodeLocation<'_>,
             _ctx: &LspContext,
         ) -> anyhow::Result<Rc<lsp::CompletionResponse>> {
-            Ok(Rc::new(lsp::CompletionResponse::Array(vec![])))
+            Ok(Rc::new(
+                self.completion
+                    .clone()
+                    .unwrap_or_else(|| lsp::CompletionResponse::Array(vec![])),
+            ))
         }
 
         fn goto_definition(
@@ -744,7 +967,7 @@ mod tests {
         (
             LspServer {
                 connection,
-                server: Box::new(StubServer),
+                server: Box::<StubServer>::default(),
                 buffers,
                 context,
                 watch_files: false,
@@ -777,16 +1000,421 @@ mod tests {
     }
 
     fn receive_response(client: &Connection, id: i32) -> Response {
-        let Message::Response(response) = client
-            .receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-        else {
-            panic!("expected response");
+        let response = loop {
+            match client
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                Message::Response(response) => break response,
+                Message::Notification(notification) => {
+                    assert_eq!(notification.method, lsp::notification::LogMessage::METHOD);
+                }
+                message => panic!("expected response or log, got {message:?}"),
+            }
         };
         assert_eq!(response.id, RequestId::from(id));
         assert_ne!(response.result.is_some(), response.error.is_some());
         response
+    }
+
+    fn receive_log(client: &Connection, typ: lsp::MessageType) -> String {
+        let Message::Notification(notification) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+        else {
+            panic!("expected log notification");
+        };
+        assert_eq!(notification.method, lsp::notification::LogMessage::METHOD);
+        let params: lsp::LogMessageParams = serde_json::from_value(notification.params).unwrap();
+        assert_eq!(params.typ, typ);
+        params.message
+    }
+
+    fn record_changes(server: &mut LspServer<'_>) -> Rc<RefCell<Vec<String>>> {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        server.server = Box::new(StubServer {
+            allow_document_changes: true,
+            events: Some(events.clone()),
+            ..Default::default()
+        });
+        events
+    }
+
+    fn queue_change(client: &Connection, uri: &str, version: i32, changes: Value) {
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidChangeTextDocument::METHOD.into(),
+                json!({
+                    "textDocument": { "uri": uri, "version": version },
+                    "contentChanges": changes,
+                }),
+            )))
+            .unwrap();
+    }
+
+    fn queue_shutdown(client: &Connection) {
+        send_request(client, 99, lsp::request::Shutdown::METHOD, Value::Null);
+        send_exit(client);
+    }
+
+    #[test]
+    fn queued_changes_apply_incrementally_and_rebuild_once_per_uri() {
+        let (mut server, client) = memory_server();
+        let events = record_changes(&mut server);
+        server.watch_files = true;
+        let uri = "file:///C:/test.reds";
+        let other = "file:///C:/other.reds";
+        server
+            .buffers
+            .open(other.parse().unwrap(), "other".into(), 1);
+        queue_change(
+            &client,
+            uri,
+            2,
+            json!([{
+                "range": { "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 3 } },
+                "text": "AB"
+            }]),
+        );
+        queue_change(&client, other, 2, json!([{ "text": "second" }]));
+        queue_change(
+            &client,
+            uri,
+            3,
+            json!([
+                {
+                    "range": { "start": { "line": 0, "character": 2 }, "end": { "line": 0, "character": 4 } },
+                    "text": "C"
+                },
+                {
+                    "range": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 3 } },
+                    "text": "!"
+                }
+            ]),
+        );
+        queue_shutdown(&client);
+
+        server.run().unwrap();
+
+        assert_eq!(
+            *events.borrow(),
+            [
+                "change:éAC!est:Some(3)",
+                "watchers",
+                "change:second:Some(2)",
+                "watchers",
+            ]
+        );
+        for version in [2, 2, 3] {
+            let log = receive_log(&client, lsp::MessageType::INFO);
+            assert!(log.starts_with("Document change uri="), "{log}");
+            assert!(log.contains(&format!("version={version}")), "{log}");
+        }
+    }
+
+    #[test]
+    fn queued_changes_do_not_cross_requests_or_other_notifications() {
+        let (mut server, client) = memory_server();
+        let events = record_changes(&mut server);
+        let uri = "file:///C:/test.reds";
+        queue_change(&client, uri, 2, json!([{ "text": "before request" }]));
+        send_request(
+            &client,
+            1,
+            lsp::request::HoverRequest::METHOD,
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        );
+        queue_change(&client, uri, 3, json!([{ "text": "before save" }]));
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidSaveTextDocument::METHOD.into(),
+                json!({ "textDocument": { "uri": uri } }),
+            )))
+            .unwrap();
+        queue_change(&client, uri, 4, json!([{ "text": "after save" }]));
+        queue_shutdown(&client);
+
+        server.run().unwrap();
+
+        assert_eq!(
+            *events.borrow(),
+            [
+                "change:before request:Some(2)",
+                "hover:before request",
+                "change:before save:Some(3)",
+                "save",
+                "change:after save:Some(4)",
+            ]
+        );
+        receive_response(&client, 1);
+        receive_response(&client, 99);
+    }
+
+    #[test]
+    fn queued_changes_validate_each_version_and_preserve_ignored_logs() {
+        let (mut server, client) = memory_server();
+        let events = record_changes(&mut server);
+        let uri = "file:///C:/test.reds";
+        queue_change(&client, uri, 3, json!([{ "text": "accepted" }]));
+        queue_change(&client, uri, 2, json!([{ "text": "stale" }]));
+        queue_change(&client, uri, 3, json!([{ "text": "equal" }]));
+        queue_change(
+            &client,
+            uri,
+            4,
+            json!([{
+                "range": { "start": { "line": 0, "character": 8 }, "end": { "line": 0, "character": 8 } },
+                "text": "!"
+            }]),
+        );
+        queue_change(
+            &client,
+            "file:///C:/closed.reds",
+            5,
+            json!([{ "text": "closed" }]),
+        );
+        queue_shutdown(&client);
+
+        server.run().unwrap();
+
+        assert_eq!(*events.borrow(), ["change:accepted!:Some(4)"]);
+        let buffer = server.buffers.get(&uri.parse().unwrap()).unwrap();
+        assert_eq!(buffer.contents().to_string(), "accepted!");
+        assert_eq!(buffer.version(), Some(4));
+        for expected in [
+            "Document change uri=",
+            "Document change ignored (stale)",
+            "Document change ignored (stale)",
+            "Document change uri=",
+            "Document change ignored (not open)",
+        ] {
+            let log = receive_log(&client, lsp::MessageType::INFO);
+            assert!(log.starts_with(expected), "{log}");
+            if expected.ends_with("(stale)") {
+                assert!(log.contains("current_version=Some(3)"), "{log}");
+            }
+        }
+    }
+
+    #[test]
+    fn queued_changes_flush_on_disconnect() {
+        let (mut server, client) = memory_server();
+        let events = record_changes(&mut server);
+        queue_change(
+            &client,
+            "file:///C:/test.reds",
+            2,
+            json!([{ "text": "final" }]),
+        );
+        // Keep the log receiver alive while disconnecting the incoming channel.
+        drop(client.sender);
+        server.run().unwrap();
+        assert_eq!(*events.borrow(), ["change:final:Some(2)"]);
+    }
+
+    #[test]
+    fn initialization_logs_client_workspace_and_version() {
+        let (server, client) = memory_server();
+        let params = serde_json::from_value(json!({
+            "capabilities": {},
+            "clientInfo": { "name": "test-client", "version": "1.2" },
+            "workspaceFolders": [{ "uri": "file:///C:/workspace", "name": "workspace" }],
+            "initializationOptions": { "private": "DO_NOT_LOG" }
+        }))
+        .unwrap();
+        log_initialization(&server.context, &params);
+        let log = receive_log(&client, lsp::MessageType::INFO);
+        for expected in [
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            "test-client",
+            "1.2",
+            "file:///C:/workspace",
+        ] {
+            assert!(log.contains(expected), "{log}");
+        }
+        assert!(!log.contains("DO_NOT_LOG"));
+    }
+
+    #[test]
+    fn hover_and_completion_logs_metadata_and_summary_only() {
+        let (mut server, client) = memory_server();
+        for (id, method, hover_contents, completion, expected) in [
+            (
+                0,
+                lsp::request::HoverRequest::METHOD,
+                json!(""),
+                json!([]),
+                "hover=empty",
+            ),
+            (
+                1,
+                lsp::request::HoverRequest::METHOD,
+                json!({ "kind": "markdown", "value": "PRIVATE_HOVER" }),
+                json!([]),
+                "hover=nonempty",
+            ),
+            (
+                2,
+                lsp::request::Completion::METHOD,
+                json!(""),
+                json!([{ "label": "PRIVATE_COMPLETION" }]),
+                "completion_count=1",
+            ),
+            (
+                3,
+                lsp::request::Completion::METHOD,
+                json!(""),
+                json!({ "isIncomplete": false, "items": [] }),
+                "completion_count=0",
+            ),
+        ] {
+            server.server = Box::new(StubServer {
+                hover: Some(serde_json::from_value(json!({ "contents": hover_contents })).unwrap()),
+                completion: Some(serde_json::from_value(completion).unwrap()),
+                ..Default::default()
+            });
+            server
+                .handle(Message::Request(lsp_server::Request::new(
+                    id.into(),
+                    method.into(),
+                    json!({
+                        "textDocument": { "uri": "file:///C:/test.reds" },
+                        "position": { "line": 0, "character": 3 },
+                        "context": { "triggerKind": 2, "triggerCharacter": "." },
+                        "private": "PRIVATE_PARAMS"
+                    }),
+                )))
+                .unwrap();
+            let incoming = receive_log(&client, lsp::MessageType::INFO);
+            for expected in [
+                format!("id={id}"),
+                format!("method={method}"),
+                "uri=file:///C:/test.reds".into(),
+                "line=Some(0)".into(),
+                "character=Some(3)".into(),
+            ] {
+                assert!(incoming.contains(&expected), "{incoming}");
+            }
+            assert!(!incoming.contains("PRIVATE"));
+            if method == lsp::request::Completion::METHOD {
+                let context = receive_log(&client, lsp::MessageType::INFO);
+                assert!(context.contains("trigger_kind=Some(2)"));
+                assert!(context.contains("trigger_character=Some(\".\")"));
+            }
+            let summary = receive_log(&client, lsp::MessageType::INFO);
+            for expected in [
+                expected,
+                "elapsed_ms=",
+                &format!("id={id}"),
+                &format!("method={method}"),
+            ] {
+                assert!(summary.contains(expected), "{summary}");
+            }
+            assert!(!summary.contains("PRIVATE"));
+            receive_response(&client, id);
+            assert!(client.receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn cancellation_logs_request_id_without_an_unexpected_notification() {
+        let (mut server, client) = memory_server();
+        server
+            .handle(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::Cancel::METHOD.into(),
+                json!({ "id": 42 }),
+            )))
+            .unwrap();
+        let log = receive_log(&client, lsp::MessageType::INFO);
+        assert!(log.contains("Cancellation received id=Number(42)"), "{log}");
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn document_logs_versions_and_ignored_changes_without_source() {
+        let (mut server, client) = memory_server();
+        server.server = Box::new(StubServer {
+            allow_document_changes: true,
+            ..Default::default()
+        });
+        let uri = "file:///C:/document.reds";
+        for (method, params, expected) in [
+            (
+                lsp::notification::DidOpenTextDocument::METHOD,
+                json!({ "textDocument": { "uri": uri, "languageId": "redscript", "version": 3, "text": "PRIVATE_SOURCE" } }),
+                "Document open",
+            ),
+            (
+                lsp::notification::DidChangeTextDocument::METHOD,
+                json!({ "textDocument": { "uri": uri, "version": 4 }, "contentChanges": [{ "text": "PRIVATE_CHANGE" }] }),
+                "Document change",
+            ),
+            (
+                lsp::notification::DidChangeTextDocument::METHOD,
+                json!({ "textDocument": { "uri": uri, "version": 3 }, "contentChanges": [{ "text": "PRIVATE_STALE" }] }),
+                "Document change ignored (stale)",
+            ),
+            (
+                lsp::notification::DidChangeTextDocument::METHOD,
+                json!({ "textDocument": { "uri": uri, "version": 4 }, "contentChanges": [{ "text": "PRIVATE_EQUAL" }] }),
+                "Document change ignored (stale)",
+            ),
+            (
+                lsp::notification::DidSaveTextDocument::METHOD,
+                json!({ "textDocument": { "uri": uri }, "text": "PRIVATE_SAVE" }),
+                "Document save",
+            ),
+            (
+                lsp::notification::DidCloseTextDocument::METHOD,
+                json!({ "textDocument": { "uri": uri } }),
+                "Document close",
+            ),
+            (
+                lsp::notification::DidChangeTextDocument::METHOD,
+                json!({ "textDocument": { "uri": uri, "version": 5 }, "contentChanges": [{ "text": "PRIVATE_CLOSED" }] }),
+                "Document change ignored (not open)",
+            ),
+        ] {
+            server
+                .handle(Message::Notification(lsp_server::Notification::new(
+                    method.into(),
+                    params.clone(),
+                )))
+                .unwrap();
+            let log = receive_log(&client, lsp::MessageType::INFO);
+            assert!(log.starts_with(expected), "{log}");
+            assert!(log.contains(uri));
+            if let Some(version) = params
+                .pointer("/textDocument/version")
+                .and_then(Value::as_i64)
+            {
+                assert!(log.contains(&format!("version={version}")), "{log}");
+            } else {
+                assert!(log.contains("version=Some(4)"), "{log}");
+            }
+            if expected.ends_with("(stale)") {
+                assert!(log.contains("current_version=Some(4)"));
+                assert_eq!(
+                    server
+                        .buffers
+                        .get(&uri.parse().unwrap())
+                        .unwrap()
+                        .contents()
+                        .to_string(),
+                    "PRIVATE_CHANGE"
+                );
+            }
+            assert!(!log.contains("PRIVATE"));
+        }
+        assert!(client.receiver.try_recv().is_err());
     }
 
     #[test]
@@ -895,8 +1523,25 @@ mod tests {
         send_exit(&client);
         server.run().unwrap();
 
-        for (id, (_, _, code)) in cases.into_iter().enumerate() {
+        for (id, (method, _, code)) in cases.into_iter().enumerate() {
+            if method == lsp::request::HoverRequest::METHOD
+                || method == lsp::request::Completion::METHOD
+            {
+                receive_log(&client, lsp::MessageType::INFO);
+                if method == lsp::request::Completion::METHOD {
+                    receive_log(&client, lsp::MessageType::INFO);
+                }
+            }
+            let log = receive_log(&client, lsp::MessageType::ERROR);
             let error = receive_response(&client, id as i32).error.unwrap();
+            for expected in [
+                format!("method={method}"),
+                format!("id={id}"),
+                format!("code={}", error.code),
+                format!("message={}", error.message),
+            ] {
+                assert!(log.contains(&expected), "{log}");
+            }
             assert_eq!(error.code, code as i32);
             assert!(!error.message.is_empty());
         }
@@ -948,6 +1593,12 @@ mod tests {
         server.run().unwrap();
         assert_eq!(receive_response(&client, 0).result, Some(Value::Null));
         for id in 1..=3 {
+            if id == 2 {
+                receive_log(&client, lsp::MessageType::INFO);
+            }
+            let log = receive_log(&client, lsp::MessageType::ERROR);
+            assert!(log.contains(&format!("id={id}")));
+            assert!(log.contains("code=-32600 message=Server is shut down"));
             assert_eq!(
                 receive_response(&client, id).error.unwrap().code,
                 ErrorCode::InvalidRequest as i32
