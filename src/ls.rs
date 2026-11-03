@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -37,6 +37,7 @@ pub struct RedscriptLanguageServer {
     overlays: HashMap<PathBuf, Overlay>,
     standalone: HashMap<PathBuf, CompilationCache>,
     generation: u64,
+    missing_roots: RefCell<BTreeSet<PathBuf>>,
 }
 
 impl RedscriptLanguageServer {
@@ -54,11 +55,15 @@ impl RedscriptLanguageServer {
             })
             .collect::<anyhow::Result<HashMap<_, _>>>()?;
         let workspace_dirs = workspaces.iter().flat_map(|(_, w)| &w.roots);
+        let mut missing_roots = BTreeSet::new();
         Ok(Self {
             compilation_cache: CompilationCache::make(
                 cache_bytes,
                 workspace_dirs,
                 TypeInterner::default(),
+                |root| {
+                    missing_roots.insert(root.to_owned());
+                },
             )?,
             workspaces,
             cached_fixes: RefCell::new(HashMap::new()),
@@ -66,6 +71,7 @@ impl RedscriptLanguageServer {
             overlays: HashMap::new(),
             standalone: HashMap::new(),
             generation: 0,
+            missing_roots: RefCell::new(missing_roots),
         })
     }
 
@@ -80,17 +86,19 @@ impl RedscriptLanguageServer {
         roots: impl IntoIterator<Item = PathBuf>,
     ) -> anyhow::Result<CompilationCache> {
         let sources = ast::SourceMap::new();
-        let mut files: std::collections::BTreeMap<_, _> = dialect::discover(roots)?
-            .into_iter()
-            .map(|path| {
-                let text = self
-                    .overlays
-                    .get(&path)
-                    .map(|overlay| Ok(overlay.text.clone()))
-                    .unwrap_or_else(|| fs::read_to_string(&path));
-                text.map(|text| (path, text))
-            })
-            .collect::<Result<_, _>>()?;
+        let mut files: BTreeMap<_, _> = dialect::discover(roots, |root| {
+            self.missing_roots.borrow_mut().insert(root.to_owned());
+        })?
+        .into_iter()
+        .map(|path| {
+            let text = self
+                .overlays
+                .get(&path)
+                .map(|overlay| Ok(overlay.text.clone()))
+                .unwrap_or_else(|| fs::read_to_string(&path));
+            text.map(|text| (path, text))
+        })
+        .collect::<Result<_, _>>()?;
         // Unsaved new files are absent from discovery but still own an active module.
         for (path, overlay) in &self.overlays {
             if self.resolve_file(path).as_workspace().is_some() {
@@ -482,6 +490,15 @@ impl RedscriptLanguageServer {
     }
 
     pub fn check_workspace_and_publish(&self, ctx: &LspContext) -> anyhow::Result<()> {
+        for root in std::mem::take(&mut *self.missing_roots.borrow_mut()) {
+            ctx.notify::<lsp::notification::LogMessage>(lsp::LogMessageParams {
+                typ: lsp::MessageType::WARNING,
+                message: format!(
+                    "Source root '{}' is missing; treating it as temporarily empty. Restore/create the directory or update source_roots in .redscript, then refresh the workspace.",
+                    root.display()
+                ),
+            });
+        }
         self.check_workspace(|_, symbols, diags, sources| {
             self.publish_diagnostics(diags, symbols, sources, ctx)
         })
@@ -1072,8 +1089,9 @@ impl CompilationCache {
         cache_bytes: Vec<u8>,
         workspace_dirs: impl IntoIterator<Item = impl Into<PathBuf>>,
         interner: TypeInterner,
+        missing_root: impl FnMut(&Path),
     ) -> anyhow::Result<Self> {
-        let sources = ast::SourceMap::from_files(dialect::discover(workspace_dirs)?)?;
+        let sources = ast::SourceMap::from_files(dialect::discover(workspace_dirs, missing_root)?)?;
         Self::from_sources(cache_bytes, sources, interner)
     }
 
@@ -1802,6 +1820,185 @@ mod tests {
     }
 
     #[test]
+    fn nested_unsaved_overlay_survives_save_delete_and_close() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let path = temp.path().join("nested/deeper/new.script");
+        let identity = dialect::identity(&path);
+        let _buffer = open(&mut server, &ctx, &path, "class Live {}", 1);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "class Saved {}").unwrap();
+        server.files_changed(vec![path.clone()], &ctx).unwrap();
+        fs::remove_dir_all(temp.path().join("nested")).unwrap();
+        server.files_changed(vec![path.clone()], &ctx).unwrap();
+        assert_eq!(server.overlays.len(), 1);
+        assert!(server.overlays.contains_key(&identity));
+        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 1);
+        server
+            .check_workspace(|_, symbols, diagnostics, _| {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                assert!(symbols.types().any(|(id, _)| id.as_str() == "Live"));
+                assert!(!symbols.types().any(|(id, _)| id.as_str() == "Saved"));
+                Ok(())
+            })
+            .unwrap();
+        server.document_changed(path, None, &ctx).unwrap();
+        assert!(server.overlays.is_empty());
+        assert!(server.compilation_cache.borrow_file_ids().is_empty());
+    }
+
+    fn missing_external_root_diagnostics(initially_missing: bool) {
+        let (temp, _server, ctx, receiver) = fixture();
+        let external = tempfile::tempdir().unwrap();
+        let root = external.path().join("nested/root");
+        let removed = root.join("removed.script");
+        let healthy = temp.path().join("healthy.script");
+        let standalone_dir = tempfile::tempdir().unwrap();
+        let standalone = standalone_dir.path().join("solo.script");
+        fs::write(&healthy, "class {").unwrap();
+        fs::write(&standalone, "class {").unwrap();
+        if !initially_missing {
+            fs::create_dir_all(&root).unwrap();
+            fs::write(&removed, "class {").unwrap();
+        }
+        fs::write(
+            temp.path().join(".redscript"),
+            format!(
+                "source_roots = [{:?}, {:?}]",
+                temp.path().to_string_lossy().replace('\\', "/"),
+                root.to_string_lossy().replace('\\', "/"),
+            ),
+        )
+        .unwrap();
+        // Exercise startup discovery too, before an LspContext is available.
+        let mut server =
+            RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
+        assert_eq!(
+            server.missing_roots.borrow().len(),
+            usize::from(initially_missing)
+        );
+        server.check_workspace_and_publish(&ctx).unwrap();
+        let startup: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(
+            startup.iter().any(|message| {
+                let lsp_server::Message::Notification(notification) = message else {
+                    return false;
+                };
+                notification.method == "window/logMessage"
+                    && serde_json::from_value::<lsp::LogMessageParams>(notification.params.clone())
+                        .is_ok_and(|params| params.typ == lsp::MessageType::WARNING)
+            }),
+            initially_missing
+        );
+        server.check(standalone.clone(), &ctx).unwrap();
+        let initial: Vec<lsp::PublishDiagnosticsParams> = startup
+            .into_iter()
+            .chain(receiver.try_iter())
+            .filter_map(|message| {
+                let lsp_server::Message::Notification(notification) = message else {
+                    return None;
+                };
+                serde_json::from_value(notification.params).ok()
+            })
+            .collect();
+        for path in [&healthy, &standalone] {
+            assert!(initial.iter().any(
+                |params| params.uri == ctx.uri(path).unwrap() && !params.diagnostics.is_empty()
+            ));
+        }
+        if !initially_missing {
+            assert!(
+                initial
+                    .iter()
+                    .any(|params| params.uri == ctx.uri(&removed).unwrap()
+                        && !params.diagnostics.is_empty())
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::write(&healthy, "class Healthy {}").unwrap();
+        fs::write(&standalone, "class Solo {}").unwrap();
+        server
+            .files_changed(
+                vec![root.clone(), healthy.clone(), standalone.clone()],
+                &ctx,
+            )
+            .unwrap();
+        let messages: Vec<_> = receiver.try_iter().collect();
+        assert!(messages.iter().any(|message| {
+            let lsp_server::Message::Notification(notification) = message else {
+                return false;
+            };
+            if notification.method != "window/logMessage" {
+                return false;
+            }
+            let params: lsp::LogMessageParams =
+                serde_json::from_value(notification.params.clone()).unwrap();
+            params.typ == lsp::MessageType::WARNING
+                && params
+                    .message
+                    .contains(&dialect::identity(&root).display().to_string())
+                && params.message.contains("source_roots")
+                && params.message.contains("Restore/create")
+        }));
+        let publications: Vec<lsp::PublishDiagnosticsParams> = messages
+            .into_iter()
+            .filter_map(|message| {
+                let lsp_server::Message::Notification(notification) = message else {
+                    return None;
+                };
+                serde_json::from_value(notification.params).ok()
+            })
+            .collect();
+        for path in [&healthy, &standalone]
+            .into_iter()
+            .chain((!initially_missing).then_some(&removed))
+        {
+            assert!(
+                publications
+                    .iter()
+                    .any(|params| params.uri == ctx.uri(path).unwrap()
+                        && params.diagnostics.is_empty()),
+                "missing clear for {}",
+                path.display()
+            );
+        }
+        assert!(server.resolve_file(&removed).as_workspace().is_some());
+        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 1);
+        assert_eq!(server.standalone.len(), 1);
+        // Missing roots must not block subsequent live diagnostic updates either.
+        for path in [&healthy, &standalone] {
+            let _buffer = open(&mut server, &ctx, path, "class {", 7);
+        }
+        let publications: Vec<lsp::PublishDiagnosticsParams> = receiver
+            .try_iter()
+            .filter_map(|message| {
+                let lsp_server::Message::Notification(notification) = message else {
+                    return None;
+                };
+                serde_json::from_value(notification.params).ok()
+            })
+            .collect();
+        for path in [&healthy, &standalone] {
+            assert!(
+                publications
+                    .iter()
+                    .any(|params| params.uri == ctx.uri(path).unwrap()
+                        && params.version == Some(7)
+                        && !params.diagnostics.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn deleted_external_root_keeps_workspace_and_standalone_diagnostics_updating() {
+        missing_external_root_diagnostics(false);
+    }
+
+    #[test]
+    fn initially_missing_root_keeps_workspace_and_standalone_diagnostics_updating() {
+        missing_external_root_diagnostics(true);
+    }
+
+    #[test]
     fn external_roots_watch_delete_and_configuration_reload() {
         let (temp, mut server, ctx, _receiver) = fixture();
         let external = tempfile::tempdir().unwrap();
@@ -2174,6 +2371,7 @@ mod tests {
             overlays: HashMap::new(),
             standalone: HashMap::new(),
             generation: 0,
+            missing_roots: RefCell::new(BTreeSet::new()),
         }
     }
 

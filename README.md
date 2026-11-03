@@ -43,13 +43,19 @@ ASCII-case-insensitive `.script` (REDmod) extensions, including `.Script` and
 `.SCRIPT`. Other extensions are ignored; dialect selection
 never sniffs content or tries multiple parsers. Discovery respects the existing
 ignore-file rules, reports traversal errors, and canonicalizes/deduplicates files
-across overlapping roots. Configured external roots participate in workspace
+across overlapping roots. Missing configured roots are temporarily empty and
+produce an actionable warning in the client log; other I/O/traversal failures
+remain errors. Restore/create the root or update `source_roots` in `.redscript`,
+then refresh the workspace. Configured external roots participate in workspace
 analysis. Formatting configuration uses the deepest matching root; equal-depth
 ties use the lexicographically first workspace path. Workspace roots share one
 analysis universe, including roots shared by multiple workspaces.
 
 Open documents retain versions and overlay disk contents across **all** open
-workspace buffers. Open/change/save/close and workspace-folder changes rebuild
+workspace buffers. New/deleted paths resolve through the nearest existing
+ancestor, keeping nested unsaved paths comparable before saving and after deletion;
+identity is not guaranteed across symlink creation or retargeting.
+Open/change/save/close and workspace-folder changes rebuild
 analysis and diagnostics; stale document changes are ignored. Source/config
 watched-file batches and configuration notifications reload roots and analysis,
 without replacing open buffers with disk contents. Clients supporting dynamic

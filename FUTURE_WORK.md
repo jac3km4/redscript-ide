@@ -5,8 +5,8 @@ Prioritized follow-ups from the LSP/code review. Keep fixes focused and add regr
 ## Reliability
 
 
-- Stabilize file identities across creation/deletion, especially Windows canonical paths and missing parent directories.
-- Treat missing source roots as temporarily empty with warnings; isolate discovery/read failures so healthy files keep updating.
+- Reconcile file identities across symlink creation/retargeting (ordinary creation/deletion and missing parents are handled).
+- Isolate non-missing-root discovery/read failures so healthy files keep updating (missing roots are handled).
 
 ## LSP correctness
 

@@ -26,35 +26,70 @@ impl Dialect {
 }
 
 pub fn identity(path: &Path) -> PathBuf {
-    // Keep deleted/new files comparable with existing files, including on Windows.
-    if let Ok(path) = fs::canonicalize(path) {
-        return path;
-    }
-    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
-        && let Ok(parent) = fs::canonicalize(parent)
-    {
-        return parent.join(name);
-    }
-    path.components()
-        .fold(PathBuf::new(), |mut result, component| {
-            match component {
-                std::path::Component::CurDir => {}
-                std::path::Component::ParentDir => {
-                    result.pop();
-                }
-                component => result.push(component.as_os_str()),
-            }
-            result
+    // Resolve the existing prefix even when several parent directories are missing.
+    // This does not preserve identity across symlink creation or retargeting.
+    let (base, suffix) = path
+        .ancestors()
+        .find_map(|ancestor| {
+            let existing = if ancestor.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                ancestor
+            };
+            fs::canonicalize(existing)
+                .ok()
+                .map(|base| (base, path.strip_prefix(ancestor).unwrap()))
         })
+        .unwrap_or_else(|| (PathBuf::new(), path));
+    suffix.components().fold(base, |mut result, component| {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            component => result.push(component.as_os_str()),
+        }
+        result
+    })
 }
 
-pub fn discover(roots: impl IntoIterator<Item = impl Into<PathBuf>>) -> io::Result<Vec<PathBuf>> {
+pub fn discover(
+    roots: impl IntoIterator<Item = impl Into<PathBuf>>,
+    mut missing_root: impl FnMut(&Path),
+) -> io::Result<Vec<PathBuf>> {
     let mut paths = BTreeSet::new();
     for root in roots {
-        for entry in ignore::WalkBuilder::new(root.into())
-            .follow_links(true)
-            .build()
-        {
+        let root = root.into();
+        match fs::metadata(&root) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // Windows also reports NotFound for children of a regular file.
+                // Only absent directories should be treated as temporarily empty.
+                for ancestor in root.ancestors().skip(1) {
+                    if ancestor.as_os_str().is_empty() {
+                        break;
+                    }
+                    match fs::metadata(ancestor) {
+                        Ok(metadata) if metadata.is_dir() => break,
+                        Ok(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotADirectory,
+                                format!(
+                                    "source root ancestor '{}' is not a directory",
+                                    ancestor.display()
+                                ),
+                            ));
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                missing_root(&root);
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+        for entry in ignore::WalkBuilder::new(root).follow_links(true).build() {
             let entry = entry.map_err(io::Error::other)?;
             if entry.file_type().is_some_and(|kind| kind.is_file())
                 && Dialect::of(entry.path()).is_some()
@@ -182,12 +217,55 @@ mod tests {
         fs::write(temp.path().join("upper.SCRIPT"), "").unwrap();
         fs::write(temp.path().join("wrong.REDS"), "").unwrap();
         fs::write(temp.path().join(".ignore"), "ignored.script\n").unwrap();
-        let paths = discover([temp.path(), temp.path()]).unwrap();
+        let paths = discover([temp.path(), temp.path()], |_| {
+            panic!("unexpected missing root")
+        })
+        .unwrap();
         assert_eq!(paths.len(), 4);
         for name in ["a.reds", "b.script", "mixed.Script", "upper.SCRIPT"] {
             assert!(paths.contains(&identity(&temp.path().join(name))));
         }
-        assert!(discover([temp.path().join("missing")]).is_err());
+        // A non-directory ancestor is an error, not a temporarily absent root.
+        assert!(
+            discover([temp.path().join("a.reds/child")], |_| {
+                panic!("unexpected missing root")
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn nested_missing_identity_survives_save_and_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested/deeper/file.script");
+        let expected = fs::canonicalize(temp.path())
+            .unwrap()
+            .join("nested/deeper/file.script");
+        assert_eq!(identity(&path), expected);
+        assert_eq!(
+            identity(&temp.path().join("nested/unused/../deeper/./file.script")),
+            expected
+        );
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "").unwrap();
+        assert_eq!(identity(&path), expected);
+        fs::remove_dir_all(temp.path().join("nested")).unwrap();
+        assert_eq!(identity(&path), expected);
+    }
+
+    #[test]
+    fn discovery_reports_initially_missing_roots_and_keeps_healthy_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let healthy = temp.path().join("healthy.script");
+        fs::write(&healthy, "").unwrap();
+        let missing = temp.path().join("missing/nested");
+        let mut warnings = Vec::new();
+        let paths = discover([missing.clone(), temp.path().to_owned()], |root| {
+            warnings.push(root.to_owned());
+        })
+        .unwrap();
+        assert_eq!(warnings, [missing]);
+        assert_eq!(paths, [identity(&healthy)]);
     }
 
     #[test]
