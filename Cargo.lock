@@ -641,6 +641,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "redscript-code-edit"
 version = "1.0.0-preview.22"
+source = "git+https://github.com/jac3km4/redscript?rev=e1c44e801e46ce076a0b0bad64349313067cb5b3#e1c44e801e46ce076a0b0bad64349313067cb5b3"
 dependencies = [
  "anyhow",
  "mimalloc",
@@ -650,6 +651,7 @@ dependencies = [
 [[package]]
 name = "redscript-community-ast"
 version = "1.0.0-preview.22"
+source = "git+https://github.com/jac3km4/redscript?rev=e1c44e801e46ce076a0b0bad64349313067cb5b3#e1c44e801e46ce076a0b0bad64349313067cb5b3"
 dependencies = [
  "bitflags 2.11.0",
  "chumsky",
@@ -661,6 +663,7 @@ dependencies = [
 [[package]]
 name = "redscript-community-formatter"
 version = "1.0.0-preview.22"
+source = "git+https://github.com/jac3km4/redscript?rev=e1c44e801e46ce076a0b0bad64349313067cb5b3#e1c44e801e46ce076a0b0bad64349313067cb5b3"
 dependencies = [
  "hashbrown 0.17.0",
  "pretty_dtoa",
@@ -671,6 +674,7 @@ dependencies = [
 [[package]]
 name = "redscript-community-parser"
 version = "1.0.0-preview.22"
+source = "git+https://github.com/jac3km4/redscript?rev=e1c44e801e46ce076a0b0bad64349313067cb5b3#e1c44e801e46ce076a0b0bad64349313067cb5b3"
 dependencies = [
  "chumsky",
  "redscript-community-ast",
@@ -679,6 +683,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-api"
 version = "1.0.0-preview.22"
+source = "git+https://github.com/jac3km4/redscript?rev=e1c44e801e46ce076a0b0bad64349313067cb5b3#e1c44e801e46ce076a0b0bad64349313067cb5b3"
 dependencies = [
  "bon",
  "log",
@@ -693,6 +698,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-backend"
 version = "1.0.0-preview.22"
+source = "git+https://github.com/jac3km4/redscript?rev=e1c44e801e46ce076a0b0bad64349313067cb5b3#e1c44e801e46ce076a0b0bad64349313067cb5b3"
 dependencies = [
  "bitfield-struct",
  "bon",
@@ -709,6 +715,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-frontend"
 version = "1.0.0-preview.22"
+source = "git+https://github.com/jac3km4/redscript?rev=e1c44e801e46ce076a0b0bad64349313067cb5b3#e1c44e801e46ce076a0b0bad64349313067cb5b3"
 dependencies = [
  "bitfield-struct",
  "bon",
@@ -729,6 +736,7 @@ dependencies = [
 [[package]]
 name = "redscript-dotfile"
 version = "1.0.0-preview.22"
+source = "git+https://github.com/jac3km4/redscript?rev=e1c44e801e46ce076a0b0bad64349313067cb5b3#e1c44e801e46ce076a0b0bad64349313067cb5b3"
 dependencies = [
  "anyhow",
  "hashbrown 0.17.0",
@@ -767,6 +775,7 @@ dependencies = [
 [[package]]
 name = "redscript-io"
 version = "1.0.0-preview.22"
+source = "git+https://github.com/jac3km4/redscript?rev=e1c44e801e46ce076a0b0bad64349313067cb5b3#e1c44e801e46ce076a0b0bad64349313067cb5b3"
 dependencies = [
  "bitfield-struct",
  "byte",
@@ -780,6 +789,7 @@ dependencies = [
 [[package]]
 name = "redscript-redmod-adapter"
 version = "1.0.0-preview.22"
+source = "git+https://github.com/jac3km4/redscript?rev=e1c44e801e46ce076a0b0bad64349313067cb5b3#e1c44e801e46ce076a0b0bad64349313067cb5b3"
 dependencies = [
  "redscript-community-ast",
  "redscript-compiler-frontend",
@@ -790,6 +800,7 @@ dependencies = [
 [[package]]
 name = "redscript-redmod-ast"
 version = "1.0.0-preview.22"
+source = "git+https://github.com/jac3km4/redscript?rev=e1c44e801e46ce076a0b0bad64349313067cb5b3#e1c44e801e46ce076a0b0bad64349313067cb5b3"
 dependencies = [
  "redscript-community-ast",
 ]
@@ -797,6 +808,7 @@ dependencies = [
 [[package]]
 name = "redscript-redmod-formatter"
 version = "1.0.0-preview.22"
+source = "git+https://github.com/jac3km4/redscript?rev=e1c44e801e46ce076a0b0bad64349313067cb5b3#e1c44e801e46ce076a0b0bad64349313067cb5b3"
 dependencies = [
  "redscript-redmod-ast",
  "redscript-redmod-parser",
@@ -805,6 +817,7 @@ dependencies = [
 [[package]]
 name = "redscript-redmod-parser"
 version = "1.0.0-preview.22"
+source = "git+https://github.com/jac3km4/redscript?rev=e1c44e801e46ce076a0b0bad64349313067cb5b3#e1c44e801e46ce076a0b0bad64349313067cb5b3"
 dependencies = [
  "chumsky",
  "redscript-community-ast",

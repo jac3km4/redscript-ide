@@ -20,26 +20,32 @@ lsp-types = "0.97"
 
 
 [dependencies.redscript-redmod-formatter]
-path = "../redscript/crates/syntax/redmod/formatter"
+git = "https://github.com/jac3km4/redscript"
+rev = "e1c44e801e46ce076a0b0bad64349313067cb5b3"
 
 [dependencies.redscript-redmod-adapter]
-path = "../redscript/crates/compiler/redmod/adapter"
+git = "https://github.com/jac3km4/redscript"
+rev = "e1c44e801e46ce076a0b0bad64349313067cb5b3"
 
 [dependencies.redscript-community-formatter]
-path = "../redscript/crates/syntax/community/formatter"
+git = "https://github.com/jac3km4/redscript"
+rev = "e1c44e801e46ce076a0b0bad64349313067cb5b3"
 
 [dependencies.redscript-compiler-api]
-path = "../redscript/crates/compiler/api"
+git = "https://github.com/jac3km4/redscript"
+rev = "e1c44e801e46ce076a0b0bad64349313067cb5b3"
 
 [dependencies.redscript-dotfile]
-path = "../redscript/crates/dotfile"
+git = "https://github.com/jac3km4/redscript"
+rev = "e1c44e801e46ce076a0b0bad64349313067cb5b3"
 
 [dependencies.redscript-code-edit]
-path = "../redscript/crates/code-edit"
+git = "https://github.com/jac3km4/redscript"
+rev = "e1c44e801e46ce076a0b0bad64349313067cb5b3"
 
 [dev-dependencies]
 tempfile = "3"
-redscript-compiler-frontend = { path = "../redscript/crates/compiler/frontend" }
+redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "e1c44e801e46ce076a0b0bad64349313067cb5b3" }
 
 [patch.crates-io]
 stable_deref_trait = { git = "https://github.com/Storyyeller/stable_deref_trait", rev = "59a35e0" }

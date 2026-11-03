@@ -25,19 +25,17 @@ Keep `--all-targets` in the Clippy command so test code is linted too.
 
 ## Working across repositories
 
-The IDE currently uses **path dependencies** into `../redscript` for every
-redscript package, including `redscript-redmod-adapter` and its parser. Clone both
-repositories side by side; the sibling must include the REDmod semantic adapter
-and the shared frontend's `expr_type` API. All transitive AST/compiler dependencies
-then come from that same workspace. `Cargo.lock` records the resulting graph.
-Do not mix a Git parser/AST with a local compiler or invent a future revision.
+All redscript dependencies use the same Git revision pinned in `Cargo.toml`:
+`e1c44e801e46ce076a0b0bad64349313067cb5b3`. Cargo fetches that revision for local
+builds and CI; no sibling checkout or `REDSCRIPT_REF` repository variable is needed.
+Transitive AST/compiler packages come from the same Git workspace, and
+`Cargo.lock` records the resulting graph.
 
-CI checks out `jac3km4/redscript` next to the IDE. Set the repository variable
-`REDSCRIPT_REF` to a published branch/tag/commit containing the coordinated work
-(default: the existing `1.0.x` branch). Until the sibling changes are published,
-CI cannot reproduce this development checkout. Before releasing, select and
-validate an immutable published compiler revision and update the dependency
-strategy and CI together. A path dependency is not a reproducible release pin.
+When updating the compiler, change every redscript revision together, regenerate
+`Cargo.lock`, and run the validation above. For local cross-repository development,
+use Cargo Git-source patches for the affected packages, keeping the complete
+AST/compiler graph consistent. Do not commit local path overrides or mix a Git
+parser/AST with a local compiler.
 
 Validate both repositories separately when changing the compiler and language
 server. IDE tests use small synthetic bundles, not a game installation.

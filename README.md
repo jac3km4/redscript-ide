@@ -98,8 +98,9 @@ errors even though they parse and can be indented. Queries directly over
 unconverted native-only syntax are not yet implemented.
 Hover, member completion, definition lookup and workspace symbols reuse shared
 analysis for the supported subset. **This is still a strict, partial REDmod implementation**, not full
-semantic parity or an official compiler replacement; see the sibling
-`redscript/crates/compiler/redmod/adapter/README.md` for supported features and limits.
+semantic parity or an official compiler replacement; see the pinned compiler's
+[semantic adapter README](https://github.com/jac3km4/redscript/blob/e1c44e801e46ce076a0b0bad64349313067cb5b3/crates/compiler/redmod/adapter/README.md)
+for supported features and limits.
 REDmod dynamic-array receivers offer the semantic adapter's 12 supported member
 operations (including `Size`, `PushBack`, and `Last`). Completion signatures and
 snippets use actual boot intrinsics, omit the receiver parameter, and specialize

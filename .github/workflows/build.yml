@@ -16,13 +16,7 @@ jobs:
     runs-on: ${{ inputs.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: jac3km4/redscript
-          ref: ${{ vars.REDSCRIPT_REF || '1.0.x' }}
-          path: compiler-checkout
-      - shell: bash
-        run: mv compiler-checkout ../redscript
+
 
       - run: rustup toolchain install stable --profile minimal --no-self-update
 
