@@ -22,6 +22,7 @@ pub struct LspServer<'a> {
     context: LspContext,
     watch_files: bool,
     watched_roots: Vec<PathBuf>,
+    shutdown: bool,
 }
 
 impl LspServer<'_> {
@@ -72,19 +73,26 @@ impl LspServer<'_> {
             buffers: Buffers::default(),
             watch_files,
             watched_roots: vec![],
+            shutdown: false,
         };
         this.update_watchers()?;
 
-        loop {
-            match this.handle() {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(err) => {
-                    context.logger().error(err);
+        this.run()
+    }
+
+    fn run(&mut self) -> anyhow::Result<()> {
+        while let Ok(message) = self.connection.receiver.recv() {
+            if matches!(&message, Message::Notification(notif) if notif.method == lsp::notification::Exit::METHOD)
+            {
+                if !self.shutdown {
+                    bail!("Received exit before shutdown");
                 }
+                return Ok(());
+            }
+            if let Err(err) = self.handle(message) {
+                self.context.logger().error(err);
             }
         }
-
         Ok(())
     }
 
@@ -131,91 +139,105 @@ impl LspServer<'_> {
         Ok(())
     }
 
-    fn handle(&mut self) -> anyhow::Result<bool> {
-        match self.connection.receiver.recv()? {
-            Message::Request(request) => match request.method.as_str() {
-                lsp::request::HoverRequest::METHOD => {
-                    let lsp::HoverParams {
-                        text_document_position_params: params,
-                        ..
-                    } = serde_json::from_value(request.params)?;
-                    let doc = self.document_location(&params.text_document.uri, params.position)?;
-                    self.handle_response(request.id, self.server.hover(doc, &self.context))?;
-                }
-                lsp::request::Completion::METHOD => {
-                    let lsp::CompletionParams {
-                        text_document_position: params,
-                        ..
-                    } = serde_json::from_value(request.params)?;
-                    let doc = self.document_location(&params.text_document.uri, params.position)?;
-                    let completion = self.server.completion(doc, &self.context);
-                    self.handle_response(
-                        request.id,
-                        completion.as_deref().map_err(|err| anyhow!("{err}")),
-                    )?;
-                }
-                lsp::request::GotoDefinition::METHOD => {
-                    let lsp::GotoDefinitionParams {
-                        text_document_position_params: params,
-                        ..
-                    } = serde_json::from_value(request.params)?;
-                    let doc = self.document_location(&params.text_document.uri, params.position)?;
-                    self.handle_response(
-                        request.id,
-                        self.server.goto_definition(doc, &self.context),
-                    )?;
-                }
-                lsp::request::WorkspaceSymbolRequest::METHOD => {
-                    let lsp::WorkspaceSymbolParams { query, .. } =
-                        serde_json::from_value(request.params)?;
-                    self.handle_response(
-                        request.id,
-                        self.server.workspace_symbol(&query, &self.context),
-                    )?;
-                }
-                lsp::request::Formatting::METHOD => {
-                    let lsp::DocumentFormattingParams {
-                        text_document,
-                        options,
-                        ..
-                    } = serde_json::from_value(request.params)?;
-                    let doc = self.document(&text_document.uri)?;
-                    self.handle_response(
-                        request.id,
-                        self.server
-                            .format(doc, options.tab_size as u16, &self.context),
-                    )?;
-                }
-                lsp::request::CodeActionRequest::METHOD => {
-                    let lsp::CodeActionParams {
-                        text_document,
-                        range,
-                        ..
-                    } = serde_json::from_value(request.params)?;
-                    let path = path_from_uri(&text_document.uri)?;
-                    let range = self.range(&text_document.uri, range)?;
-                    self.handle_response(
-                        request.id,
-                        self.server.code_action(path, range, &self.context),
-                    )?;
-                }
-                lsp::request::CodeActionResolveRequest::METHOD => {
-                    let action: lsp::CodeAction = serde_json::from_value(request.params)?;
-                    self.handle_response(
-                        request.id,
-                        self.server.code_action_resolve(action, &self.context),
-                    )?;
-                }
-                lsp::request::Shutdown::METHOD => {
-                    self.handle_response(request.id, Ok(Value::Null))?;
-                }
-                _ => {
-                    self.context
-                        .logger()
-                        .error(format!("Unknown request: {}", request.method));
-                }
-            },
+    fn dispatch(&mut self, method: &str, params: Value) -> Result<Value, ResponseError> {
+        if self.shutdown {
+            return Err(response_error(
+                ErrorCode::InvalidRequest,
+                "Server is shut down",
+            ));
+        }
+        match method {
+            lsp::request::HoverRequest::METHOD => {
+                let lsp::HoverParams {
+                    text_document_position_params: params,
+                    ..
+                } = serde_json::from_value(params).map_err(invalid_params)?;
+                let doc = self
+                    .document_location(&params.text_document.uri, params.position)
+                    .map_err(invalid_params)?;
+                response_value(self.server.hover(doc, &self.context))
+            }
+            lsp::request::Completion::METHOD => {
+                let lsp::CompletionParams {
+                    text_document_position: params,
+                    ..
+                } = serde_json::from_value(params).map_err(invalid_params)?;
+                let doc = self
+                    .document_location(&params.text_document.uri, params.position)
+                    .map_err(invalid_params)?;
+                let completion = self.server.completion(doc, &self.context);
+                response_value(completion.as_deref().map_err(|err| anyhow!("{err}")))
+            }
+            lsp::request::GotoDefinition::METHOD => {
+                let lsp::GotoDefinitionParams {
+                    text_document_position_params: params,
+                    ..
+                } = serde_json::from_value(params).map_err(invalid_params)?;
+                let doc = self
+                    .document_location(&params.text_document.uri, params.position)
+                    .map_err(invalid_params)?;
+                response_value(self.server.goto_definition(doc, &self.context))
+            }
+            lsp::request::WorkspaceSymbolRequest::METHOD => {
+                let lsp::WorkspaceSymbolParams { query, .. } =
+                    serde_json::from_value(params).map_err(invalid_params)?;
+                response_value(self.server.workspace_symbol(&query, &self.context))
+            }
+            lsp::request::Formatting::METHOD => {
+                let lsp::DocumentFormattingParams {
+                    text_document,
+                    options,
+                    ..
+                } = serde_json::from_value(params).map_err(invalid_params)?;
+                let doc = self.document(&text_document.uri).map_err(invalid_params)?;
+                response_value(
+                    self.server
+                        .format(doc, options.tab_size as u16, &self.context),
+                )
+            }
+            lsp::request::CodeActionRequest::METHOD => {
+                let lsp::CodeActionParams {
+                    text_document,
+                    range,
+                    ..
+                } = serde_json::from_value(params).map_err(invalid_params)?;
+                let path = path_from_uri(&text_document.uri).map_err(invalid_params)?;
+                let range = self
+                    .range(&text_document.uri, range)
+                    .map_err(invalid_params)?;
+                response_value(self.server.code_action(path, range, &self.context))
+            }
+            lsp::request::CodeActionResolveRequest::METHOD => {
+                let action = serde_json::from_value(params).map_err(invalid_params)?;
+                response_value(self.server.code_action_resolve(action, &self.context))
+            }
+            lsp::request::Shutdown::METHOD => {
+                let () = serde_json::from_value(params).map_err(invalid_params)?;
+                self.shutdown = true;
+                Ok(Value::Null)
+            }
+            _ => Err(response_error(
+                ErrorCode::MethodNotFound,
+                format!("Unknown request: {method}"),
+            )),
+        }
+    }
 
+    fn handle(&mut self, message: Message) -> anyhow::Result<()> {
+        match message {
+            Message::Request(request) => {
+                let result = self.dispatch(&request.method, request.params);
+                let (result, error) = match result {
+                    Ok(value) => (Some(value), None),
+                    Err(error) => (None, Some(error)),
+                };
+                self.connection.sender.send(Message::Response(Response {
+                    id: request.id,
+                    result,
+                    error,
+                }))?;
+            }
+            Message::Notification(_) if self.shutdown => return Ok(()),
             Message::Notification(notif) => match notif.method.as_str() {
                 lsp::notification::Initialized::METHOD => {}
                 lsp::notification::DidSaveTextDocument::METHOD => {
@@ -284,9 +306,7 @@ impl LspServer<'_> {
                     self.server
                         .change_workspace_folders(added, removed, &self.context)?;
                 }
-                lsp::notification::Exit::METHOD => {
-                    return Ok(true);
-                }
+
                 _ => {
                     self.context.logger().info(format!(
                         "Received an unexpected notification: {}",
@@ -311,31 +331,9 @@ impl LspServer<'_> {
                     .info(format!("Received an unexpected response: {}", response.id));
             }
         };
-        self.update_watchers()?;
-        Ok(false)
-    }
-
-    fn handle_response<R: Serialize>(
-        &self,
-        id: RequestId,
-        res: anyhow::Result<R>,
-    ) -> anyhow::Result<()> {
-        match res {
-            Ok(resp) => self.connection.sender.send(Message::Response(Response {
-                id,
-                result: Some(serde_json::to_value(&resp)?),
-                error: None,
-            }))?,
-            Err(err) => self.connection.sender.send(Message::Response(Response {
-                id,
-                result: None,
-                error: Some(ResponseError {
-                    code: ErrorCode::InternalError as i32,
-                    message: err.to_string(),
-                    data: None,
-                }),
-            }))?,
-        };
+        if !self.shutdown {
+            self.update_watchers()?;
+        }
         Ok(())
     }
 
@@ -370,6 +368,24 @@ impl LspServer<'_> {
             .context("end position not found")?;
         Ok(start..end)
     }
+}
+
+fn response_error(code: ErrorCode, message: impl Display) -> ResponseError {
+    ResponseError {
+        code: code as i32,
+        message: message.to_string(),
+        data: None,
+    }
+}
+
+fn invalid_params(error: impl Display) -> ResponseError {
+    response_error(ErrorCode::InvalidParams, error)
+}
+
+fn response_value<R: Serialize>(result: anyhow::Result<R>) -> Result<Value, ResponseError> {
+    result
+        .and_then(|value| Ok(serde_json::to_value(value)?))
+        .map_err(|err| response_error(ErrorCode::InternalError, err))
 }
 
 pub trait LanguageServer {
@@ -628,7 +644,352 @@ fn capabilities() -> lsp::ServerCapabilities {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    struct StubServer;
+
+    impl LanguageServer for StubServer {
+        fn watch_roots(&self) -> Vec<PathBuf> {
+            vec![]
+        }
+
+        fn document_changed(
+            &mut self,
+            _path: PathBuf,
+            _buffer: Option<&Buffer>,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<()> {
+            panic!("unexpected document change");
+        }
+
+        fn files_changed(&mut self, _paths: Vec<PathBuf>, _ctx: &LspContext) -> anyhow::Result<()> {
+            panic!("unexpected file change");
+        }
+
+        fn check(&mut self, _path: PathBuf, _ctx: &LspContext) -> anyhow::Result<()> {
+            panic!("unexpected check");
+        }
+
+        fn change_workspace_folders(
+            &mut self,
+            _added: Vec<PathBuf>,
+            _removed: Vec<PathBuf>,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<()> {
+            panic!("unexpected workspace change");
+        }
+
+        fn hover(&self, _doc: CodeLocation<'_>, _ctx: &LspContext) -> anyhow::Result<lsp::Hover> {
+            bail!("stub handler failed");
+        }
+
+        fn completion(
+            &self,
+            _doc: CodeLocation<'_>,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<Rc<lsp::CompletionResponse>> {
+            Ok(Rc::new(lsp::CompletionResponse::Array(vec![])))
+        }
+
+        fn goto_definition(
+            &self,
+            _doc: CodeLocation<'_>,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<lsp::GotoDefinitionResponse> {
+            Ok(lsp::GotoDefinitionResponse::Array(vec![]))
+        }
+
+        fn workspace_symbol(
+            &self,
+            _query: &str,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<lsp::WorkspaceSymbolResponse> {
+            Ok(lsp::WorkspaceSymbolResponse::Flat(vec![]))
+        }
+
+        fn format(
+            &self,
+            _doc: Document<'_>,
+            _tab_size: u16,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<Vec<lsp::TextEdit>> {
+            Ok(vec![])
+        }
+
+        fn code_action(
+            &self,
+            _path: PathBuf,
+            _span: Range<u32>,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<lsp::CodeActionResponse> {
+            Ok(vec![])
+        }
+
+        fn code_action_resolve(
+            &self,
+            action: lsp::CodeAction,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<lsp::CodeAction> {
+            Ok(action)
+        }
+    }
+
+    fn memory_server() -> (LspServer<'static>, Connection) {
+        let (connection, client) = Connection::memory();
+        let context = LspContext::new(connection.sender.clone());
+        let mut buffers = Buffers::default();
+        buffers.open("file:///C:/test.reds".parse().unwrap(), "é😀test".into(), 1);
+        (
+            LspServer {
+                connection,
+                server: Box::new(StubServer),
+                buffers,
+                context,
+                watch_files: false,
+                watched_roots: vec![],
+                shutdown: false,
+            },
+            client,
+        )
+    }
+
+    fn send_request(client: &Connection, id: i32, method: &str, params: Value) {
+        client
+            .sender
+            .send(Message::Request(lsp_server::Request::new(
+                id.into(),
+                method.into(),
+                params,
+            )))
+            .unwrap();
+    }
+
+    fn send_exit(client: &Connection) {
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::Exit::METHOD.into(),
+                Value::Null,
+            )))
+            .unwrap();
+    }
+
+    fn receive_response(client: &Connection, id: i32) -> Response {
+        let Message::Response(response) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+        else {
+            panic!("expected response");
+        };
+        assert_eq!(response.id, RequestId::from(id));
+        assert_ne!(response.result.is_some(), response.error.is_some());
+        response
+    }
+
+    #[test]
+    fn requests_receive_exactly_one_response() {
+        let (mut server, client) = memory_server();
+        let location = |uri: &str, line, character| json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } });
+        let cases = [
+            (
+                lsp::request::HoverRequest::METHOD,
+                json!({}),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::Completion::METHOD,
+                Value::Null,
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::GotoDefinition::METHOD,
+                json!([]),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::WorkspaceSymbolRequest::METHOD,
+                json!({ "query": 1 }),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::Formatting::METHOD,
+                json!({}),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::CodeActionRequest::METHOD,
+                json!({}),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::CodeActionResolveRequest::METHOD,
+                json!({}),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::Shutdown::METHOD,
+                json!({}),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::HoverRequest::METHOD,
+                location("file:///C:/missing.reds", 0, 0),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::HoverRequest::METHOD,
+                location("https://example.com/test.reds", 0, 0),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::HoverRequest::METHOD,
+                location("file:///C:/test.reds", 9, 0),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::HoverRequest::METHOD,
+                location("file:///C:/test.reds", 0, 2),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::Formatting::METHOD,
+                json!({ "textDocument": { "uri": "file:///C:/missing.reds" }, "options": { "tabSize": 4, "insertSpaces": true } }),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::CodeActionRequest::METHOD,
+                json!({ "textDocument": { "uri": "file:///C:/test.reds" }, "range": { "start": { "line": 9, "character": 0 }, "end": { "line": 9, "character": 1 } }, "context": { "diagnostics": [] } }),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                lsp::request::CodeActionRequest::METHOD,
+                json!({ "textDocument": { "uri": "file:///C:/test.reds" }, "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 2 } }, "context": { "diagnostics": [] } }),
+                ErrorCode::InvalidParams,
+            ),
+            ("unknown/method", Value::Null, ErrorCode::MethodNotFound),
+            (
+                lsp::request::HoverRequest::METHOD,
+                location("file:///C:/test.reds", 0, 3),
+                ErrorCode::InternalError,
+            ),
+        ];
+        for (id, (method, params, _)) in cases.iter().enumerate() {
+            send_request(&client, id as i32, method, params.clone());
+        }
+        let success_id = cases.len() as i32;
+        send_request(
+            &client,
+            success_id,
+            lsp::request::WorkspaceSymbolRequest::METHOD,
+            json!({ "query": "" }),
+        );
+        send_request(
+            &client,
+            success_id + 1,
+            lsp::request::Shutdown::METHOD,
+            Value::Null,
+        );
+        send_exit(&client);
+        server.run().unwrap();
+
+        for (id, (_, _, code)) in cases.into_iter().enumerate() {
+            let error = receive_response(&client, id as i32).error.unwrap();
+            assert_eq!(error.code, code as i32);
+            assert!(!error.message.is_empty());
+        }
+        assert_eq!(
+            receive_response(&client, success_id).result,
+            Some(json!([]))
+        );
+        assert_eq!(
+            receive_response(&client, success_id + 1).result,
+            Some(Value::Null)
+        );
+        assert!(client.receiver.try_recv().is_err(), "duplicate response");
+    }
+
+    #[test]
+    fn shutdown_rejects_requests_and_ignores_notifications() {
+        let (mut server, client) = memory_server();
+        send_request(&client, 0, lsp::request::Shutdown::METHOD, Value::Null);
+        for (id, method) in [
+            lsp::request::Shutdown::METHOD,
+            lsp::request::HoverRequest::METHOD,
+            "unknown/method",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            send_request(&client, id as i32 + 1, method, Value::Null);
+        }
+        for (method, params) in [
+            (
+                lsp::notification::DidOpenTextDocument::METHOD,
+                json!({ "textDocument": { "uri": "file:///C:/ignored.reds", "languageId": "redscript", "version": 1, "text": "ignored" } }),
+            ),
+            (
+                lsp::notification::DidChangeConfiguration::METHOD,
+                json!({ "settings": {} }),
+            ),
+            (lsp::notification::DidSaveTextDocument::METHOD, Value::Null),
+        ] {
+            client
+                .sender
+                .send(Message::Notification(lsp_server::Notification::new(
+                    method.into(),
+                    params,
+                )))
+                .unwrap();
+        }
+        send_exit(&client);
+        server.run().unwrap();
+        assert_eq!(receive_response(&client, 0).result, Some(Value::Null));
+        for id in 1..=3 {
+            assert_eq!(
+                receive_response(&client, id).error.unwrap().code,
+                ErrorCode::InvalidRequest as i32
+            );
+        }
+        assert!(
+            server
+                .buffers
+                .get(&"file:///C:/ignored.reds".parse().unwrap())
+                .is_none()
+        );
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn exit_without_shutdown_fails() {
+        let (mut server, client) = memory_server();
+        send_exit(&client);
+        assert!(
+            server
+                .run()
+                .unwrap_err()
+                .to_string()
+                .contains("before shutdown")
+        );
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn disconnected_receiver_stops() {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let thread = std::thread::spawn(move || {
+            let (mut server, client) = memory_server();
+            drop(client);
+            sender.send(server.run()).unwrap();
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        thread.join().unwrap();
+    }
 
     #[test]
     fn test_uri_from_windows_path() {
