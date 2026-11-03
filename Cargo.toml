@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+ignore = "0.4"
 hashbrown = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -17,27 +18,28 @@ mimalloc = { version = "0.1", features = ["v3"] }
 lsp-server = "0.7"
 lsp-types = "0.97"
 
-[dependencies.redscript-parser]
-git = "https://github.com/jac3km4/redscript"
-rev = "8671afb"
 
-[dependencies.redscript-formatter]
-git = "https://github.com/jac3km4/redscript"
-rev = "8671afb"
+[dependencies.redscript-redmod-formatter]
+path = "../redscript/crates/syntax/redmod/formatter"
+
+[dependencies.redscript-redmod-adapter]
+path = "../redscript/crates/compiler/redmod/adapter"
+
+[dependencies.redscript-community-formatter]
+path = "../redscript/crates/syntax/community/formatter"
 
 [dependencies.redscript-compiler-api]
-git = "https://github.com/jac3km4/redscript"
-rev = "8671afb"
-features = ["ignore"]
+path = "../redscript/crates/compiler/api"
 
 [dependencies.redscript-dotfile]
-git = "https://github.com/jac3km4/redscript"
-rev = "8671afb"
+path = "../redscript/crates/dotfile"
 
 [dependencies.redscript-code-edit]
-git = "https://github.com/jac3km4/redscript"
-rev = "8671afb"
+path = "../redscript/crates/code-edit"
 
+[dev-dependencies]
+tempfile = "3"
+redscript-compiler-frontend = { path = "../redscript/crates/compiler/frontend" }
 
 [patch.crates-io]
 stable_deref_trait = { git = "https://github.com/Storyyeller/stable_deref_trait", rev = "59a35e0" }

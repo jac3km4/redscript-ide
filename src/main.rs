@@ -8,6 +8,7 @@ use server::LspServer;
 
 mod buffers;
 mod completions;
+mod dialect;
 mod display;
 mod ls;
 mod positions;

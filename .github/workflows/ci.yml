@@ -15,9 +15,20 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: jac3km4/redscript
+          ref: ${{ vars.REDSCRIPT_REF || '1.0.x' }}
+          path: compiler-checkout
+      - shell: bash
+        run: mv compiler-checkout ../redscript
       - run: rustup toolchain install stable --profile minimal --component clippy --no-self-update
+      - run: rustup toolchain install nightly-2026-10-15 --profile minimal --component rustfmt --no-self-update
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -- -Dwarnings
+      - run: cargo +nightly-2026-10-15 fmt --package redscript-ide -- --check
+      - run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo +stable test --workspace --all-features --locked
+      - run: cargo +stable doc --workspace --all-features --no-deps --locked
 
   build:
     name: Build and upload an artifact for ${{ matrix.name }}

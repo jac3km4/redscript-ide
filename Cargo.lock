@@ -266,6 +266,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -301,6 +317,17 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi",
+]
 
 [[package]]
 name = "globset"
@@ -424,6 +451,12 @@ dependencies = [
  "cc",
  "libc",
 ]
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "log"
@@ -600,21 +633,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "redscript-ast"
-version = "1.0.0-preview.22"
-source = "git+https://github.com/jac3km4/redscript?rev=8671afb#8671afbe320a45c17cd0f68d53b58c7f55d013a5"
-dependencies = [
- "bitflags 2.11.0",
- "chumsky",
- "derive-where",
- "elsa",
- "ignore",
-]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "redscript-code-edit"
 version = "1.0.0-preview.22"
-source = "git+https://github.com/jac3km4/redscript?rev=8671afb#8671afbe320a45c17cd0f68d53b58c7f55d013a5"
 dependencies = [
  "anyhow",
  "mimalloc",
@@ -622,24 +648,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "redscript-community-ast"
+version = "1.0.0-preview.22"
+dependencies = [
+ "bitflags 2.11.0",
+ "chumsky",
+ "derive-where",
+ "elsa",
+ "unicode-width",
+]
+
+[[package]]
+name = "redscript-community-formatter"
+version = "1.0.0-preview.22"
+dependencies = [
+ "hashbrown 0.17.0",
+ "pretty_dtoa",
+ "redscript-community-ast",
+ "redscript-community-parser",
+]
+
+[[package]]
+name = "redscript-community-parser"
+version = "1.0.0-preview.22"
+dependencies = [
+ "chumsky",
+ "redscript-community-ast",
+]
+
+[[package]]
 name = "redscript-compiler-api"
 version = "1.0.0-preview.22"
-source = "git+https://github.com/jac3km4/redscript?rev=8671afb#8671afbe320a45c17cd0f68d53b58c7f55d013a5"
 dependencies = [
  "bon",
  "log",
- "redscript-ast",
+ "redscript-community-ast",
+ "redscript-community-parser",
  "redscript-compiler-backend",
  "redscript-compiler-frontend",
  "redscript-io",
- "redscript-parser",
  "thiserror",
 ]
 
 [[package]]
 name = "redscript-compiler-backend"
 version = "1.0.0-preview.22"
-source = "git+https://github.com/jac3km4/redscript?rev=8671afb#8671afbe320a45c17cd0f68d53b58c7f55d013a5"
 dependencies = [
  "bitfield-struct",
  "bon",
@@ -656,7 +709,6 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-frontend"
 version = "1.0.0-preview.22"
-source = "git+https://github.com/jac3km4/redscript?rev=8671afb#8671afbe320a45c17cd0f68d53b58c7f55d013a5"
 dependencies = [
  "bitfield-struct",
  "bon",
@@ -666,8 +718,8 @@ dependencies = [
  "identity-hash",
  "indexmap",
  "paste",
- "redscript-ast",
- "redscript-parser",
+ "redscript-community-ast",
+ "redscript-community-parser",
  "sequence_trie",
  "slab",
  "smallvec",
@@ -677,24 +729,12 @@ dependencies = [
 [[package]]
 name = "redscript-dotfile"
 version = "1.0.0-preview.22"
-source = "git+https://github.com/jac3km4/redscript?rev=8671afb#8671afbe320a45c17cd0f68d53b58c7f55d013a5"
 dependencies = [
  "anyhow",
  "hashbrown 0.17.0",
  "leon",
  "serde",
  "toml",
-]
-
-[[package]]
-name = "redscript-formatter"
-version = "1.0.0-preview.22"
-source = "git+https://github.com/jac3km4/redscript?rev=8671afb#8671afbe320a45c17cd0f68d53b58c7f55d013a5"
-dependencies = [
- "hashbrown 0.17.0",
- "pretty_dtoa",
- "redscript-ast",
- "redscript-parser",
 ]
 
 [[package]]
@@ -705,25 +745,28 @@ dependencies = [
  "crossbeam-channel",
  "fluent-uri 0.3.2",
  "hashbrown 0.17.0",
+ "ignore",
  "lsp-server",
  "lsp-types",
  "mimalloc",
  "ouroboros",
  "redscript-code-edit",
+ "redscript-community-formatter",
  "redscript-compiler-api",
+ "redscript-compiler-frontend",
  "redscript-dotfile",
- "redscript-formatter",
- "redscript-parser",
+ "redscript-redmod-adapter",
+ "redscript-redmod-formatter",
  "ropey",
  "serde",
  "serde_json",
+ "tempfile",
  "toml",
 ]
 
 [[package]]
 name = "redscript-io"
 version = "1.0.0-preview.22"
-source = "git+https://github.com/jac3km4/redscript?rev=8671afb#8671afbe320a45c17cd0f68d53b58c7f55d013a5"
 dependencies = [
  "bitfield-struct",
  "byte",
@@ -735,12 +778,38 @@ dependencies = [
 ]
 
 [[package]]
-name = "redscript-parser"
+name = "redscript-redmod-adapter"
 version = "1.0.0-preview.22"
-source = "git+https://github.com/jac3km4/redscript?rev=8671afb#8671afbe320a45c17cd0f68d53b58c7f55d013a5"
+dependencies = [
+ "redscript-community-ast",
+ "redscript-compiler-frontend",
+ "redscript-redmod-ast",
+ "redscript-redmod-parser",
+]
+
+[[package]]
+name = "redscript-redmod-ast"
+version = "1.0.0-preview.22"
+dependencies = [
+ "redscript-community-ast",
+]
+
+[[package]]
+name = "redscript-redmod-formatter"
+version = "1.0.0-preview.22"
+dependencies = [
+ "redscript-redmod-ast",
+ "redscript-redmod-parser",
+]
+
+[[package]]
+name = "redscript-redmod-parser"
+version = "1.0.0-preview.22"
 dependencies = [
  "chumsky",
- "redscript-ast",
+ "redscript-community-ast",
+ "redscript-community-parser",
+ "redscript-redmod-ast",
 ]
 
 [[package]]
@@ -805,6 +874,19 @@ checksum = "93411e420bcd1a75ddd1dc3caf18c23155eda2c090631a85af21ba19e97093b5"
 dependencies = [
  "smallvec",
  "str_indices",
+]
+
+[[package]]
+name = "rustix"
+version = "1.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
+dependencies = [
+ "bitflags 2.11.0",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -969,6 +1051,19 @@ name = "system_error"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b52ada790ecca61aa8e561eba96355deb41b9b1b796dd3c965e74a590e9734a3"
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "thiserror"

@@ -3,25 +3,25 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::{fmt, fs, iter, mem};
+use std::{fmt, fs};
 
 use anyhow::Context;
 use hashbrown::{HashMap, HashSet};
 use lsp_types::{self as lsp};
 use ouroboros::self_referencing;
 use redscript_code_edit::{CodeEdit, TextEdit};
+use redscript_community_formatter::{FormatSettings, format_document};
 use redscript_compiler_api::ast::Span;
 use redscript_compiler_api::pass::{DiagnosticPass, UnusedLocals};
 use redscript_compiler_api::{
-    CompilationInputs, CompileErrorReporter, Diagnostic, Evaluator, LoweredCompilationUnit,
-    ScriptBundle, SourceMapExt, Symbols, TypeFlagRegistry, TypeInterner, TypeSchema, ast,
-    infer_from_sources, parse_file, parse_files, process_sources,
+    CompilationInputs, CompileErrorReporter, Diagnostic, LoweredCompilationUnit, ScriptBundle,
+    SourceMapExt, Symbols, TypeFlagRegistry, TypeInterner, TypeSchema, ast,
 };
 use redscript_dotfile::Dotfile;
-use redscript_formatter::{FormatSettings, format_document};
 use serde::{Deserialize, Serialize};
 
 use crate::completions;
+use crate::dialect::{self, Dialect, ParsedSources};
 use crate::query::{AtContext, ExprAt};
 use crate::server::{CodeLocation, Document, LanguageServer, LspContext};
 
@@ -32,9 +32,11 @@ type FixMap = HashMap<PathBuf, BTreeMap<(u32, u32), Fix>>;
 pub struct RedscriptLanguageServer {
     workspaces: HashMap<PathBuf, WorkspaceDir>,
     compilation_cache: CompilationCache,
-    cached_completions: RefCell<Option<CachedCompletions>>,
     cached_fixes: RefCell<FixMap>,
     last_published_files: RefCell<HashSet<PathBuf>>,
+    overlays: HashMap<PathBuf, Overlay>,
+    standalone: HashMap<PathBuf, CompilationCache>,
+    generation: u64,
 }
 
 impl RedscriptLanguageServer {
@@ -59,19 +61,145 @@ impl RedscriptLanguageServer {
                 TypeInterner::default(),
             )?,
             workspaces,
-            cached_completions: RefCell::new(None),
             cached_fixes: RefCell::new(HashMap::new()),
             last_published_files: RefCell::new(HashSet::new()),
+            overlays: HashMap::new(),
+            standalone: HashMap::new(),
+            generation: 0,
         })
     }
 
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+
+        self.cached_fixes.borrow_mut().clear();
+    }
+
+    fn make_snapshot(
+        &self,
+        roots: impl IntoIterator<Item = PathBuf>,
+    ) -> anyhow::Result<CompilationCache> {
+        let sources = ast::SourceMap::new();
+        let mut files: std::collections::BTreeMap<_, _> = dialect::discover(roots)?
+            .into_iter()
+            .map(|path| {
+                let text = self
+                    .overlays
+                    .get(&path)
+                    .map(|overlay| Ok(overlay.text.clone()))
+                    .unwrap_or_else(|| fs::read_to_string(&path));
+                text.map(|text| (path, text))
+            })
+            .collect::<Result<_, _>>()?;
+        // Unsaved new files are absent from discovery but still own an active module.
+        for (path, overlay) in &self.overlays {
+            if self.resolve_file(path).as_workspace().is_some() {
+                files.insert(path.clone(), overlay.text.clone());
+            }
+        }
+        for (path, text) in files {
+            sources.push_back(path, text);
+        }
+        CompilationCache::from_sources(
+            self.compilation_cache.borrow_cache_bytes().clone(),
+            sources,
+            TypeInterner::default(),
+        )
+    }
+
+    fn rebuild(&mut self, ctx: &LspContext) -> anyhow::Result<()> {
+        self.invalidate();
+        let workspace = self.make_snapshot(
+            self.workspaces
+                .values()
+                .flat_map(|workspace| workspace.roots.clone()),
+        )?;
+        let paths: HashSet<_> = self
+            .standalone
+            .keys()
+            .chain(self.overlays.keys())
+            .filter(|path| self.resolve_file(path).as_workspace().is_none())
+            .cloned()
+            .collect();
+        let mut standalone = HashMap::new();
+        for path in paths {
+            let text = self
+                .overlays
+                .get(&path)
+                .map(|overlay| Ok(overlay.text.clone()))
+                .unwrap_or_else(|| fs::read_to_string(&path));
+            match text {
+                Ok(text) => {
+                    let sources = ast::SourceMap::new();
+                    sources.push_back(&path, text);
+                    standalone.insert(
+                        path,
+                        CompilationCache::from_sources(
+                            self.compilation_cache.borrow_cache_bytes().clone(),
+                            sources,
+                            TypeInterner::default(),
+                        )?,
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.compilation_cache = workspace;
+        self.standalone = standalone;
+        self.check_workspace_and_publish(ctx)?;
+        for cache in self.standalone.values() {
+            cache.analyze(|_, symbols, diagnostics, sources| {
+                self.publish_diagnostics(diagnostics, symbols, sources, ctx)
+            })?;
+        }
+        // Also clear removed folders, deleted files and closed unsaved standalone files.
+        let active: HashSet<_> = self
+            .compilation_cache
+            .borrow_file_ids()
+            .keys()
+            .chain(self.standalone.keys())
+            .cloned()
+            .collect();
+        let stale: Vec<_> = self
+            .last_published_files
+            .borrow()
+            .difference(&active)
+            .cloned()
+            .collect();
+        for path in stale {
+            ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
+                uri: ctx.uri(&path)?,
+                diagnostics: vec![],
+                version: None,
+            });
+            self.last_published_files.borrow_mut().remove(&path);
+        }
+        Ok(())
+    }
+
     fn resolve_file(&self, path: &Path) -> FileResolution<'_> {
-        if let Some(workspace) =
-            iter::successors(Some(path), |p| p.parent()).find_map(|p| self.workspaces.get(p))
+        let path = dialect::identity(path);
+        if let Some((_, _, workspace)) = self
+            .workspaces
+            .iter()
+            .flat_map(|(owner, workspace)| {
+                workspace
+                    .roots
+                    .iter()
+                    .map(move |root| (root, owner, workspace))
+            })
+            .filter(|(root, _, _)| path.starts_with(root))
+            .max_by(|(a, owner_a, _), (b, owner_b, _)| {
+                a.components()
+                    .count()
+                    .cmp(&b.components().count())
+                    .then_with(|| owner_b.cmp(owner_a))
+            })
         {
             FileResolution::Workspace(workspace)
         } else {
-            FileResolution::NonWorkspace(path.to_owned())
+            FileResolution::NonWorkspace
         }
     }
 
@@ -100,40 +228,18 @@ impl RedscriptLanguageServer {
         loc: CodeLocation<'_>,
         ctx: &LspContext,
     ) -> anyhow::Result<Rc<lsp::CompletionResponse>> {
-        let preceding_pos = loc.pos() - 1;
-
-        let byte = loc.doc().buffer().contents().byte(preceding_pos as usize);
-
-        if let Some(cached) = &mut *self.cached_completions.borrow_mut()
-            && cached.file == loc.doc().path()
-            && loc.pos().saturating_sub(cached.pos) <= 1
-            && (byte == b'_' || byte.is_ascii_alphanumeric())
-        {
-            cached.pos = loc.pos();
-            return Ok(cached.completions.clone());
-        };
-
-        if byte != b'.' {
+        let contents = loc.doc().buffer().contents().to_string();
+        let Some(member) = member_completion_range(&contents, loc.pos()) else {
             return Ok(Rc::new(lsp::CompletionResponse::Array(vec![])));
-        }
-
-        let completions = self.patched_expr_at(
-            loc.clone().with_pos(preceding_pos),
-            generate_completions,
+        };
+        let dialect = Dialect::of(loc.doc().path());
+        let completions = self.expr_at_with(
+            loc.with_pos(member.start as u32),
+            Some(member),
+            |at| generate_completions(at, dialect),
             ctx,
         )?;
-
-        if !completions.is_empty() {
-            let resp = Rc::new(lsp::CompletionResponse::Array(completions));
-            *self.cached_completions.borrow_mut() = Some(CachedCompletions::new(
-                resp.clone(),
-                loc.doc().path().to_owned(),
-                loc.pos(),
-            ));
-            Ok(resp)
-        } else {
-            Ok(Rc::new(lsp::CompletionResponse::Array(vec![])))
-        }
+        Ok(Rc::new(lsp::CompletionResponse::Array(completions)))
     }
 
     fn definition_at(
@@ -201,6 +307,9 @@ impl RedscriptLanguageServer {
         doc: Document<'_>,
         _tab_size: u16,
     ) -> anyhow::Result<Vec<lsp::TextEdit>> {
+        let Some(dialect) = Dialect::of(doc.path()) else {
+            return Ok(vec![]);
+        };
         let resolved = self.resolve_file(doc.path());
         let settings = resolved
             .as_workspace()
@@ -212,16 +321,22 @@ impl RedscriptLanguageServer {
         let id = map.push_back(doc.path(), contents.to_string());
         let file = map.get(id).context("missing source file")?;
 
-        let (module, errors) = format_document(file.source(), id, settings);
-        if let Some(module) = module
-            && errors.is_empty()
+        let formatted = match dialect {
+            Dialect::Redmod => redscript_redmod_formatter::format_source(file.source(), id).ok(),
+            Dialect::Community => {
+                let (module, errors) = format_document(file.source(), id, settings);
+                module
+                    .filter(|_| errors.is_empty())
+                    .map(|module| module.to_string())
+            }
+        };
+        if let Some(formatted) = formatted
+            && formatted != file.source()
         {
             let end = crate::positions::position(file.source(), file.source().len() as u32)
                 .context("invalid document end")?;
-            let edit = lsp::TextEdit::new(
-                lsp::Range::new(lsp::Position::new(0, 0), end),
-                module.to_string(),
-            );
+            let edit =
+                lsp::TextEdit::new(lsp::Range::new(lsp::Position::new(0, 0), end), formatted);
             return Ok(vec![edit]);
         };
 
@@ -234,11 +349,16 @@ impl RedscriptLanguageServer {
         span: Range<u32>,
         _ctx: &LspContext,
     ) -> anyhow::Result<lsp::CodeActionResponse> {
+        if Dialect::of(&path) != Some(Dialect::Community) {
+            return Ok(vec![]);
+        }
+        let path = dialect::identity(&path);
         let fixes = self.cached_fixes.borrow();
 
         if let Some(fixes) = fixes.get(&path)
             && let Some((&(start, end), fix)) = fixes.range(..(span.start, span.end)).last()
             && (start..end).contains(&span.start)
+            && self.valid_fix(fix)
         {
             let fix_one = lsp::CodeAction {
                 title: fix.kind.to_string(),
@@ -251,7 +371,10 @@ impl RedscriptLanguageServer {
             let fix_all = lsp::CodeAction {
                 title: format!("{} - fix all in the workspace", fix.kind),
                 kind: Some(lsp::CodeActionKind::REFACTOR_REWRITE),
-                data: Some(serde_json::to_value(FixRequest::FixAll(fix.kind))?),
+                data: Some(serde_json::to_value(FixRequest::FixAll(
+                    fix.kind,
+                    self.generation,
+                ))?),
                 ..Default::default()
             };
 
@@ -275,14 +398,12 @@ impl RedscriptLanguageServer {
 
         let request: FixRequest = serde_json::from_value(data)?;
         let action = match request {
-            FixRequest::FixOne(fix) => lsp::CodeAction {
+            FixRequest::FixOne(fix) if self.valid_fix(&fix) => lsp::CodeAction {
                 title: fix.kind.to_string(),
-                edit: Some(lsp::WorkspaceEdit::new(
-                    [(fix.uri, vec![fix.edit])].into_iter().collect(),
-                )),
+                edit: Some(self.workspace_edit(vec![(fix.uri, vec![fix.edit])])),
                 ..Default::default()
             },
-            FixRequest::FixAll(kind) => {
+            FixRequest::FixAll(kind, generation) if generation == self.generation => {
                 let mut unique = HashSet::<(lsp::Uri, lsp::Range)>::new();
 
                 #[allow(clippy::mutable_key_type)]
@@ -292,7 +413,7 @@ impl RedscriptLanguageServer {
                     .borrow()
                     .values()
                     .flat_map(|f| f.iter())
-                    .filter(|(_, f)| f.kind == kind)
+                    .filter(|(_, f)| f.kind == kind && self.valid_fix(f))
                 {
                     if unique.insert((fix.uri.clone(), fix.edit.range)) {
                         edits
@@ -304,12 +425,60 @@ impl RedscriptLanguageServer {
 
                 lsp::CodeAction {
                     title: kind.to_string(),
-                    edit: Some(lsp::WorkspaceEdit::new(edits)),
+                    edit: Some(self.workspace_edit(edits.into_iter().collect())),
                     ..Default::default()
                 }
             }
+            _ => lsp::CodeAction {
+                title: action.title,
+                disabled: Some(lsp::CodeActionDisabled {
+                    reason: "This fix is stale or targets an unsupported dialect".into(),
+                }),
+                ..Default::default()
+            },
         };
         Ok(action)
+    }
+
+    fn workspace_edit(&self, edits: Vec<(lsp::Uri, Vec<lsp::TextEdit>)>) -> lsp::WorkspaceEdit {
+        let mut edits = edits;
+        edits.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+        lsp::WorkspaceEdit {
+            document_changes: Some(lsp::DocumentChanges::Edits(
+                edits
+                    .into_iter()
+                    .map(|(uri, edits)| {
+                        let version = crate::server::path_from_uri(&uri)
+                            .ok()
+                            .and_then(|path| self.overlays.get(&dialect::identity(&path)))
+                            .map(|overlay| overlay.version);
+                        lsp::TextDocumentEdit {
+                            text_document: lsp::OptionalVersionedTextDocumentIdentifier {
+                                uri,
+                                version,
+                            },
+                            edits: edits.into_iter().map(lsp::OneOf::Left).collect(),
+                        }
+                    })
+                    .collect(),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn valid_fix(&self, fix: &Fix) -> bool {
+        let Ok(path) = crate::server::path_from_uri(&fix.uri) else {
+            return false;
+        };
+        if Dialect::of(&path) != Some(Dialect::Community) || fix.generation != self.generation {
+            return false;
+        }
+        let path = dialect::identity(&path);
+        if let Some(overlay) = self.overlays.get(&path) {
+            overlay.text == fix.expected_source
+        } else {
+            fs::read_to_string(&path).is_ok_and(|text| text == fix.expected_source)
+        }
     }
 
     pub fn check_workspace_and_publish(&self, ctx: &LspContext) -> anyhow::Result<()> {
@@ -323,27 +492,16 @@ impl RedscriptLanguageServer {
         cb: impl for<'ctx> Fn(
             &LoweredCompilationUnit<'ctx>,
             &Symbols<'ctx>,
-            &[Diagnostic<'ctx>],
+            &[&Diagnostic<'ctx>],
             &'ctx ast::SourceMap,
         ) -> anyhow::Result<A>,
     ) -> anyhow::Result<A> {
-        self.compilation_cache.with(|cache| {
-            let mut reporter = CompileErrorReporter::default();
-            let (unit, syms) = infer_from_sources(
-                cache.sources,
-                cache.symbols.clone(),
-                &mut reporter,
-                cache.interner,
-            );
-            unit.run_diagnostics(DIAGNOSTIC_PASSES, &mut reporter);
-
-            cb(&unit, &syms, &reporter.into_reported(), cache.sources)
-        })
+        self.compilation_cache.analyze(cb)
     }
 
     fn publish_diagnostics<'ctx>(
         &self,
-        diags: &[Diagnostic<'ctx>],
+        diags: &[&Diagnostic<'ctx>],
         symbols: &Symbols<'ctx>,
         sources: &'ctx ast::SourceMap,
         ctx: &LspContext,
@@ -353,7 +511,7 @@ impl RedscriptLanguageServer {
             let file = diag.span().file;
             if sources
                 .get(file)
-                .is_some_and(|f| self.resolve_file(f.path()).as_workspace().is_some())
+                .is_some_and(|f| Dialect::of(f.path()).is_some())
             {
                 file_diags.entry(file).or_insert_with(Vec::new).push(diag);
             }
@@ -361,11 +519,13 @@ impl RedscriptLanguageServer {
 
         let mut last_diagnostics = self.last_published_files.borrow_mut();
         let mut fixes = self.cached_fixes.borrow_mut();
-        fixes.clear();
+        for (_, file) in sources.files() {
+            fixes.remove(file.path());
+        }
 
         let mut publications = Vec::new();
         let mut current_files = HashSet::new();
-        for (file, mut diags) in file_diags {
+        for (file, diags) in file_diags {
             let file = sources.get(file).context("missing source file")?;
             let path = file.path();
 
@@ -373,15 +533,28 @@ impl RedscriptLanguageServer {
 
             let slots = fixes.entry_ref(path).or_default();
             for diag in &diags {
-                if let Some(fix) = generate_fix(diag, symbols, sources, ctx) {
+                if Dialect::of(path) == Some(Dialect::Community)
+                    && let Some(mut fix) = generate_fix(diag, symbols, sources, ctx)
+                {
+                    fix.generation = self.generation;
                     let span = diag.span();
                     slots.insert((span.start, span.end), fix);
                 }
             }
 
-            diags.sort_by_cached_key(|diag| {
-                let span = diag.span();
-                (span.start, span.end, diag.code(), diag.to_string())
+            let mut diags: Vec<_> = diags
+                .into_iter()
+                .map(|diag| (diag, diag.to_string()))
+                .collect();
+            diags.sort_by(|(a, message_a), (b, message_b)| {
+                let a_span = a.span();
+                let b_span = b.span();
+                (a_span.start, a_span.end, a.code(), message_a).cmp(&(
+                    b_span.start,
+                    b_span.end,
+                    b.code(),
+                    message_b,
+                ))
             });
             publications.push((
                 path,
@@ -389,7 +562,7 @@ impl RedscriptLanguageServer {
                     uri: ctx.uri(path)?,
                     diagnostics: diags
                         .into_iter()
-                        .filter_map(|diag| {
+                        .filter_map(|(diag, message)| {
                             Some(lsp::Diagnostic {
                                 range: range(diag.span(), file)?,
                                 severity: Some(if diag.is_error() {
@@ -399,7 +572,23 @@ impl RedscriptLanguageServer {
                                 }),
                                 code: Some(lsp::NumberOrString::String(diag.code().into())),
                                 source: Some("redscript".into()),
-                                message: diag.to_string(),
+                                message,
+                                related_information: {
+                                    let related: Vec<_> = diag
+                                        .related_locations()
+                                        .filter_map(|(span, message)| {
+                                            let file = sources.get(span.file)?;
+                                            Some(lsp::DiagnosticRelatedInformation {
+                                                location: lsp::Location {
+                                                    uri: ctx.uri(file.path()).ok()?,
+                                                    range: range(span, file)?,
+                                                },
+                                                message: message.into(),
+                                            })
+                                        })
+                                        .collect();
+                                    (!related.is_empty()).then_some(related)
+                                },
                                 tags: (matches!(diag, Diagnostic::UnusedLocal(_))
                                     && ctx
                                         .supports_diagnostic_tag(lsp::DiagnosticTag::UNNECESSARY))
@@ -408,17 +597,28 @@ impl RedscriptLanguageServer {
                             })
                         })
                         .collect(),
-                    version: None,
+                    version: self.overlays.get(path).map(|overlay| overlay.version),
                 },
             ));
         }
-        for path in last_diagnostics.difference(&current_files) {
+        let analyzed_paths: HashSet<_> = sources
+            .files()
+            .map(|(_, file)| file.path().to_owned())
+            .collect();
+        let is_workspace = sources
+            .files()
+            .any(|(_, file)| self.resolve_file(file.path()).as_workspace().is_some());
+        for path in last_diagnostics.difference(&current_files).filter(|path| {
+            analyzed_paths.contains(*path)
+                || (is_workspace && self.resolve_file(path).as_workspace().is_some())
+                || (!self.overlays.contains_key(*path) && !path.exists())
+        }) {
             publications.push((
                 path.as_path(),
                 lsp::PublishDiagnosticsParams {
                     uri: ctx.uri(path)?,
                     diagnostics: vec![],
-                    version: None,
+                    version: self.overlays.get(path).map(|overlay| overlay.version),
                 },
             ));
         }
@@ -426,7 +626,13 @@ impl RedscriptLanguageServer {
         for (_, params) in publications {
             ctx.notify::<lsp::notification::PublishDiagnostics>(params);
         }
-        *last_diagnostics = current_files;
+
+        last_diagnostics.retain(|path| {
+            !analyzed_paths.contains(path)
+                && !(is_workspace && self.resolve_file(path).as_workspace().is_some())
+                && (path.exists() || self.overlays.contains_key(path))
+        });
+        last_diagnostics.extend(current_files);
         Ok(())
     }
 
@@ -436,45 +642,77 @@ impl RedscriptLanguageServer {
         cb: impl Fn(ExprAt<'_, '_>) -> anyhow::Result<A>,
         ctx: &LspContext,
     ) -> anyhow::Result<A> {
-        self.expr_at_with(loc, false, cb, ctx)
+        self.expr_at_with(loc, None, cb, ctx)
     }
 
+    #[cfg(test)]
     fn patched_expr_at<A>(
         &self,
         loc: CodeLocation<'_>,
         cb: impl Fn(ExprAt<'_, '_>) -> anyhow::Result<A>,
         ctx: &LspContext,
     ) -> anyhow::Result<A> {
-        self.expr_at_with(loc, true, cb, ctx)
+        let pos = loc.pos() as usize;
+        let contents = loc.doc().buffer().contents().to_string();
+        let end = contents
+            .get(pos..)
+            .and_then(|suffix| suffix.chars().next())
+            .map_or(pos, |ch| pos + ch.len_utf8());
+        self.expr_at_with(loc, Some(pos..end), cb, ctx)
     }
 
     fn expr_at_with<A>(
         &self,
         loc: CodeLocation<'_>,
-        patch: bool,
+        patch: Option<Range<usize>>,
         cb: impl Fn(ExprAt<'_, '_>) -> anyhow::Result<A>,
         _ctx: &LspContext,
     ) -> anyhow::Result<A> {
-        self.compilation_cache.with(|cache| {
-            let mut contents = loc.doc().buffer().contents().to_string();
-            if patch {
-                let pos = loc.pos() as usize;
-                if let Some(c) = contents[pos..].chars().next() {
-                    contents.replace_range(pos..pos + c.len_utf8(), &" ".repeat(c.len_utf8()));
+        anyhow::ensure!(
+            Dialect::of(loc.doc().path()).is_some(),
+            "unsupported source extension"
+        );
+        let path = dialect::identity(loc.doc().path());
+        let workspace = self.resolve_file(&path).as_workspace().is_some();
+        let base = if workspace {
+            &self.compilation_cache
+        } else {
+            self.standalone
+                .get(&path)
+                .unwrap_or(&self.compilation_cache)
+        };
+        // A query owns its storage; speculative sources never enter the active cache.
+        let sources = ast::SourceMap::new();
+        base.with_sources(|active| {
+            for (_, file) in active.files() {
+                if dialect::identity(file.path()) != path
+                    && base.borrow_file_ids().contains_key(file.path())
+                    && workspace
+                {
+                    sources.push_back(file.path(), file.source());
                 }
-            };
+            }
+        });
+        let mut contents = loc.doc().buffer().contents().to_string();
+        if let Some(range) = patch {
+            contents.replace_range(range.clone(), &" ".repeat(range.len()));
+        }
 
-            let preceding_pos = loc.pos() - 1;
-
-            let id = cache.sources.push_back(loc.doc().path(), contents);
-            let file = cache.sources.get(id).context("missing source file")?;
-
-            let previous_id = cache.file_ids.get(loc.doc().path()).copied();
-
+        let preceding_pos = loc.pos().saturating_sub(1);
+        let id = sources.push_back(&path, contents);
+        let query_cache = CompilationCache::from_sources(
+            base.borrow_cache_bytes().clone(),
+            sources,
+            TypeInterner::default(),
+        )?;
+        query_cache.with(|cache| {
             let mut reporter = CompileErrorReporter::default();
-            let module = parse_file(id, file, &mut reporter);
-
-            let match_ = module.as_ref().and_then(|m| m.find_at(preceding_pos));
+            let match_ = cache
+                .parsed
+                .modules
+                .iter()
+                .find(|(file, _)| *file == id)
+                .and_then(|(_, module)| module.module().find_at(preceding_pos));
             let (ctx, typ) = match match_ {
                 Some(ast::QueryResult::Type(&ast::Type::Named { name, .. })) => (None, Some(name)),
                 Some(ast::QueryResult::Expr(&ast::Expr::Ident(name))) => {
@@ -483,20 +721,10 @@ impl RedscriptLanguageServer {
                 _ => (None, None),
             };
 
-            let evaluator = Evaluator::from_modules(cache.modules.iter().chain(module.as_ref()));
-            let mods = cache
-                .modules
-                .iter()
-                .filter(|m| m.span().map(|s| s.file) != previous_id)
-                .cloned()
-                .chain(module);
-            let (unit, syms) = process_sources(
-                mods,
-                cache.symbols.clone(),
-                evaluator,
-                &mut reporter,
-                cache.interner,
-            );
+            let (unit, syms) =
+                cache
+                    .parsed
+                    .process(cache.symbols.clone(), &mut reporter, cache.interner);
             let func = unit
                 .all_functions()
                 .find(|f| f.span.file == id && f.span.contains(preceding_pos));
@@ -510,6 +738,29 @@ impl RedscriptLanguageServer {
     }
 }
 
+/// Locate a contiguous member token at the cursor, including its leading dot.
+/// Unicode letters are accepted here even though the parsers currently require
+/// ASCII identifiers: erase the unfinished token before parsing the receiver.
+fn member_completion_range(source: &str, pos: u32) -> Option<Range<usize>> {
+    let pos = pos as usize;
+    let prefix = source.get(..pos)?;
+    let is_member_char = |ch: char| ch == '_' || ch.is_alphanumeric();
+    let (dot, ch) = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !is_member_char(*ch))?;
+    if ch != '.' || dot == 0 {
+        return None;
+    }
+    let suffix = source.get(pos..)?;
+    let end = pos
+        + suffix
+            .char_indices()
+            .find(|(_, ch)| !is_member_char(*ch))
+            .map_or(suffix.len(), |(index, _)| index);
+    Some(dot..end)
+}
+
 fn generate_fix<'ctx>(
     diag: &Diagnostic<'ctx>,
     symbols: &Symbols<'ctx>,
@@ -519,16 +770,22 @@ fn generate_fix<'ctx>(
     let code_edit = CodeEdit::from_diagnostic(diag)?;
     let edit = TextEdit::from_code_edit(&code_edit, symbols, sources).ok()?;
     let file = sources.get(edit.file)?;
+    if Dialect::of(file.path()) != Some(Dialect::Community) {
+        return None;
+    }
     let range = range(Span::new(edit.start as _, edit.end as _, edit.file), file)?;
     Some(Fix {
         kind: FixKind::from(&code_edit),
         uri: ctx.uri(file.path()).ok()?,
         edit: lsp::TextEdit::new(range, edit.content.to_string()),
+        expected_source: file.source().to_owned(),
+        generation: 0,
     })
 }
 
 fn generate_completions(
     at: ExprAt<'_, '_>,
+    dialect: Option<Dialect>,
 ) -> Result<Vec<lsp_types::CompletionItem>, anyhow::Error> {
     let mut completions = vec![];
 
@@ -558,6 +815,24 @@ fn generate_completions(
     if let Some(typ) = typ.as_ref()
         && let Some(typ) = typ.unwrap_ref_or_self().upper_bound()
     {
+        if dialect == Some(Dialect::Redmod)
+            && typ.id() == redscript_compiler_api::types::predef::ARRAY
+            && let [element] = typ.args()
+        {
+            completions.extend(
+                redscript_redmod_adapter::array_operations()
+                    .iter()
+                    .filter_map(|operation| {
+                        completions::array_method(
+                            operation.name,
+                            operation.intrinsic,
+                            element,
+                            at.symbols(),
+                        )
+                    }),
+            );
+        }
+
         let methods = at
             .symbols()
             .query_methods(typ.id())
@@ -577,25 +852,91 @@ fn generate_completions(
 }
 
 impl LanguageServer for RedscriptLanguageServer {
-    fn check(&mut self, path: PathBuf, ctx: &LspContext) -> anyhow::Result<()> {
-        match self.resolve_file(&path) {
-            FileResolution::Workspace(_) => {
-                let workspace_dirs = self.workspaces.values().flat_map(|w| &w.roots);
-                self.compilation_cache.remake(workspace_dirs)?;
-                self.check_workspace_and_publish(ctx)
-            }
-            FileResolution::NonWorkspace(path) => {
-                self.compilation_cache.remake([path])?;
-                self.check_workspace_and_publish(ctx)
-            }
+    fn watch_roots(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<_> = self
+            .workspaces
+            .keys()
+            .map(|path| dialect::identity(path))
+            .chain(
+                self.workspaces
+                    .values()
+                    .flat_map(|workspace| workspace.roots.clone()),
+            )
+            .collect();
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    fn document_changed(
+        &mut self,
+        path: PathBuf,
+        buffer: Option<&crate::buffers::Buffer>,
+        ctx: &LspContext,
+    ) -> anyhow::Result<()> {
+        let path = dialect::identity(&path);
+        if Dialect::of(&path).is_none() {
+            return Ok(());
         }
+        if let Some(buffer) = buffer {
+            self.overlays.insert(
+                path.clone(),
+                Overlay {
+                    text: buffer.contents().to_string(),
+                    version: buffer.version().unwrap_or(0),
+                },
+            );
+        } else {
+            self.overlays.remove(&path);
+            self.standalone.remove(&path);
+        }
+        self.rebuild(ctx)
+    }
+
+    fn files_changed(&mut self, _paths: Vec<PathBuf>, ctx: &LspContext) -> anyhow::Result<()> {
+        let workspaces = self
+            .workspaces
+            .keys()
+            .map(|path| Ok((path.clone(), WorkspaceDir::load(path)?)))
+            .collect::<anyhow::Result<HashMap<_, _>>>()?;
+        self.workspaces = workspaces;
+        self.rebuild(ctx)
+    }
+
+    fn check(&mut self, path: PathBuf, ctx: &LspContext) -> anyhow::Result<()> {
+        if path.file_name().is_some_and(|name| name == ".redscript") {
+            return self.files_changed(vec![path], ctx);
+        }
+
+        let path = dialect::identity(&path);
+        if self.resolve_file(&path).as_workspace().is_none()
+            && Dialect::of(&path).is_some()
+            && path.is_file()
+        {
+            let sources = ast::SourceMap::new();
+            let text = self
+                .overlays
+                .get(&path)
+                .map(|overlay| Ok(overlay.text.clone()))
+                .unwrap_or_else(|| fs::read_to_string(&path))?;
+            sources.push_back(&path, text);
+            self.standalone.insert(
+                path,
+                CompilationCache::from_sources(
+                    self.compilation_cache.borrow_cache_bytes().clone(),
+                    sources,
+                    TypeInterner::default(),
+                )?,
+            );
+        }
+        self.rebuild(ctx)
     }
 
     fn change_workspace_folders(
         &mut self,
         added: Vec<PathBuf>,
         removed: Vec<PathBuf>,
-        _ctx: &LspContext,
+        ctx: &LspContext,
     ) -> anyhow::Result<()> {
         for dir in added {
             let value = WorkspaceDir::load(&dir)?;
@@ -604,7 +945,7 @@ impl LanguageServer for RedscriptLanguageServer {
         for folder in removed {
             self.workspaces.remove(&folder);
         }
-        Ok(())
+        self.rebuild(ctx)
     }
 
     fn hover(&self, loc: CodeLocation<'_>, _ctx: &LspContext) -> anyhow::Result<lsp_types::Hover> {
@@ -690,17 +1031,57 @@ struct CompilationCache {
 
     #[borrows(sources)]
     #[not_covariant]
-    modules: Vec<ast::SourceModule<'this>>,
+    parsed: ParsedSources<'this>,
 }
 
 impl CompilationCache {
+    fn analyze<A>(
+        &self,
+        cb: impl for<'ctx> Fn(
+            &LoweredCompilationUnit<'ctx>,
+            &Symbols<'ctx>,
+            &[&Diagnostic<'ctx>],
+            &'ctx ast::SourceMap,
+        ) -> anyhow::Result<A>,
+    ) -> anyhow::Result<A> {
+        self.with(|cache| {
+            let mut reporter = CompileErrorReporter::default();
+            let (unit, symbols) =
+                cache
+                    .parsed
+                    .process(cache.symbols.clone(), &mut reporter, cache.interner);
+            unit.run_diagnostics(DIAGNOSTIC_PASSES, &mut reporter);
+            // Keep syntax errors, but suppress recovery-induced semantic cascades.
+            let invalid_files = cache.parsed.diagnostic_files();
+            let diags: Vec<_> = cache
+                .parsed
+                .diagnostics
+                .iter()
+                .chain(
+                    reporter
+                        .reported()
+                        .iter()
+                        .filter(|diag| !invalid_files.contains(&diag.span().file)),
+                )
+                .collect();
+            cb(&unit, &symbols, &diags, cache.sources)
+        })
+    }
+
     pub fn make(
         cache_bytes: Vec<u8>,
         workspace_dirs: impl IntoIterator<Item = impl Into<PathBuf>>,
         interner: TypeInterner,
     ) -> anyhow::Result<Self> {
-        let sources = ast::SourceMap::from_paths_recursively(workspace_dirs)?;
+        let sources = ast::SourceMap::from_files(dialect::discover(workspace_dirs)?)?;
+        Self::from_sources(cache_bytes, sources, interner)
+    }
 
+    fn from_sources(
+        cache_bytes: Vec<u8>,
+        sources: ast::SourceMap,
+        interner: TypeInterner,
+    ) -> anyhow::Result<Self> {
         let file_ids = sources
             .files()
             .map(|(id, file)| (file.path().to_owned(), id))
@@ -720,20 +1101,8 @@ impl CompilationCache {
                     &TypeFlagRegistry::default(),
                 )?)
             },
-            |sources| {
-                let mut reporter = CompileErrorReporter::default();
-                Ok(parse_files(sources, &mut reporter))
-            },
+            |sources| Ok(dialect::parse(sources)),
         )
-    }
-
-    pub fn remake(
-        &mut self,
-        dirs: impl IntoIterator<Item = impl Into<PathBuf>>,
-    ) -> anyhow::Result<()> {
-        let cache = mem::take(self).into_heads();
-        *self = CompilationCache::make(cache.cache_bytes, dirs, cache.interner)?;
-        Ok(())
     }
 }
 
@@ -745,9 +1114,17 @@ impl Default for CompilationCache {
             ast::SourceMap::default(),
             HashMap::default(),
             |_, _, _| Symbols::with_default_types(),
-            |_| vec![],
+            |_| ParsedSources {
+                modules: vec![],
+                diagnostics: vec![],
+            },
         )
     }
+}
+
+struct Overlay {
+    text: String,
+    version: i32,
 }
 
 #[derive(Debug)]
@@ -762,7 +1139,7 @@ impl WorkspaceDir {
         let roots = dotfile
             .expanded_source_roots()
             .into_iter()
-            .map(|p| dir.join(p))
+            .map(|p| dialect::identity(&dir.join(p)))
             .collect();
 
         let mut settings = FormatSettings::default();
@@ -795,31 +1172,14 @@ impl WorkspaceDir {
 #[derive(Debug)]
 enum FileResolution<'a> {
     Workspace(&'a WorkspaceDir),
-    NonWorkspace(PathBuf),
+    NonWorkspace,
 }
 
 impl FileResolution<'_> {
     pub fn as_workspace(&self) -> Option<&WorkspaceDir> {
         match self {
             Self::Workspace(ws) => Some(ws),
-            Self::NonWorkspace(_) => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct CachedCompletions {
-    completions: Rc<lsp::CompletionResponse>,
-    file: PathBuf,
-    pos: u32,
-}
-
-impl CachedCompletions {
-    fn new(completions: Rc<lsp::CompletionResponse>, file: PathBuf, pos: u32) -> Self {
-        Self {
-            completions,
-            file,
-            pos,
+            Self::NonWorkspace => None,
         }
     }
 }
@@ -827,7 +1187,7 @@ impl CachedCompletions {
 #[derive(Debug, Serialize, Deserialize)]
 enum FixRequest {
     FixOne(Fix),
-    FixAll(FixKind),
+    FixAll(FixKind, u64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -835,6 +1195,8 @@ struct Fix {
     kind: FixKind,
     uri: lsp::Uri,
     edit: lsp::TextEdit,
+    expected_source: String,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -869,15 +1231,949 @@ impl fmt::Display for FixKind {
 
 #[cfg(test)]
 mod tests {
+    use redscript_compiler_api::ir;
+
     use super::*;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        RedscriptLanguageServer,
+        LspContext,
+        crossbeam_channel::Receiver<lsp_server::Message>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache.bin");
+        fs::write(
+            &cache,
+            ScriptBundle::default().into_writeable().to_bytes().unwrap(),
+        )
+        .unwrap();
+        let server = RedscriptLanguageServer::new(&cache, [temp.path()]).unwrap();
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        (temp, server, LspContext::new(sender), receiver)
+    }
+
+    fn open(
+        server: &mut RedscriptLanguageServer,
+        ctx: &LspContext,
+        path: &Path,
+        text: &str,
+        version: i32,
+    ) -> crate::buffers::Buffers {
+        let mut buffers = crate::buffers::Buffers::default();
+        let uri = ctx.uri(path).unwrap();
+        buffers.open(uri.clone(), text.into(), version);
+        server
+            .document_changed(path.to_owned(), buffers.get(&uri), ctx)
+            .unwrap();
+        buffers
+    }
+
+    #[test]
+    fn mixed_case_redmod_saved_and_live_snapshots() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let community = temp.path().join("community.reds");
+        let mixed = temp.path().join("mixed.Script");
+        let upper = temp.path().join("upper.SCRIPT");
+        fs::write(&community, "public class Community {}").unwrap();
+        fs::write(&mixed, "class MixedDisk {}").unwrap();
+        fs::write(&upper, "class UpperDisk {}").unwrap();
+        server
+            .files_changed(vec![community, mixed.clone(), upper.clone()], &ctx)
+            .unwrap();
+        server
+            .check_workspace(|_, symbols, diags, _| {
+                assert!(diags.is_empty(), "{diags:?}");
+                for name in ["Community", "MixedDisk", "UpperDisk"] {
+                    assert!(symbols.types().any(|(id, _)| id.as_str() == name));
+                }
+                Ok(())
+            })
+            .unwrap();
+        let _mixed = open(&mut server, &ctx, &mixed, "class MixedLive {}", 1);
+        let _upper = open(&mut server, &ctx, &upper, "class UpperLive {}", 1);
+        let unsaved = temp.path().join("new.sCrIpT");
+        let _unsaved = open(&mut server, &ctx, &unsaved, "class Unsaved {}", 1);
+        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 4);
+        server
+            .check_workspace(|_, symbols, diags, _| {
+                assert!(diags.is_empty(), "{diags:?}");
+                for name in ["Community", "MixedLive", "UpperLive", "Unsaved"] {
+                    assert!(symbols.types().any(|(id, _)| id.as_str() == name));
+                }
+                for name in ["MixedDisk", "UpperDisk"] {
+                    assert!(!symbols.types().any(|(id, _)| id.as_str() == name));
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn mixed_live_snapshot_empty_replacement_and_standalone_safety() {
+        let (temp, mut server, ctx, receiver) = fixture();
+        let community = temp.path().join("a.reds");
+        let redmod = temp.path().join("b.script");
+        fs::write(&community, "public class Community {}").unwrap();
+        fs::write(&redmod, "class Redmod { var value : Int32; }").unwrap();
+        server
+            .files_changed(vec![community.clone(), redmod.clone()], &ctx)
+            .unwrap();
+        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 2);
+        server
+            .check_workspace(|_, symbols, diags, _| {
+                assert!(diags.is_empty(), "{diags:?}");
+                assert!(symbols.types().any(|(id, _)| id.as_str() == "Redmod"));
+                Ok(())
+            })
+            .unwrap();
+        let _buffers = open(&mut server, &ctx, &redmod, "", 5);
+        server
+            .check_workspace(|_, symbols, diags, _| {
+                assert!(diags.is_empty(), "{diags:?}");
+                assert!(!symbols.types().any(|(id, _)| id.as_str() == "Redmod"));
+                Ok(())
+            })
+            .unwrap();
+        server.compilation_cache.with(|cache| {
+            let id = cache.file_ids[&dialect::identity(&redmod)];
+            assert!(cache.parsed.modules.iter().any(|(file, _)| *file == id));
+        });
+        let external = tempfile::tempdir().unwrap();
+        let standalone = external.path().join("solo.script");
+        fs::write(&standalone, "class Standalone {}").unwrap();
+        server.check(standalone.clone(), &ctx).unwrap();
+        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 2);
+        assert_eq!(
+            server.standalone[&dialect::identity(&standalone)]
+                .borrow_file_ids()
+                .len(),
+            1
+        );
+        let _buffers = open(&mut server, &ctx, &redmod, "class {", 6);
+        let params: Vec<lsp::PublishDiagnosticsParams> = receiver
+            .try_iter()
+            .filter_map(|message| {
+                let lsp_server::Message::Notification(notification) = message else {
+                    return None;
+                };
+                serde_json::from_value(notification.params).ok()
+            })
+            .collect();
+        assert!(params.iter().any(|params| {
+            params.version == Some(6)
+                && params
+                    .diagnostics
+                    .iter()
+                    .any(|diag| diag.code == Some(lsp::NumberOrString::String("OTHER".into())))
+        }));
+    }
+
+    #[test]
+    fn queries_use_all_overlays_without_mutating_active_sources() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let target = temp.path().join("target.script");
+        let user = temp.path().join("user.script");
+        let _target_buffers = open(
+            &mut server,
+            &ctx,
+            &target,
+            "class Target { public var value : Int32; }",
+            1,
+        );
+        let text = "class User { function Test(obj : Target) : Int32 { return obj.value; } }";
+        let buffers = open(&mut server, &ctx, &user, text, 1);
+        let buffer = buffers.get(&ctx.uri(&user).unwrap()).unwrap();
+        let loc = CodeLocation::new(
+            Document::new(user.clone(), buffer),
+            text.find("value").unwrap() as u32 + 1,
+        );
+        for _ in 0..3 {
+            let definition = server.definition_at(loc.clone(), &ctx).unwrap();
+            let lsp::GotoDefinitionResponse::Array(locations) = definition else {
+                panic!("expected locations");
+            };
+            assert_eq!(locations.len(), 1);
+            assert_eq!(
+                dialect::identity(&crate::server::path_from_uri(&locations[0].uri).unwrap()),
+                dialect::identity(&target)
+            );
+            server
+                .patched_expr_at(loc.clone(), |_| Ok(()), &ctx)
+                .unwrap();
+        }
+        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 2);
+        assert_eq!(
+            server.compilation_cache.with_sources(ast::SourceMap::len),
+            3
+        );
+        server
+            .check_workspace(|_, _, diags, _| {
+                assert!(diags.is_empty(), "{diags:?}");
+                Ok(())
+            })
+            .unwrap();
+        let zero = CodeLocation::new(Document::new(user, buffer), 0);
+        assert!(
+            matches!(&*server.completion_at(zero, &ctx).unwrap(), lsp::CompletionResponse::Array(items) if items.is_empty())
+        );
+    }
+
+    #[test]
+    fn redmod_cast_type_navigation_and_unicode_syntax_diagnostics() {
+        let (temp, mut server, ctx, receiver) = fixture();
+        let target = temp.path().join("target.script");
+        let _buffers = open(&mut server, &ctx, &target, "class Target {}", 1);
+        let path = temp.path().join("cast.script");
+        let text =
+            "class User { function Test(obj : IScriptable) : Target { return (Target)obj; } }";
+        let buffers = open(&mut server, &ctx, &path, text, 2);
+        let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+        let pos = text.find("(Target)").unwrap() as u32 + 3;
+        let response = server
+            .definition_at(
+                CodeLocation::new(Document::new(path.clone(), buffer), pos),
+                &ctx,
+            )
+            .unwrap();
+        let lsp::GotoDefinitionResponse::Array(locations) = response else {
+            panic!("expected definition locations");
+        };
+        assert_eq!(locations.len(), 1);
+        assert_eq!(
+            dialect::identity(&crate::server::path_from_uri(&locations[0].uri).unwrap()),
+            dialect::identity(&target)
+        );
+        receiver.try_iter().for_each(drop);
+        let text = "// é😀\r\nclass User { function Test() { var value : ; } }";
+        let _buffers = open(&mut server, &ctx, &path, text, 3);
+        let params: Vec<lsp::PublishDiagnosticsParams> = receiver
+            .try_iter()
+            .filter_map(|message| {
+                let lsp_server::Message::Notification(notification) = message else {
+                    return None;
+                };
+                serde_json::from_value(notification.params).ok()
+            })
+            .collect();
+        let params = params
+            .iter()
+            .find(|params| params.version == Some(3))
+            .unwrap();
+        assert!(!params.diagnostics.is_empty());
+        assert!(
+            params
+                .diagnostics
+                .iter()
+                .all(|diag| diag.range.start.line == 1)
+        );
+    }
+
+    #[test]
+    fn mixed_semantics_apply_to_workspace_and_query_snapshots() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let dependency = temp.path().join("dependency.reds");
+        let _dependencies = open(
+            &mut server,
+            &ctx,
+            &dependency,
+            "public class Object {} public func Shared() -> Int32 { if true { let x: Int32 = 1; return x; } let x: Int32 = 2; return x; }",
+            1,
+        );
+        let path = temp.path().join("arrays.script");
+        let text = "function Test(obj: Object) -> Int32 { let values: array<Int32>; values.PushBack(Shared()); if (obj) { return values.Size(); } return 0; }";
+        let buffers = open(&mut server, &ctx, &path, text, 2);
+        server
+            .check_workspace(|unit, _, diagnostics, _| {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                assert!(unit.all_functions().any(|function| function.span.file
+                    == server.compilation_cache.borrow_file_ids()[&dialect::identity(&path)]));
+                Ok(())
+            })
+            .unwrap();
+        let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+        let loc = CodeLocation::new(
+            Document::new(path.clone(), buffer),
+            text.find("Size").unwrap() as u32 + 2,
+        );
+        server
+            .expr_at(
+                loc,
+                |at| {
+                    assert_eq!(
+                        at.expr_type().map(|typ| typ.to_string()).as_deref(),
+                        Some("Int32")
+                    );
+                    Ok(())
+                },
+                &ctx,
+            )
+            .unwrap();
+        let _buffers = open(
+            &mut server,
+            &ctx,
+            &path,
+            "function Test(n: Int32) { if (n) {} }",
+            3,
+        );
+        server
+            .check_workspace(|_, _, diagnostics, _| {
+                assert!(!diagnostics.is_empty());
+                assert!(diagnostics.iter().any(|diag| diag.span().file
+                    == server.compilation_cache.borrow_file_ids()[&dialect::identity(&path)]));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn override_metadata_survives_live_and_speculative_snapshots() {
+        let (temp, mut server, ctx, receiver) = fixture();
+        let base = temp.path().join("base.reds");
+        let _base = open(
+            &mut server,
+            &ctx,
+            &base,
+            "public class Base { public func F(x: Int32) {} }",
+            1,
+        );
+        let path = temp.path().join("child.script");
+        let text = "class Child extends Base { public override function F(x: Int32 ) {} }";
+        let buffers = open(&mut server, &ctx, &path, text, 2);
+        server
+            .check_workspace(|_, _, diagnostics, _| {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                Ok(())
+            })
+            .unwrap();
+        server.compilation_cache.with(|cache| {
+            let id = cache.file_ids[&dialect::identity(&path)];
+            let (_, crate::dialect::ParsedModule::Redmod(parsed)) = cache
+                .parsed
+                .modules
+                .iter()
+                .find(|(file, _)| *file == id)
+                .unwrap()
+            else {
+                panic!("expected REDmod metadata");
+            };
+            assert_eq!(parsed.overrides.len(), 1);
+        });
+        let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+        let loc = CodeLocation::new(
+            Document::new(path.clone(), buffer),
+            text.find("Int32").unwrap() as u32 + 5,
+        );
+        server
+            .patched_expr_at(
+                loc,
+                |at| {
+                    assert_eq!(at.type_().map(|typ| typ.as_str()), Some("Int32"));
+                    Ok(())
+                },
+                &ctx,
+            )
+            .unwrap();
+        receiver.try_iter().for_each(drop);
+        let _buffers = open(
+            &mut server,
+            &ctx,
+            &path,
+            "class Child extends Base { public function F(x: Int32) {} }",
+            3,
+        );
+        server
+            .check_workspace(|_, _, diagnostics, _| {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diag| diag.to_string().contains("requires override")),
+                    "{diagnostics:?}"
+                );
+                Ok(())
+            })
+            .unwrap();
+        let publications: Vec<lsp::PublishDiagnosticsParams> = receiver
+            .try_iter()
+            .filter_map(|message| {
+                let lsp_server::Message::Notification(notification) = message else {
+                    return None;
+                };
+                serde_json::from_value(notification.params).ok()
+            })
+            .collect();
+        assert!(publications.iter().any(|params| {
+            params.version == Some(3)
+                && params
+                    .diagnostics
+                    .iter()
+                    .any(|diag| diag.message.contains("requires override"))
+        }));
+        let _buffers = open(
+            &mut server,
+            &ctx,
+            &path,
+            "class Child extends Base { public override function F(x: Bool) {} }",
+            4,
+        );
+        server
+            .check_workspace(|_, _, diagnostics, _| {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diag| diag.to_string().contains("no matching base signature")),
+                    "{diagnostics:?}"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn assert_native_loop_queries(text: &str, calls: &[&str]) {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let dependency = temp.path().join("dependency.reds");
+        let declarations = "public func Init() -> Int32 { return 0; }\npublic func Condition() -> Bool { return false; }\npublic func Step() -> Int32 { return 1; }\npublic func Body() -> Int32 { return 2; }";
+        let _dependency = open(&mut server, &ctx, &dependency, declarations, 1);
+        let path = temp.path().join("loops.script");
+        fs::write(&path, "function DiskOnly() {}").unwrap();
+        server.files_changed(vec![path.clone()], &ctx).unwrap();
+        let buffers = open(&mut server, &ctx, &path, text, 2);
+        server
+            .check_workspace(|unit, _, diagnostics, _| {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                let id = server.compilation_cache.borrow_file_ids()[&dialect::identity(&path)];
+                let function = unit
+                    .all_functions()
+                    .find(|function| function.span.file == id)
+                    .unwrap();
+                // Each native loop needs its metadata-driven first-entry guard.
+                assert_eq!(function.locals.len(), 1);
+                assert!(function.locals[0].name.is_none());
+                for name in calls {
+                    let pos = text.find(name).unwrap() as u32;
+                    assert!(
+                        matches!(function.block.find_at(pos), Some(ir::Expr::Call { .. })),
+                        "workspace lookup hid {name}"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+        for name in calls {
+            let pos = text.find(name).unwrap() as u32 + 1;
+            let loc = CodeLocation::new(Document::new(path.clone(), buffer), pos);
+            let lsp::GotoDefinitionResponse::Array(locations) =
+                server.definition_at(loc.clone(), &ctx).unwrap()
+            else {
+                panic!("expected definition locations for {name}");
+            };
+            assert_eq!(locations.len(), 1, "missing definition for {name}");
+            assert_eq!(locations[0].uri, ctx.uri(&dependency).unwrap());
+            assert_eq!(
+                locations[0].range.start.line,
+                declarations[..declarations.find(&format!("func {name}")).unwrap()]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count() as u32
+            );
+            let hover = server.hover_at(loc.clone(), &ctx).unwrap();
+            let lsp::HoverContents::Markup(contents) = hover.contents else {
+                panic!("expected markup hover for {name}");
+            };
+            let typ = if *name == "Condition" {
+                "Bool"
+            } else {
+                "Int32"
+            };
+            assert!(
+                contents.value.contains(&format!("{name}() -> {typ}")),
+                "unexpected hover for {name}: {}",
+                contents.value
+            );
+            let start = text.find(name).unwrap();
+            let line = text[..start].bytes().filter(|byte| *byte == b'\n').count() as u32;
+            let column = (start - text[..start].rfind('\n').map_or(0, |index| index + 1)) as u32;
+            assert_eq!(
+                hover.range,
+                Some(lsp::Range::new(
+                    lsp::Position::new(line, column),
+                    lsp::Position::new(line, column + name.len() as u32 + 2),
+                ))
+            );
+
+            // Model completion's token erasure without publishing the broken buffer.
+            let speculative = text.replace("Body()", "Body().unfinished");
+            let mut query_buffers = crate::buffers::Buffers::default();
+            let uri = ctx.uri(&path).unwrap();
+            query_buffers.open(uri.clone(), speculative.clone(), 3);
+            let start = speculative.find(".unfinished").unwrap();
+            let query_loc = CodeLocation::new(
+                Document::new(path.clone(), query_buffers.get(&uri).unwrap()),
+                speculative.find(name).unwrap() as u32 + 1,
+            );
+            server
+                .expr_at_with(
+                    query_loc,
+                    Some(start..start + ".unfinished".len()),
+                    |at| {
+                        assert_eq!(at.func().unwrap().locals.len(), 1);
+                        assert!(at.func().unwrap().locals[0].name.is_none());
+                        assert!(
+                            matches!(at.expr(), Some(ir::Expr::Call { .. })),
+                            "speculative lookup hid {name}"
+                        );
+                        assert_eq!(at.expr_type().unwrap().to_string(), typ);
+                        assert_eq!(
+                            location(at.definition_span().unwrap(), at.sources(), &ctx).unwrap(),
+                            locations[0]
+                        );
+                        assert!(
+                            at.display()
+                                .to_string()
+                                .contains(&format!("{name}() -> {typ}"))
+                        );
+                        Ok(())
+                    },
+                    &ctx,
+                )
+                .unwrap();
+        }
+        server.compilation_cache.with_sources(|sources| {
+            let id = server.compilation_cache.borrow_file_ids()[&dialect::identity(&path)];
+            assert_eq!(sources.get(id).unwrap().source(), text);
+        });
+        assert_eq!(fs::read_to_string(path).unwrap(), "function DiskOnly() {}");
+    }
+
+    #[test]
+    fn native_for_navigation_and_hover_survive_live_and_speculative_analysis() {
+        assert_native_loop_queries(
+            "function Run() {\n    for (Init(); Condition(); Step()) {\n        Body();\n        continue;\n    }\n}",
+            &["Init", "Condition", "Step", "Body"],
+        );
+    }
+
+    #[test]
+    fn native_do_while_navigation_and_hover_survive_live_and_speculative_analysis() {
+        assert_native_loop_queries(
+            "function Run() {\n    do {\n        Body();\n        continue;\n    } while (Condition());\n}",
+            &["Body", "Condition"],
+        );
+    }
+
+    #[test]
+    fn failed_redmod_inputs_do_not_block_valid_workspace_modules() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let good = temp.path().join("good.script");
+        let _good = open(&mut server, &ctx, &good, "class Good {}", 1);
+        let community = temp.path().join("community.reds");
+        let _community = open(
+            &mut server,
+            &ctx,
+            &community,
+            "public class Community {}",
+            1,
+        );
+        let bad = temp.path().join("bad.script");
+        for text in ["class Generic<T> {}", "class {"] {
+            let _bad = open(&mut server, &ctx, &bad, text, 2);
+            server
+                .check_workspace(|_, symbols, diagnostics, sources| {
+                    assert!(symbols.types().any(|(id, _)| id.as_str() == "Good"));
+                    assert!(symbols.types().any(|(id, _)| id.as_str() == "Community"));
+                    assert!(!symbols.types().any(|(id, _)| id.as_str() == "Generic"));
+                    let errors: Vec<_> = diagnostics
+                        .iter()
+                        .filter(|diag| {
+                            sources.get(diag.span().file).unwrap().path() == dialect::identity(&bad)
+                        })
+                        .collect();
+                    assert!(!errors.is_empty());
+                    assert!(
+                        errors
+                            .iter()
+                            .all(|diag| matches!(diag, Diagnostic::Other(_, _, _)))
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn external_roots_watch_delete_and_configuration_reload() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let external = tempfile::tempdir().unwrap();
+        let script = external.path().join("external.script");
+        fs::write(&script, "class External {}").unwrap();
+        fs::write(
+            temp.path().join(".redscript"),
+            format!(
+                "source_roots = [ {:?} ]",
+                external.path().to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        server.files_changed(vec![], &ctx).unwrap();
+        assert!(server.resolve_file(&script).as_workspace().is_some());
+        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 1);
+        let _buffers = open(&mut server, &ctx, &script, "class Unsaved {}", 2);
+        fs::remove_file(&script).unwrap();
+        server.files_changed(vec![script.clone()], &ctx).unwrap();
+        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 1);
+        server.document_changed(script, None, &ctx).unwrap();
+        assert!(server.compilation_cache.borrow_file_ids().is_empty());
+        server
+            .change_workspace_folders(vec![], vec![temp.path().to_owned()], &ctx)
+            .unwrap();
+        assert!(server.workspaces.is_empty());
+    }
+
+    fn dot_completions(
+        server: &mut RedscriptLanguageServer,
+        ctx: &LspContext,
+        path: &Path,
+        text: &str,
+        version: i32,
+    ) -> Rc<lsp::CompletionResponse> {
+        let buffers = open(server, ctx, path, text, version);
+        let buffer = buffers.get(&ctx.uri(path).unwrap()).unwrap();
+        let pos = text.rfind('.').unwrap() as u32 + 1;
+        server
+            .completion_at(
+                CodeLocation::new(Document::new(path.to_owned(), buffer), pos),
+                ctx,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn member_completion_ranges_preserve_utf8_boundaries() {
+        for (source, cursor, expected) in [
+            ("values.", 7, Some(6..7)),
+            ("values.Size", 8, Some(6..11)),
+            ("values.é", 9, Some(6..9)),
+            ("values.é", 8, None),
+            ("values + S", 10, None),
+            ("values. S", 9, None),
+            ("values", 6, None),
+            ("", 0, None),
+            ("values.", 20, None),
+        ] {
+            assert_eq!(
+                member_completion_range(source, cursor),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn member_completions_recompute_after_sequential_changes() {
+        for (extension, function, receiver) in [
+            ("script", "function", "Other"),
+            ("reds", "func", "ref<Other>"),
+        ] {
+            let (temp, mut server, ctx, _receiver) = fixture();
+            let path = temp.path().join(format!("members.{extension}"));
+            let uri = ctx.uri(&path).unwrap();
+            let mut buffers = crate::buffers::Buffers::default();
+            buffers.open(uri.clone(), String::new(), 0);
+            let mut previous = String::new();
+            for (index, prefix) in ["", "S", "Si", "é", "é界", "S"].into_iter().enumerate() {
+                let text = format!(
+                    "class Other {{ public {function} Size() -> String {{ return \"custom\"; }} }} \
+                     {function} Test(values: {receiver}) {{ let text: String = \"😀é\"; values.{prefix}; }}"
+                );
+                let change = if index == 0 {
+                    lsp::TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: text.clone(),
+                    }
+                } else {
+                    let start = previous.rfind('.').unwrap() + 1;
+                    let end = previous.rfind(';').unwrap();
+                    lsp::TextDocumentContentChangeEvent {
+                        range: Some(lsp::Range::new(
+                            crate::positions::position(&previous, start as u32).unwrap(),
+                            crate::positions::position(&previous, end as u32).unwrap(),
+                        )),
+                        range_length: None,
+                        text: prefix.into(),
+                    }
+                };
+                assert!(buffers.change(&uri, index as i32 + 1, vec![change]));
+                let buffer = buffers.get(&uri).unwrap();
+                assert_eq!(buffer.contents().to_string(), text);
+                previous.clone_from(&text);
+                server
+                    .document_changed(path.clone(), Some(buffer), &ctx)
+                    .unwrap();
+                let pos = (text.rfind('.').unwrap() + 1 + prefix.len()) as u32;
+                let response = server
+                    .completion_at(
+                        CodeLocation::new(Document::new(path.clone(), buffer), pos),
+                        &ctx,
+                    )
+                    .unwrap();
+                let lsp::CompletionResponse::Array(items) = &*response else {
+                    panic!("expected completion items");
+                };
+                assert_eq!(items.len(), 1, "{extension}: {prefix}");
+                assert_eq!(items[0].label, "Size");
+                assert_eq!(items[0].detail.as_deref(), Some("() -> String"));
+                server.compilation_cache.with_sources(|sources| {
+                    assert_eq!(
+                        sources
+                            .files()
+                            .find(|(_, file)| file.path() == dialect::identity(&path))
+                            .unwrap()
+                            .1
+                            .source(),
+                        text
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn prefixed_array_completions_use_the_current_receiver_type() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let path = temp.path().join("arrays.script");
+        let uri = ctx.uri(&path).unwrap();
+        let mut buffers = crate::buffers::Buffers::default();
+        buffers.open(uri.clone(), String::new(), 0);
+        for (index, (typ, prefix, expected)) in [
+            ("array<Int32>", "", Some("() -> Int32")),
+            ("array<Int32>", "S", Some("() -> Int32")),
+            ("array<String>", "Si", Some("() -> String")),
+            ("array<String>", "é", Some("() -> String")),
+            ("Int32", "S", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text = format!("function Test(values: {typ}) {{ values.{prefix}; }}");
+            assert!(buffers.change(
+                &uri,
+                index as i32 + 1,
+                vec![lsp::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.clone(),
+                }]
+            ));
+            let buffer = buffers.get(&uri).unwrap();
+            server
+                .document_changed(path.clone(), Some(buffer), &ctx)
+                .unwrap();
+            let pos = (text.rfind('.').unwrap() + 1 + prefix.len()) as u32;
+            let response = server
+                .completion_at(
+                    CodeLocation::new(Document::new(path.clone(), buffer), pos),
+                    &ctx,
+                )
+                .unwrap();
+            let lsp::CompletionResponse::Array(items) = &*response else {
+                panic!("expected completion items");
+            };
+            if let Some(expected) = expected {
+                let last = items.iter().find(|item| item.label == "Last").unwrap();
+                assert_eq!(last.detail.as_deref(), Some(expected));
+            } else {
+                assert!(items.is_empty(), "stale receiver completions: {items:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn redmod_array_dot_completion_uses_shared_descriptors_and_typed_boot_signatures() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let path = temp.path().join("arrays.script");
+        for (version, element) in [(1, "Int32"), (2, "String")] {
+            let text = format!("function Test(values: array<{element}>) {{ values.; }}");
+            let response = dot_completions(&mut server, &ctx, &path, &text, version);
+            let lsp::CompletionResponse::Array(items) = &*response else {
+                panic!("expected completion items");
+            };
+            let mut expected: Vec<_> = redscript_redmod_adapter::array_operations()
+                .iter()
+                .map(|operation| operation.name)
+                .collect();
+            let mut labels: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
+            expected.sort();
+            labels.sort();
+            assert_eq!(labels, expected);
+            let size = items.iter().find(|item| item.label == "Size").unwrap();
+            assert_eq!(size.detail.as_deref(), Some("() -> Int32"));
+            assert_eq!(size.insert_text.as_deref(), Some("Size()"));
+            let push = items.iter().find(|item| item.label == "PushBack").unwrap();
+            assert_eq!(push.detail, Some(format!("(elem: {element}) -> Void")));
+            assert_eq!(push.insert_text.as_deref(), Some("PushBack(${1:elem})"));
+            assert_eq!(push.kind, Some(lsp::CompletionItemKind::METHOD));
+            assert_eq!(
+                push.insert_text_format,
+                Some(lsp::InsertTextFormat::SNIPPET)
+            );
+            assert!(push.documentation.is_some());
+            let last = items.iter().find(|item| item.label == "Last").unwrap();
+            assert_eq!(last.detail, Some(format!("() -> {element}")));
+            // Queries and their completion patches never become active snapshots.
+            assert_eq!(server.compilation_cache.borrow_file_ids().len(), 1);
+            assert_eq!(
+                server.compilation_cache.with_sources(ast::SourceMap::len),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn redmod_array_completion_is_not_offered_in_community_sources() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let community = temp.path().join("community.reds");
+        let response = dot_completions(
+            &mut server,
+            &ctx,
+            &community,
+            "func Test(values: array<Int32>) { values.; }",
+            1,
+        );
+        assert!(matches!(&*response, lsp::CompletionResponse::Array(items) if items.is_empty()));
+    }
+
+    #[test]
+    fn redmod_formatting_preserves_native_syntax_trivia_and_utf16_ranges() {
+        let (temp, server, ctx, _receiver) = fixture();
+        let path = temp.path().join("format.script");
+        let source = "class Test {\r\n// comment { 😀\r\noverride function Run() {\r\nvar text: String = \"first\n  second\"; // }\r\n/* block\n unmodified */\r\n}\r\n} // é😀";
+        let expected = "class Test {\r\n    // comment { 😀\r\n    override function Run() {\r\n        var text: String = \"first\n  second\"; // }\r\n        /* block\n unmodified */\r\n    }\r\n} // é😀";
+        let buffer = crate::buffers::Buffer::new(source.into());
+        let edits = server
+            .format_document(Document::new(path.clone(), &buffer), 2)
+            .unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, expected);
+        assert_eq!(
+            edits[0].range,
+            lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(8, 8))
+        );
+        let mut formatted = crate::buffers::Buffer::new(source.into());
+        formatted.update_range(edits[0].range, edits[0].new_text.clone());
+        assert_eq!(formatted.contents().to_string(), expected);
+        assert!(
+            server
+                .format_document(Document::new(path.clone(), &formatted), 8)
+                .unwrap()
+                .is_empty()
+        );
+        let invalid = crate::buffers::Buffer::new("function Broken( {".into());
+        assert!(
+            server
+                .format_document(Document::new(path.clone(), &invalid), 4)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            server
+                .format_document(Document::new(temp.path().join("unknown.txt"), &buffer), 4)
+                .unwrap()
+                .is_empty()
+        );
+        // No semantic validity is required for indentation-only formatting.
+        assert!(ctx.uri(&path).is_ok());
+    }
+
+    #[test]
+    fn unchanged_formatting_and_fixes_reject_redmod_and_stale_targets() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let path = temp.path().join("test.script");
+        let buffers = open(&mut server, &ctx, &path, "class Native {}", 1);
+        assert!(
+            server
+                .format_document(
+                    Document::new(path.clone(), buffers.get(&ctx.uri(&path).unwrap()).unwrap()),
+                    2
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let mut fix = Fix {
+            kind: FixKind::MakeFieldPublic,
+            uri: ctx.uri(&path).unwrap(),
+            edit: lsp::TextEdit::new(lsp::Range::default(), "public ".into()),
+            expected_source: "class Native {}".into(),
+            generation: server.generation,
+        };
+        assert!(!server.valid_fix(&fix));
+        let community = temp.path().join("test.reds");
+        let _buffers = open(
+            &mut server,
+            &ctx,
+            &community,
+            "public class Community {}",
+            1,
+        );
+        fix.uri = ctx.uri(&community).unwrap();
+        fix.expected_source = "public class Community {}".into();
+        fix.generation = server.generation;
+        assert!(server.valid_fix(&fix));
+        fix.expected_source.clear();
+        assert!(!server.valid_fix(&fix));
+        let action = lsp::CodeAction {
+            title: "stale".into(),
+            data: Some(serde_json::to_value(FixRequest::FixOne(fix)).unwrap()),
+            ..Default::default()
+        };
+        assert!(
+            server
+                .code_action_resolve(action, &ctx)
+                .unwrap()
+                .edit
+                .is_none()
+        );
+        // A community diagnostic can still propose an edit in another dialect.
+        let redmod_fix = Fix {
+            kind: FixKind::MakeFieldPublic,
+            uri: ctx.uri(&path).unwrap(),
+            edit: lsp::TextEdit::new(lsp::Range::default(), "public ".into()),
+            expected_source: "class Native {}".into(),
+            generation: server.generation,
+        };
+        server
+            .cached_fixes
+            .borrow_mut()
+            .entry(community)
+            .or_default()
+            .insert((0, 1), redmod_fix);
+        let action = lsp::CodeAction {
+            title: "fix all".into(),
+            data: Some(
+                serde_json::to_value(FixRequest::FixAll(
+                    FixKind::MakeFieldPublic,
+                    server.generation,
+                ))
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let resolved = server.code_action_resolve(action, &ctx).unwrap();
+        assert!(
+            matches!(resolved.edit.unwrap().document_changes, Some(lsp::DocumentChanges::Edits(edits)) if edits.is_empty())
+        );
+    }
 
     fn server() -> RedscriptLanguageServer {
         RedscriptLanguageServer {
             workspaces: HashMap::new(),
             compilation_cache: CompilationCache::default(),
-            cached_completions: RefCell::new(None),
             cached_fixes: RefCell::new(HashMap::new()),
             last_published_files: RefCell::new(HashSet::new()),
+            overlays: HashMap::new(),
+            standalone: HashMap::new(),
+            generation: 0,
         }
     }
 
@@ -910,7 +2206,7 @@ mod tests {
                 ctx.set_diagnostic_capabilities(&capabilities);
             }
             server
-                .publish_diagnostics(&diags, &symbols, &sources, &ctx)
+                .publish_diagnostics(&diags.iter().collect::<Vec<_>>(), &symbols, &sources, &ctx)
                 .unwrap();
             let lsp_server::Message::Notification(notification) = receiver.try_recv().unwrap()
             else {
@@ -938,6 +2234,88 @@ mod tests {
     }
 
     #[test]
+    fn replacement_conflict_diagnostics_include_related_information() {
+        let server = server();
+        let root = PathBuf::from("C:/scripts");
+        let previous_path = root.join("z-first.reds");
+        let primary_path = root.join("a-second.reds");
+        let sources = ast::SourceMap::new();
+        use redscript_compiler_frontend::{Aggregate, FunctionType, Method, MethodFlags, TypeDef};
+
+        let interner = TypeInterner::default();
+        let mut reporter = CompileErrorReporter::default();
+        let mut symbols = Symbols::with_default_types();
+        let mut aggregate = Aggregate::default();
+        aggregate.methods_mut().add(
+            "Value",
+            Method::new(
+                MethodFlags::new().with_is_native(true),
+                FunctionType::default(),
+                None,
+                [],
+                None,
+            ),
+        );
+        symbols.add_type(
+            interner.intern("NativeTarget"),
+            TypeDef::new([], TypeSchema::Aggregate(aggregate.into()), []),
+        );
+        sources.push_back(
+            &previous_path,
+            "\n@replaceMethod(NativeTarget)\nfunc Value() {}",
+        );
+        sources.push_back(
+            &primary_path,
+            "\n\n@replaceMethod(NativeTarget)\nfunc Value() {}",
+        );
+        sources.populate_boot_lib();
+        let (_, symbols) =
+            redscript_compiler_api::infer_from_sources(&sources, symbols, &mut reporter, &interner);
+        let diags = reporter.into_reported();
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(matches!(
+            diags[0],
+            Diagnostic::ReplaceMethodConflict(_, _, _, _)
+        ));
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let ctx = LspContext::new(sender);
+        server
+            .publish_diagnostics(&diags.iter().collect::<Vec<_>>(), &symbols, &sources, &ctx)
+            .unwrap();
+
+        let lsp_server::Message::Notification(notification) = receiver.try_recv().unwrap() else {
+            panic!("expected diagnostics notification");
+        };
+        assert_eq!(notification.method, "textDocument/publishDiagnostics");
+        let params: lsp::PublishDiagnosticsParams =
+            serde_json::from_value(notification.params).unwrap();
+        assert_eq!(params.uri, ctx.uri(&primary_path).unwrap());
+        assert_eq!(params.diagnostics.len(), 1);
+        let diagnostic = &params.diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(lsp::NumberOrString::String(
+                "REPLACE_METHOD_CONFLICT".into()
+            ))
+        );
+        assert_eq!(
+            diagnostic.range,
+            lsp::Range::new(lsp::Position::new(2, 0), lsp::Position::new(3, 15))
+        );
+        assert_eq!(
+            diagnostic.related_information,
+            Some(vec![lsp::DiagnosticRelatedInformation {
+                location: lsp::Location {
+                    uri: ctx.uri(&previous_path).unwrap(),
+                    range: lsp::Range::new(lsp::Position::new(1, 0), lsp::Position::new(2, 15)),
+                },
+                message: "previous replacement is overridden here".into(),
+            }])
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn publishing_replaces_diagnostics_without_clearing_first() {
         let mut server = server();
         let root = PathBuf::from("C:/scripts");
@@ -957,7 +2335,7 @@ mod tests {
 
         for _ in 0..2 {
             server
-                .publish_diagnostics(&diags, &symbols, &sources, &ctx)
+                .publish_diagnostics(&diags.iter().collect::<Vec<_>>(), &symbols, &sources, &ctx)
                 .unwrap();
             let messages: Vec<_> = receiver.try_iter().collect();
             assert_eq!(messages.len(), 1);
@@ -999,7 +2377,7 @@ mod tests {
         let sources = ast::SourceMap::new();
         let z = sources.push_back(root.join("z.reds"), "test");
         let a = sources.push_back(root.join("a.reds"), "test");
-        let mut diags = vec![
+        let mut diags = [
             Diagnostic::UnusedLocal(Span::new(0, 1, z)),
             Diagnostic::UnusedLocal(Span::new(2, 3, a)),
             Diagnostic::UnknownIntrinsic("z", Span::new(0, 2, a)),
@@ -1018,7 +2396,7 @@ mod tests {
                 .borrow_mut()
                 .extend([root.join("0.reds"), root.join("zz.reds")]);
             server
-                .publish_diagnostics(&diags, &symbols, &sources, &ctx)
+                .publish_diagnostics(&diags.iter().collect::<Vec<_>>(), &symbols, &sources, &ctx)
                 .unwrap();
             let params = receiver
                 .try_iter()
@@ -1084,6 +2462,14 @@ mod tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let ctx = LspContext::new(sender);
         let uri: lsp::Uri = "file:///C:/scripts/test.reds".parse().unwrap();
+        let mut server = server;
+        server.overlays.insert(
+            dialect::identity(&crate::server::path_from_uri(&uri).unwrap()),
+            Overlay {
+                text: String::new(),
+                version: 1,
+            },
+        );
         let kinds = [FixKind::MakeMethodPublic, FixKind::MakeFieldPublic];
         let fixes = kinds
             .into_iter()
@@ -1095,6 +2481,8 @@ mod tests {
                     Fix {
                         kind,
                         uri: uri.clone(),
+                        expected_source: String::new(),
+                        generation: 0,
                         edit: lsp::TextEdit::new(
                             lsp::Range::new(
                                 lsp::Position::new(0, start),
@@ -1113,11 +2501,21 @@ mod tests {
 
         for kind in [kinds[0], kinds[0], kinds[1]] {
             let action = lsp::CodeAction {
-                data: Some(serde_json::to_value(FixRequest::FixAll(kind)).unwrap()),
+                data: Some(
+                    serde_json::to_value(FixRequest::FixAll(kind, server.generation)).unwrap(),
+                ),
                 ..Default::default()
             };
             let resolved = server.code_action_resolve(action, &ctx).unwrap();
-            assert_eq!(resolved.edit.unwrap().changes.unwrap()[&uri].len(), 1);
+            let lsp::DocumentChanges::Edits(edits) =
+                resolved.edit.unwrap().document_changes.unwrap()
+            else {
+                panic!("expected document edits");
+            };
+            assert_eq!(edits.len(), 1);
+            assert_eq!(edits[0].text_document.uri, uri);
+            assert_eq!(edits[0].text_document.version, Some(1));
+            assert_eq!(edits[0].edits.len(), 1);
             assert_eq!(
                 server
                     .cached_fixes

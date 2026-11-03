@@ -20,6 +20,8 @@ pub struct LspServer<'a> {
     server: Box<dyn LanguageServer + 'a>,
     buffers: Buffers,
     context: LspContext,
+    watch_files: bool,
+    watched_roots: Vec<PathBuf>,
 }
 
 impl LspServer<'_> {
@@ -36,6 +38,13 @@ impl LspServer<'_> {
 
         let init_params: lsp::InitializeParams = serde_json::from_value(params)?;
         context.set_diagnostic_capabilities(&init_params.capabilities);
+        let watch_files = init_params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+            .and_then(|watch| watch.dynamic_registration)
+            .unwrap_or(false);
         let workspace_folders = init_params
             .workspace_folders
             .unwrap_or_default()
@@ -61,7 +70,10 @@ impl LspServer<'_> {
             server,
             context: context.clone(),
             buffers: Buffers::default(),
+            watch_files,
+            watched_roots: vec![],
         };
+        this.update_watchers()?;
 
         loop {
             match this.handle() {
@@ -73,6 +85,49 @@ impl LspServer<'_> {
             }
         }
 
+        Ok(())
+    }
+
+    fn update_watchers(&mut self) -> anyhow::Result<()> {
+        if !self.watch_files {
+            return Ok(());
+        }
+        let roots = self.server.watch_roots();
+        if roots == self.watched_roots {
+            return Ok(());
+        }
+        if !self.watched_roots.is_empty() {
+            self.connection.sender.send(Message::Request(lsp_server::Request::new(
+                RequestId::from("remove-source-watchers".to_owned()),
+                lsp::request::UnregisterCapability::METHOD.to_owned(),
+                json!({ "unregisterations": [{ "id": "source-watchers", "method": lsp::notification::DidChangeWatchedFiles::METHOD }] }),
+            )))?;
+        }
+        let watchers: Vec<_> = roots
+            .iter()
+            .flat_map(|root| {
+                let root = root.to_string_lossy().replace('\\', "/");
+                let root = root.strip_prefix("//?/").unwrap_or(&root);
+                ["**/*.reds", "**/*.[sS][cC][rR][iI][pP][tT]", ".redscript"]
+                    .map(|pattern| json!({ "globPattern": format!("{root}/{pattern}") }))
+            })
+            .collect();
+        if !watchers.is_empty() {
+            self.connection
+                .sender
+                .send(Message::Request(lsp_server::Request::new(
+                    RequestId::from("source-watchers".to_owned()),
+                    lsp::request::RegisterCapability::METHOD.to_owned(),
+                    lsp::RegistrationParams {
+                        registrations: vec![lsp::Registration {
+                            id: "source-watchers".into(),
+                            method: lsp::notification::DidChangeWatchedFiles::METHOD.into(),
+                            register_options: Some(json!({ "watchers": watchers })),
+                        }],
+                    },
+                )))?;
+        }
+        self.watched_roots = roots;
         Ok(())
     }
 
@@ -162,6 +217,7 @@ impl LspServer<'_> {
             },
 
             Message::Notification(notif) => match notif.method.as_str() {
+                lsp::notification::Initialized::METHOD => {}
                 lsp::notification::DidSaveTextDocument::METHOD => {
                     let lsp::DidSaveTextDocumentParams {
                         text_document: doc, ..
@@ -171,24 +227,46 @@ impl LspServer<'_> {
                 lsp::notification::DidOpenTextDocument::METHOD => {
                     let lsp::DidOpenTextDocumentParams { text_document: doc } =
                         serde_json::from_value(notif.params)?;
-                    self.buffers.add(doc.uri, doc.text);
+                    let uri = doc.uri;
+                    self.buffers.open(uri.clone(), doc.text, doc.version);
+                    self.server.document_changed(
+                        path_from_uri(&uri)?,
+                        self.buffers.get(&uri),
+                        &self.context,
+                    )?;
                 }
                 lsp::notification::DidCloseTextDocument::METHOD => {
                     let lsp::DidCloseTextDocumentParams { text_document: doc } =
                         serde_json::from_value(notif.params)?;
                     self.buffers.remove(&doc.uri);
+                    self.server
+                        .document_changed(path_from_uri(&doc.uri)?, None, &self.context)?;
                 }
                 lsp::notification::DidChangeTextDocument::METHOD => {
                     let lsp::DidChangeTextDocumentParams {
                         text_document: doc,
                         content_changes,
                     } = serde_json::from_value(notif.params)?;
-                    for change in content_changes {
-                        match change.range {
-                            Some(range) => self.buffers.update_range(&doc.uri, range, change.text),
-                            None => self.buffers.add(doc.uri.clone(), change.text),
-                        }
+                    if self.buffers.change(&doc.uri, doc.version, content_changes) {
+                        self.server.document_changed(
+                            path_from_uri(&doc.uri)?,
+                            self.buffers.get(&doc.uri),
+                            &self.context,
+                        )?;
                     }
+                }
+                lsp::notification::DidChangeWatchedFiles::METHOD => {
+                    let params: lsp::DidChangeWatchedFilesParams =
+                        serde_json::from_value(notif.params)?;
+                    let paths = params
+                        .changes
+                        .into_iter()
+                        .map(|event| path_from_uri(&event.uri))
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    self.server.files_changed(paths, &self.context)?;
+                }
+                lsp::notification::DidChangeConfiguration::METHOD => {
+                    self.server.files_changed(vec![], &self.context)?;
                 }
                 lsp::notification::DidChangeWorkspaceFolders::METHOD => {
                     let lsp::DidChangeWorkspaceFoldersParams { event } =
@@ -216,12 +294,24 @@ impl LspServer<'_> {
                     ));
                 }
             },
+            Message::Response(response)
+                if response.id == RequestId::from("source-watchers".to_owned())
+                    || response.id == RequestId::from("remove-source-watchers".to_owned()) =>
+            {
+                if let Some(error) = response.error {
+                    self.context.logger().error(format!(
+                        "Could not register source watchers: {}",
+                        error.message
+                    ));
+                }
+            }
             Message::Response(response) => {
                 self.context
                     .logger()
                     .info(format!("Received an unexpected response: {}", response.id));
             }
         };
+        self.update_watchers()?;
         Ok(false)
     }
 
@@ -283,6 +373,14 @@ impl LspServer<'_> {
 }
 
 pub trait LanguageServer {
+    fn watch_roots(&self) -> Vec<PathBuf>;
+    fn document_changed(
+        &mut self,
+        path: PathBuf,
+        buffer: Option<&Buffer>,
+        ctx: &LspContext,
+    ) -> anyhow::Result<()>;
+    fn files_changed(&mut self, paths: Vec<PathBuf>, ctx: &LspContext) -> anyhow::Result<()>;
     fn check(&mut self, path: PathBuf, ctx: &LspContext) -> anyhow::Result<()>;
     fn change_workspace_folders(
         &mut self,
@@ -401,7 +499,7 @@ pub struct Document<'a> {
 }
 
 impl<'a> Document<'a> {
-    fn new(path: PathBuf, body: &'a Buffer) -> Self {
+    pub(crate) fn new(path: PathBuf, body: &'a Buffer) -> Self {
         Self { path, body }
     }
 
@@ -421,7 +519,7 @@ pub struct CodeLocation<'a> {
 }
 
 impl<'a> CodeLocation<'a> {
-    fn new(document: Document<'a>, pos: u32) -> Self {
+    pub(crate) fn new(document: Document<'a>, pos: u32) -> Self {
         Self { document, pos }
     }
 
@@ -456,7 +554,7 @@ impl Options {
     }
 }
 
-fn path_from_uri(uri: &lsp::Uri) -> anyhow::Result<PathBuf> {
+pub(crate) fn path_from_uri(uri: &lsp::Uri) -> anyhow::Result<PathBuf> {
     if !uri
         .scheme()
         .is_some_and(|scheme| scheme.eq_lowercase("file"))
@@ -475,6 +573,8 @@ fn path_from_uri(uri: &lsp::Uri) -> anyhow::Result<PathBuf> {
 fn uri_from_path(path: &Path) -> anyhow::Result<lsp::Uri> {
     let mut encoded_path = fluent_uri::encoding::EString::new();
     let path_str = path.to_string_lossy().replace('\\', "/");
+    // canonicalize() uses Windows extended-length paths; these are not URI paths.
+    let path_str = path_str.strip_prefix("//?/").unwrap_or(&path_str);
 
     #[cfg(windows)]
     encoded_path.encode::<fluent_uri::encoding::encoder::Path>(&b"/");
