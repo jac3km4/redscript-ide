@@ -20,31 +20,31 @@ lsp-types = "0.97"
 
 [dependencies.redscript-redmod-formatter]
 git = "https://github.com/jac3km4/redscript"
-rev = "58c123c69458c4139db2276cb07d1cb444cb263e"
+rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55"
 
 [dependencies.redscript-redmod-adapter]
 git = "https://github.com/jac3km4/redscript"
-rev = "58c123c69458c4139db2276cb07d1cb444cb263e"
+rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55"
 
 [dependencies.redscript-community-formatter]
 git = "https://github.com/jac3km4/redscript"
-rev = "58c123c69458c4139db2276cb07d1cb444cb263e"
+rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55"
 
 [dependencies.redscript-compiler-api]
 git = "https://github.com/jac3km4/redscript"
-rev = "58c123c69458c4139db2276cb07d1cb444cb263e"
+rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55"
 
 [dependencies.redscript-dotfile]
 git = "https://github.com/jac3km4/redscript"
-rev = "58c123c69458c4139db2276cb07d1cb444cb263e"
+rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55"
 
 [dependencies.redscript-code-edit]
 git = "https://github.com/jac3km4/redscript"
-rev = "58c123c69458c4139db2276cb07d1cb444cb263e"
+rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55"
 
 [dev-dependencies]
 tempfile = "3"
-redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "58c123c69458c4139db2276cb07d1cb444cb263e" }
+redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55" }
 
 [patch.crates-io]
 stable_deref_trait = { git = "https://github.com/Storyyeller/stable_deref_trait", rev = "59a35e0" }
