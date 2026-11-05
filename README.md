@@ -36,84 +36,30 @@ indent = 2
 max_width = 80
 ```
 
-## REDmod and document lifecycle
+## REDmod support
 
-The server discovers case-sensitive `.reds` (community REDscript) and
-ASCII-case-insensitive `.script` (REDmod) extensions, including `.Script` and
-`.SCRIPT`. Other extensions are ignored; dialect selection
-never sniffs content or tries multiple parsers. Discovery respects the existing
-ignore-file rules, reports traversal errors, and canonicalizes/deduplicates files
-across overlapping roots. Missing configured roots are temporarily empty and
-produce an actionable warning in the client log; other I/O/traversal failures
-remain errors. Restore/create the root or update `source_roots` in `.redscript`,
-then refresh the workspace. Configured external roots participate in workspace
-analysis. Formatting configuration uses the deepest matching root; equal-depth
-ties use the lexicographically first workspace path. Workspace roots share one
-analysis universe, including roots shared by multiple workspaces.
+The server supports community REDscript (`.reds`) and REDmod (`.script`,
+case-insensitive), selected by file extension. Both can share a workspace and
+use the same `source_roots` configuration.
 
-Open documents retain versions and overlay disk contents across **all** open
-workspace buffers. New/deleted paths resolve through the nearest existing
-ancestor, keeping nested unsaved paths comparable before saving and after deletion;
-identity is not guaranteed across symlink creation or retargeting.
-Open/change/save/close and workspace-folder changes update
-snapshots; stale document changes are ignored. Diagnostics are published on
-startup and save, using the current workspace and standalone snapshots (including
-open-buffer overlays). Edits and filesystem/configuration events do not publish
-diagnostics; existing diagnostics remain until the next save. Source/config
-watched-file batches and configuration notifications reload roots and analysis,
-without replacing open buffers with disk contents. Clients supporting dynamic
-watched-file registration are registered for both extensions and `.redscript`;
-other clients must send watched-file notifications themselves. Standalone files
-are analyzed separately and cannot replace workspace state. Closing a standalone
-file drops its analysis; its diagnostics are cleared on the next save.
-Open/change snapshots reuse known workspace
-source text and apply overlays without rescanning or rereading dependencies;
-save/close, filesystem/configuration events, and workspace changes refresh disk
-state. Consecutive queued document changes are applied in order and rebuilt once
-per affected document, without crossing requests or other notifications. Edit
-snapshots prepare inputs but defer semantic analysis until a query or save needs
-it. Semantic analysis is still synchronous and non-incremental, so queries and
-saves can still be slow in large workspaces.
-Once analyzed, each snapshot retains its lowered analysis for diagnostics, hover,
-and definition lookup. Unmodified queries log
-`Query analysis=reused active snapshot` and do not reparse or recompile the
-workspace. Member completion uses a separate speculative snapshot because it
-temporarily erases the unfinished member token. Member completion results are
-cached across prefix-only edits when dependencies are unchanged.
+REDmod support is partial, not a replacement for the official compiler:
 
-REDmod syntax and adapter semantic diagnostics use the generic `OTHER` code.
-Workspace, standalone and query snapshots all use `redscript-redmod-adapter`, retaining
-written override intent and applying its per-file policy for function-wide local
-scope, dynamic-array operations and object truthiness. Community dependencies
-retain community semantics. Files with REDmod parse/capability errors retain their
-diagnostics but are excluded from lowering, so valid workspace files can still
-be analyzed (dependents of excluded declarations may report missing symbols).
-The REDmod parser now owns a separate native `redscript-redmod-ast`; only successful
-checked conversion contributes a shared query module. Malformed sources retain
-syntax diagnostics but no partial shared query tree. Native `for`/`do-while`
-analysis retains the adapter's control-flow plan, including in speculative queries;
-written conditions, steps and bodies support hover and definition lookup.
-Omitted arguments and other unimplemented semantics produce explicit capability
-errors even though they parse and can be indented. Queries directly over
-unconverted native-only syntax are not yet implemented.
-Hover, member completion, definition lookup and workspace symbols reuse shared
-analysis for the supported subset. **This is still a strict, partial REDmod implementation**, not full
-semantic parity or an official compiler replacement; see the pinned compiler's
-[semantic adapter README](https://github.com/jac3km4/redscript/blob/e1c44e801e46ce076a0b0bad64349313067cb5b3/crates/compiler/redmod/adapter/README.md)
-for supported features and limits.
-REDmod dynamic-array receivers offer the semantic adapter's 12 supported member
-operations (including `Size`, `PushBack`, and `Last`). Completion signatures and
-snippets use actual boot intrinsics, omit the receiver parameter, and specialize
-the array element type. These suggestions are `.script`-only and do not replace
-same-named user-class methods. References/rename and general keyword/local
-completion are not implemented.
-REDmod formatting uses the native conservative indentation formatter: four spaces
-per brace level, preserving comments, literal spelling/content, `override`, and
-line endings. It does not apply community spacing/wrapping settings or the LSP
-tab size, and invalid syntax produces no edits. Community-syntax code actions
-remain disabled for `.script`, including cross-file action targets. Resolved
-actions reject stale source snapshots and carry document versions for open edit
-targets.
+- Diagnostics, hover, go-to-definition, workspace symbols, and member completion
+  work for the [supported language subset](https://github.com/jac3km4/redscript/blob/e1c44e801e46ce076a0b0bad64349313067cb5b3/crates/compiler/redmod/adapter/README.md).
+- Array completions include operations such as `Size`, `PushBack`, and `Last`.
+  Completion tolerates a missing semicolon in the current statement; other syntax
+  or unsupported-feature errors can prevent semantic features from working.
+- Formatting preserves source spelling and uses four-space indentation, ignoring
+  community formatter settings. Invalid syntax is left unchanged.
+- References, rename, keyword/local completion, and community code actions are
+  not available for REDmod.
+
+### Workspace behavior
+
+Queries use unsaved changes from all open workspace files. Diagnostics update on
+startup and save, not on every edit. Standalone files are analyzed separately.
+Missing source roots produce a log warning; restore them or update `.redscript`
+and refresh the workspace. Analysis can be slow in large workspaces.
 
 ## usage
 

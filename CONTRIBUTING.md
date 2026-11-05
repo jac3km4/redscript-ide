@@ -40,38 +40,20 @@ parser/AST with a local compiler.
 Validate both repositories separately when changing the compiler and language
 server. IDE tests use small synthetic bundles, not a game installation.
 
-## REDmod integration boundary
+## REDmod integration
 
-`src/dialect.rs` owns extension classification (`.reds` exact, `.script`
-ASCII-case-insensitive), ignored-file traversal, canonical path deduplication and
-parser dispatch. Do not broaden the
-shared community `SourceMap` loader. `CompilationCache` stores explicit file/module
-pairs (including empty modules) and parse diagnostics. Query caches own temporary
-source storage; evaluator and inference receive the same module list.
+- Keep file discovery and parser selection in `src/dialect.rs`: `.reds` is exact,
+  `.script` is ASCII-case-insensitive. Do not change the community source loader.
+- Use `redscript_redmod_adapter::parse_file_with_metadata` and `process_sources`
+  for all snapshots, passing community modules as dependencies. Preserve file IDs
+  and complete parsed metadata when cloning.
+- Keep parse, adapter, and shared compiler diagnostics. Invalid REDmod files must
+  not block analysis of valid files or enter lowering through parser recovery.
+- Keep completion repairs temporary and strictly reparse them. Never change the
+  document or published diagnostics to make completion work.
+- Build REDmod array completions from `array_operations()` and real intrinsic
+  signatures, not a separate hardcoded list.
+- Use the native REDmod formatter for `.script` files. Never apply community
+  formatting or code edits to REDmod targets.
 
-`ParsedSources` retains community ASTs and REDmod `ParsedModule` metadata behind
-explicit file IDs. `redscript_redmod_adapter::parse_file_with_metadata` supplies syntax and
-capability diagnostics. Its `process_sources` adapter is the only analysis entry
-point for both authoritative and speculative snapshots, with community modules
-(including the boot library) passed as dependencies. Clone the complete parsed
-value so written override spans and private control-flow plans survive snapshots.
-Syntax or bridge-capability failures retain diagnostics but supply no shared query
-tree. Successfully converted modules with validation diagnostics remain available
-for lookup but are excluded from lowering to avoid blocking the entire batch.
-Dependencies of failed files may still report missing symbols.
-
-Retain both parse-time errors and adapter processing errors, alongside shared
-resolution/type diagnostics. REDmod errors retain their byte spans through
-`Diagnostic::Other` (`OTHER` code). This enables the adapter's partial semantic
-subset, not full REDmod parity; consult its README before expanding claims.
-The community formatter and code-edit generator must never edit `.script` targets.
-REDmod formatting calls `redscript_redmod_formatter::format_source` directly and emits
-a full-document UTF-16 edit only when valid source changes. Its fixed four-space
-indentation intentionally ignores community formatter options and LSP tab size.
-
-Array member completions read `redscript_redmod_adapter::array_operations()` rather than
-maintaining a second operation-name mapping. Gate them by the requesting file's
-REDmod dialect and the resolved dynamic-array receiver type. Build signatures
-from the actual intrinsic symbols, substituting the element type and omitting the
-receiver parameter; missing intrinsic symbols must not produce invented entries.
-Normal user-class member completion remains independent of this mapping.
+See the [README](README.md#redmod-support) for user-facing support and limitations.
