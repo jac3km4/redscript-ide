@@ -1483,13 +1483,18 @@ mod tests {
 
     use super::*;
 
+    fn tempdir() -> tempfile::TempDir {
+        // Windows runners can expose TEMP through an 8.3 alias such as RUNNER~1.
+        tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+    }
+
     fn fixture() -> (
         tempfile::TempDir,
         RedscriptLanguageServer,
         LspContext,
         crossbeam_channel::Receiver<lsp_server::Message>,
     ) {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempdir();
         let cache = temp.path().join("cache.bin");
         fs::write(
             &cache,
@@ -1585,7 +1590,7 @@ mod tests {
     fn diagnostics_are_only_published_on_save() {
         for standalone in [false, true] {
             let (temp, mut server, ctx, receiver) = fixture();
-            let external = tempfile::tempdir().unwrap();
+            let external = tempdir();
             let directory = if standalone {
                 external.path()
             } else {
@@ -1861,7 +1866,7 @@ mod tests {
                     .any(|(file, _)| *file == id)
             );
         });
-        let external = tempfile::tempdir().unwrap();
+        let external = tempdir();
         let standalone = external.path().join("solo.script");
         fs::write(&standalone, "class Standalone {}").unwrap();
         server.check(standalone.clone(), &ctx).unwrap();
@@ -2141,9 +2146,10 @@ mod tests {
         server
             .check_workspace(|_, _, diagnostics, _| {
                 assert!(
-                    diagnostics
-                        .iter()
-                        .any(|diag| diag.to_string().contains("requires override")),
+                    diagnostics.iter().any(|diag| {
+                        diag.to_string()
+                            == redscript_redmod_adapter::SemanticError::MissingOverride.to_string()
+                    }),
                     "{diagnostics:?}"
                 );
                 Ok(())
@@ -2161,10 +2167,10 @@ mod tests {
             .collect();
         assert!(publications.iter().any(|params| {
             params.version == Some(3)
-                && params
-                    .diagnostics
-                    .iter()
-                    .any(|diag| diag.message.contains("requires override"))
+                && params.diagnostics.iter().any(|diag| {
+                    diag.message
+                        == redscript_redmod_adapter::SemanticError::MissingOverride.to_string()
+                })
         }));
         let _buffers = open(
             &mut server,
@@ -2176,9 +2182,11 @@ mod tests {
         server
             .check_workspace(|_, _, diagnostics, _| {
                 assert!(
-                    diagnostics
-                        .iter()
-                        .any(|diag| diag.to_string().contains("no matching base signature")),
+                    diagnostics.iter().any(|diag| {
+                        diag.to_string()
+                            == redscript_redmod_adapter::SemanticError::OverrideWithoutBase
+                                .to_string()
+                    }),
                     "{diagnostics:?}"
                 );
                 Ok(())
@@ -2387,11 +2395,11 @@ mod tests {
 
     fn missing_external_root_diagnostics(initially_missing: bool) {
         let (temp, _server, ctx, receiver) = fixture();
-        let external = tempfile::tempdir().unwrap();
+        let external = tempdir();
         let root = external.path().join("nested/root");
         let removed = root.join("removed.script");
         let healthy = temp.path().join("healthy.script");
-        let standalone_dir = tempfile::tempdir().unwrap();
+        let standalone_dir = tempdir();
         let standalone = standalone_dir.path().join("solo.script");
         fs::write(&healthy, "class {").unwrap();
         fs::write(&standalone, "class {").unwrap();
@@ -2546,7 +2554,7 @@ mod tests {
     #[test]
     fn external_roots_watch_delete_and_configuration_reload() {
         let (temp, mut server, ctx, _receiver) = fixture();
-        let external = tempfile::tempdir().unwrap();
+        let external = tempdir();
         let script = external.path().join("external.script");
         fs::write(&script, "class External {}").unwrap();
         fs::write(
