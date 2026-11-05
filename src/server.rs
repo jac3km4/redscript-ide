@@ -40,6 +40,7 @@ impl LspServer<'_> {
 
         let init_params: lsp::InitializeParams = serde_json::from_value(params)?;
         context.set_diagnostic_capabilities(&init_params.capabilities);
+        context.set_code_action_capabilities(&init_params.capabilities);
         log_initialization(&context, &init_params);
         let watch_files = init_params
             .capabilities
@@ -262,13 +263,14 @@ impl LspServer<'_> {
                 let lsp::CodeActionParams {
                     text_document,
                     range,
+                    context,
                     ..
                 } = serde_json::from_value(params).map_err(invalid_params)?;
                 let path = path_from_uri(&text_document.uri).map_err(invalid_params)?;
                 let range = self
                     .range(&text_document.uri, range)
                     .map_err(invalid_params)?;
-                response_value(self.server.code_action(path, range, &self.context))
+                response_value(self.server.code_action(path, range, context, &self.context))
             }
             lsp::request::CodeActionResolveRequest::METHOD => {
                 let action = serde_json::from_value(params).map_err(invalid_params)?;
@@ -632,6 +634,7 @@ pub trait LanguageServer {
         &self,
         path: PathBuf,
         span: Range<u32>,
+        context: lsp::CodeActionContext,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp::CodeActionResponse>;
     fn code_action_resolve(
@@ -645,6 +648,9 @@ pub trait LanguageServer {
 pub struct LspContext {
     sender: Sender<Message>,
     diagnostic_tags: Vec<lsp::DiagnosticTag>,
+    code_action_literals: bool,
+    code_action_data: bool,
+    code_action_resolve_edit: bool,
 }
 
 impl LspContext {
@@ -652,6 +658,9 @@ impl LspContext {
         Self {
             sender,
             diagnostic_tags: vec![],
+            code_action_literals: false,
+            code_action_data: false,
+            code_action_resolve_edit: false,
         }
     }
 
@@ -663,6 +672,23 @@ impl LspContext {
             .and_then(|diags| diags.tag_support.as_ref())
             .map(|support| support.value_set.clone())
             .unwrap_or_default();
+    }
+
+    pub(crate) fn set_code_action_capabilities(&mut self, capabilities: &lsp::ClientCapabilities) {
+        let support = capabilities
+            .text_document
+            .as_ref()
+            .and_then(|doc| doc.code_action.as_ref());
+        self.code_action_literals =
+            support.is_some_and(|s| s.code_action_literal_support.is_some());
+        self.code_action_data = support.and_then(|s| s.data_support).unwrap_or(false);
+        self.code_action_resolve_edit = support
+            .and_then(|s| s.resolve_support.as_ref())
+            .is_some_and(|s| s.properties.iter().any(|property| property == "edit"));
+    }
+
+    pub fn supports_code_action_resolve_edit(&self) -> bool {
+        self.code_action_literals && self.code_action_data && self.code_action_resolve_edit
     }
 
     pub fn supports_diagnostic_tag(&self, tag: lsp::DiagnosticTag) -> bool {
@@ -837,6 +863,7 @@ fn capabilities() -> lsp::ServerCapabilities {
         document_formatting_provider: Some(lsp::OneOf::Left(true)),
         code_action_provider: Some(lsp::CodeActionProviderCapability::Options(
             lsp::CodeActionOptions {
+                code_action_kinds: Some(vec![lsp::CodeActionKind::QUICKFIX]),
                 resolve_provider: Some(true),
                 ..Default::default()
             },
@@ -964,9 +991,16 @@ mod tests {
         fn code_action(
             &self,
             _path: PathBuf,
-            _span: Range<u32>,
+            span: Range<u32>,
+            context: lsp::CodeActionContext,
             _ctx: &LspContext,
         ) -> anyhow::Result<lsp::CodeActionResponse> {
+            if let Some(events) = &self.events {
+                events.borrow_mut().push(format!(
+                    "code_action:{span:?}:{}",
+                    serde_json::to_string(&context)?
+                ));
+            }
             Ok(vec![])
         }
 
@@ -996,6 +1030,69 @@ mod tests {
             },
             client,
         )
+    }
+
+    #[test]
+    fn code_action_dispatch_preserves_context_and_converts_utf16_range() {
+        let (mut server, _client) = memory_server();
+        let events = Rc::new(RefCell::new(vec![]));
+        server.server = Box::new(StubServer {
+            events: Some(events.clone()),
+            ..Default::default()
+        });
+        let context = json!({
+            "diagnostics": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "message": "test"}],
+            "only": ["quickfix"],
+            "triggerKind": 1
+        });
+        let result = server.dispatch(lsp::request::CodeActionRequest::METHOD, json!({
+            "textDocument": {"uri": "file:///C:/test.reds"},
+            "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 3}},
+            "context": context
+        })).unwrap();
+        assert_eq!(result, json!([]));
+        let expected: lsp::CodeActionContext = serde_json::from_value(context).unwrap();
+        assert_eq!(
+            &*events.borrow(),
+            &[format!(
+                "code_action:2..6:{}",
+                serde_json::to_string(&expected).unwrap()
+            )]
+        );
+        let capabilities = serde_json::to_value(capabilities()).unwrap();
+        assert_eq!(
+            capabilities["codeActionProvider"]["codeActionKinds"],
+            json!(["quickfix"])
+        );
+        assert_eq!(capabilities["codeActionProvider"]["resolveProvider"], true);
+    }
+
+    #[test]
+    fn code_action_lazy_edits_require_all_client_capabilities() {
+        let (sender, _) = crossbeam_channel::unbounded();
+        let mut ctx = LspContext::new(sender);
+        assert!(!ctx.supports_code_action_resolve_edit());
+        for literals in [false, true] {
+            for data in [false, true] {
+                for edit in [false, true] {
+                    let mut support = json!({"dataSupport": data, "resolveSupport": {"properties": if edit { vec!["edit"] } else { vec!["command"] }}});
+                    if literals {
+                        support["codeActionLiteralSupport"] =
+                            json!({"codeActionKind": {"valueSet": ["quickfix"]}});
+                    }
+                    ctx.set_code_action_capabilities(
+                        &serde_json::from_value(json!({"textDocument": {"codeAction": support}}))
+                            .unwrap(),
+                    );
+                    assert_eq!(
+                        ctx.supports_code_action_resolve_edit(),
+                        literals && data && edit
+                    );
+                }
+            }
+        }
+        ctx.set_code_action_capabilities(&lsp::ClientCapabilities::default());
+        assert!(!ctx.supports_code_action_resolve_edit());
     }
 
     fn send_request(client: &Connection, id: i32, method: &str, params: Value) {

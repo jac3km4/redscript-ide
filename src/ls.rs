@@ -538,30 +538,50 @@ impl RedscriptLanguageServer {
         &self,
         path: PathBuf,
         span: Range<u32>,
-        _ctx: &LspContext,
+        context: lsp::CodeActionContext,
+        ctx: &LspContext,
     ) -> anyhow::Result<lsp::CodeActionResponse> {
-        if Dialect::of(&path) != Some(Dialect::Community) {
+        if Dialect::of(&path) != Some(Dialect::Community)
+            || context.only.as_ref().is_some_and(|kinds| {
+                !kinds
+                    .iter()
+                    .any(|kind| kind.as_str().is_empty() || kind == &lsp::CodeActionKind::QUICKFIX)
+            })
+        {
             return Ok(vec![]);
         }
         let path = dialect::identity(&path);
         let fixes = self.cached_fixes.borrow();
 
-        if let Some(fixes) = fixes.get(&path)
-            && let Some((&(start, end), fix)) = fixes.range(..(span.start, span.end)).last()
-            && (start..end).contains(&span.start)
-            && self.valid_fix(fix)
-        {
+        let mut actions = Vec::new();
+        let mut fix_all_kinds = Vec::new();
+        for (&(start, end), fix) in fixes.get(&path).into_iter().flat_map(|fixes| fixes.iter()) {
+            let matches = if span.is_empty() {
+                start == span.start || (start < span.start && span.start < end)
+            } else if start == end {
+                span.contains(&start)
+            } else {
+                start < span.end && span.start < end
+            };
+            if !matches || !self.valid_fix(fix) {
+                continue;
+            }
             let fix_one = lsp::CodeAction {
                 title: fix.kind.to_string(),
-                kind: Some(lsp::CodeActionKind::REFACTOR_REWRITE),
+                kind: Some(lsp::CodeActionKind::QUICKFIX),
                 data: Some(serde_json::to_value(FixRequest::FixOne(fix.clone()))?),
                 is_preferred: Some(true),
                 ..Default::default()
             };
 
+            actions.push(fix_one);
+            if fix_all_kinds.contains(&fix.kind) {
+                continue;
+            }
+            fix_all_kinds.push(fix.kind);
             let fix_all = lsp::CodeAction {
                 title: format!("{} - fix all in the workspace", fix.kind),
-                kind: Some(lsp::CodeActionKind::REFACTOR_REWRITE),
+                kind: Some(lsp::CodeActionKind::QUICKFIX),
                 data: Some(serde_json::to_value(FixRequest::FixAll(
                     fix.kind,
                     self.generation,
@@ -569,31 +589,38 @@ impl RedscriptLanguageServer {
                 ..Default::default()
             };
 
-            Ok(vec![
-                lsp::CodeActionOrCommand::CodeAction(fix_one),
-                lsp::CodeActionOrCommand::CodeAction(fix_all),
-            ])
-        } else {
-            Ok(vec![])
+            actions.push(fix_all);
         }
+        drop(fixes);
+        actions
+            .into_iter()
+            .map(|action| {
+                let action = if ctx.supports_code_action_resolve_edit() {
+                    action
+                } else {
+                    let mut action = self.code_action_resolve(action, ctx)?;
+                    action.data = None;
+                    action
+                };
+                Ok(lsp::CodeActionOrCommand::CodeAction(action))
+            })
+            .collect()
     }
 
     fn code_action_resolve(
         &self,
-        action: lsp::CodeAction,
+        mut action: lsp::CodeAction,
         _ctx: &LspContext,
     ) -> anyhow::Result<lsp::CodeAction> {
-        let Some(data) = action.data else {
+        let Some(data) = action.data.clone() else {
             return Ok(action);
         };
 
         let request: FixRequest = serde_json::from_value(data)?;
-        let action = match request {
-            FixRequest::FixOne(fix) if self.valid_fix(&fix) => lsp::CodeAction {
-                title: fix.kind.to_string(),
-                edit: Some(self.workspace_edit(vec![(fix.uri, vec![fix.edit])])),
-                ..Default::default()
-            },
+        match request {
+            FixRequest::FixOne(fix) if self.valid_fix(&fix) => {
+                action.edit = Some(self.workspace_edit(vec![(fix.uri, vec![fix.edit])]));
+            }
             FixRequest::FixAll(kind, generation) if generation == self.generation => {
                 let mut unique = HashSet::<(lsp::Uri, lsp::Range)>::new();
 
@@ -614,20 +641,15 @@ impl RedscriptLanguageServer {
                     }
                 }
 
-                lsp::CodeAction {
-                    title: kind.to_string(),
-                    edit: Some(self.workspace_edit(edits.into_iter().collect())),
-                    ..Default::default()
-                }
+                action.edit = Some(self.workspace_edit(edits.into_iter().collect()));
             }
-            _ => lsp::CodeAction {
-                title: action.title,
-                disabled: Some(lsp::CodeActionDisabled {
+            _ => {
+                action.edit = None;
+                action.disabled = Some(lsp::CodeActionDisabled {
                     reason: "This fix is stale or targets an unsupported dialect".into(),
-                }),
-                ..Default::default()
-            },
-        };
+                });
+            }
+        }
         Ok(action)
     }
 
@@ -1333,9 +1355,10 @@ impl LanguageServer for RedscriptLanguageServer {
         &self,
         path: PathBuf,
         span: Range<u32>,
+        context: lsp::CodeActionContext,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp_types::CodeActionResponse> {
-        self.code_action(path, span, ctx)
+        self.code_action(path, span, context, ctx)
     }
 
     fn code_action_resolve(
@@ -3625,6 +3648,189 @@ mod tests {
         let range = range(Span::new(start, start + 5, id), file).unwrap();
         assert_eq!(range.start, lsp::Position::new(0, 14));
         assert_eq!(range.end, lsp::Position::new(0, 19));
+    }
+
+    fn code_action_fixture() -> (RedscriptLanguageServer, LspContext, PathBuf) {
+        let mut server = server();
+        let (sender, _) = crossbeam_channel::unbounded();
+        let ctx = LspContext::new(sender);
+        let uri: lsp::Uri = "file:///C:/scripts/actions.reds".parse().unwrap();
+        let path = dialect::identity(&crate::server::path_from_uri(&uri).unwrap());
+        let text = "public class Test {}";
+        server.overlays.insert(
+            path.clone(),
+            Overlay {
+                text: text.into(),
+                version: 1,
+            },
+        );
+        let fixes = [(0, 10), (2, 4), (4, 6), (6, 6), (10, 12), (12, 14)]
+            .into_iter()
+            .map(|(start, end)| {
+                (
+                    (start, end),
+                    Fix {
+                        kind: FixKind::MakeFieldPublic,
+                        uri: uri.clone(),
+                        edit: lsp::TextEdit::new(lsp::Range::default(), format!("fix {start}")),
+                        expected_source: text.into(),
+                        generation: if start == 12 { 1 } else { 0 },
+                    },
+                )
+            })
+            .collect();
+        server.cached_fixes.borrow_mut().insert(path.clone(), fixes);
+        (server, ctx, path)
+    }
+
+    fn action_context(only: Option<Vec<lsp::CodeActionKind>>) -> lsp::CodeActionContext {
+        lsp::CodeActionContext {
+            diagnostics: vec![],
+            only,
+            trigger_kind: None,
+        }
+    }
+
+    fn literal_actions(actions: lsp::CodeActionResponse) -> Vec<lsp::CodeAction> {
+        actions
+            .into_iter()
+            .map(|action| {
+                let lsp::CodeActionOrCommand::CodeAction(action) = action else {
+                    panic!("expected a code action");
+                };
+                action
+            })
+            .collect()
+    }
+
+    #[test]
+    fn code_actions_select_all_overlapping_valid_fixes() {
+        let (server, ctx, path) = code_action_fixture();
+        for (span, expected) in [
+            (0..10, 5), // Exact range, nested fixes and a zero-width diagnostic.
+            (0..0, 2),  // Cursor at diagnostic start.
+            (2..4, 3),  // Exact nested range, including its containing diagnostic.
+            (3..5, 4),  // Partial overlap in both directions.
+            (4..4, 3),  // Exclude the diagnostic ending here.
+            (6..6, 3),  // Include a zero-width diagnostic at the cursor.
+            (6..10, 3),
+            (10..10, 2), // Exclude the diagnostic ending here.
+            (12..14, 0), // Stale fixes are never offered.
+        ] {
+            let actions = literal_actions(
+                server
+                    .code_action(path.clone(), span.clone(), action_context(None), &ctx)
+                    .unwrap(),
+            );
+            assert_eq!(actions.len(), expected, "selection {span:?}");
+            assert!(
+                actions
+                    .iter()
+                    .all(|action| action.kind == Some(lsp::CodeActionKind::QUICKFIX))
+            );
+            if !actions.is_empty() {
+                assert_eq!(
+                    actions
+                        .iter()
+                        .filter(|action| action.title.contains("fix all"))
+                        .count(),
+                    1
+                );
+            }
+        }
+        for only in [
+            vec![],
+            vec![lsp::CodeActionKind::REFACTOR],
+            vec![lsp::CodeActionKind::new("quickfix.child")],
+        ] {
+            assert!(
+                server
+                    .code_action(path.clone(), 0..10, action_context(Some(only)), &ctx)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        for only in [
+            vec![lsp::CodeActionKind::QUICKFIX],
+            vec![lsp::CodeActionKind::EMPTY],
+            vec![lsp::CodeActionKind::REFACTOR, lsp::CodeActionKind::QUICKFIX],
+        ] {
+            assert!(
+                !server
+                    .code_action(path.clone(), 0..10, action_context(Some(only)), &ctx)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(
+            server
+                .code_action(
+                    path.with_extension("script"),
+                    0..10,
+                    action_context(None),
+                    &ctx
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn code_actions_negotiate_lazy_edits_and_preserve_properties_on_resolve() {
+        let (mut server, mut ctx, path) = code_action_fixture();
+        for support in [
+            serde_json::json!({}),
+            serde_json::json!({"dataSupport": true, "resolveSupport": {"properties": ["edit"]}}),
+            serde_json::json!({"codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["quickfix"]}}, "resolveSupport": {"properties": ["edit"]}}),
+            serde_json::json!({"codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["quickfix"]}}, "dataSupport": true, "resolveSupport": {"properties": ["command"]}}),
+            serde_json::json!({"codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["quickfix"]}}, "dataSupport": true, "resolveSupport": {"properties": ["edit"]}}),
+        ] {
+            let lazy = support.get("codeActionLiteralSupport").is_some()
+                && support.get("dataSupport") == Some(&serde_json::json!(true))
+                && support.pointer("/resolveSupport/properties/0")
+                    == Some(&serde_json::json!("edit"));
+            let capabilities = serde_json::from_value(
+                serde_json::json!({"textDocument": {"codeAction": support}}),
+            )
+            .unwrap();
+            ctx.set_code_action_capabilities(&capabilities);
+            let actions = literal_actions(
+                server
+                    .code_action(path.clone(), 0..0, action_context(None), &ctx)
+                    .unwrap(),
+            );
+            assert_eq!(actions.len(), 2);
+            for mut action in actions {
+                assert_eq!(action.edit.is_none(), lazy);
+                assert_eq!(action.data.is_some(), lazy);
+                if !lazy {
+                    continue;
+                }
+                action.diagnostics = Some(vec![lsp::Diagnostic::new_simple(
+                    lsp::Range::default(),
+                    "diagnostic".into(),
+                )]);
+                action.command = Some(lsp::Command::new("command".into(), "test".into(), None));
+                let mut resolved = server.code_action_resolve(action.clone(), &ctx).unwrap();
+                assert!(resolved.edit.take().is_some());
+                assert_eq!(resolved, action);
+                let mut unchanged = action.clone();
+                unchanged.data = None;
+                assert_eq!(
+                    server.code_action_resolve(unchanged.clone(), &ctx).unwrap(),
+                    unchanged
+                );
+
+                server.generation += 1;
+                action.edit = Some(lsp::WorkspaceEdit::default());
+                let mut stale = server.code_action_resolve(action.clone(), &ctx).unwrap();
+                assert!(stale.edit.is_none());
+                assert!(stale.disabled.take().is_some());
+                action.edit = None;
+                assert_eq!(stale, action);
+                server.generation -= 1;
+            }
+        }
     }
 
     #[test]
