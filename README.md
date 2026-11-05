@@ -8,10 +8,13 @@ For development setup and validation commands, see [Contributing](CONTRIBUTING.m
 
 - error and warning diagnostics
 - autocompletion for methods and fields
-- hover for function definitions and types
-- go-to-definition
+- hover for function definitions and types, including specialized generic field types
+- go-to-definition for types, functions, fields, local variables, and captured locals
   - REDmod `.script` parsing and shared-frontend navigation (see limitations below)
-- workspace symbols
+- workspace symbols for types, functions, methods, and fields
+- document symbols for outlines and breadcrumbs in both dialects
+- quick fixes for supported community diagnostics
+- completion snippets and Markdown documentation when supported by the client
 - formatting (beta)
 - debugger (requires [redscript-dap](https://github.com/jac3km4/redscript-dap))
 - hooks for external tools

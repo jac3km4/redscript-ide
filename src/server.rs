@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::time::Instant;
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, bail};
 use crossbeam_channel::Sender;
 use lsp_server::{Connection, ErrorCode, Message, RequestId, Response, ResponseError};
 use lsp_types::notification::Notification;
@@ -41,6 +41,7 @@ impl LspServer<'_> {
         let init_params: lsp::InitializeParams = serde_json::from_value(params)?;
         context.set_diagnostic_capabilities(&init_params.capabilities);
         context.set_code_action_capabilities(&init_params.capabilities);
+        context.set_presentation_capabilities(&init_params.capabilities);
         log_initialization(&context, &init_params);
         let watch_files = init_params
             .capabilities
@@ -213,7 +214,10 @@ impl LspServer<'_> {
                 let doc = self
                     .document_location(&params.text_document.uri, params.position)
                     .map_err(invalid_params)?;
-                response_value(self.server.hover(doc, &self.context))
+                response_value(self.server.hover(doc, &self.context).map(|mut hover| {
+                    self.context.adapt_hover(&mut hover);
+                    hover
+                }))
             }
             lsp::request::Completion::METHOD => {
                 let lsp::CompletionParams {
@@ -223,8 +227,16 @@ impl LspServer<'_> {
                 let doc = self
                     .document_location(&params.text_document.uri, params.position)
                     .map_err(invalid_params)?;
-                let completion = self.server.completion(doc, &self.context);
-                response_value(completion.as_deref().map_err(|err| anyhow!("{err}")))
+                response_value(
+                    self.server
+                        .completion(doc, &self.context)
+                        .map(|completion| {
+                            // Keep cached completions independent of client presentation capabilities.
+                            let mut completion = completion.as_ref().clone();
+                            self.context.adapt_completion(&mut completion);
+                            completion
+                        }),
+                )
             }
             lsp::request::GotoDefinition::METHOD => {
                 let lsp::GotoDefinitionParams {
@@ -240,7 +252,14 @@ impl LspServer<'_> {
                 let lsp::DocumentSymbolParams { text_document, .. } =
                     serde_json::from_value(params).map_err(invalid_params)?;
                 let doc = self.document(&text_document.uri).map_err(invalid_params)?;
-                response_value(self.server.document_symbols(doc, &self.context))
+                response_value(
+                    self.server
+                        .document_symbols(doc, &self.context)
+                        .map(|symbols| {
+                            self.context
+                                .adapt_document_symbols(symbols, &text_document.uri)
+                        }),
+                )
             }
             lsp::request::WorkspaceSymbolRequest::METHOD => {
                 let lsp::WorkspaceSymbolParams { query, .. } =
@@ -644,6 +663,56 @@ pub trait LanguageServer {
     ) -> anyhow::Result<lsp::CodeAction>;
 }
 
+/// Preserve the client's preference order, with plaintext as the capability default.
+fn preferred_markup(formats: Option<&[lsp::MarkupKind]>) -> lsp::MarkupKind {
+    formats
+        .into_iter()
+        .flatten()
+        .find(|kind| matches!(kind, lsp::MarkupKind::Markdown | lsp::MarkupKind::PlainText))
+        .cloned()
+        .unwrap_or(lsp::MarkupKind::PlainText)
+}
+
+fn plaintext_marked_string(value: &lsp::MarkedString) -> String {
+    match value {
+        lsp::MarkedString::String(value) => plaintext_markup(value),
+        lsp::MarkedString::LanguageString(value) => value.value.clone(),
+    }
+}
+
+/// Remove the Markdown structure emitted by our displays, keeping fenced code literal.
+/// This is not a general Markdown parser for arbitrary user documentation.
+fn plaintext_markup(markdown: &str) -> String {
+    let mut lines = Vec::new();
+    let mut fenced = false;
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("```") {
+            if fenced {
+                fenced = false;
+            } else if let Some(code) = rest.strip_suffix("```") {
+                // Field displays use a single-line fence rather than a code block.
+                lines.push(code.to_owned());
+            } else {
+                fenced = true;
+            }
+        } else if fenced {
+            lines.push(line.to_owned());
+        } else if matches!(trimmed, "---" | "***" | "___") {
+            lines.push(String::new());
+        } else {
+            let heading = trimmed.trim_start_matches('#');
+            let text = if heading.len() != trimmed.len() && heading.starts_with(' ') {
+                heading.trim_start()
+            } else {
+                line
+            };
+            lines.push(text.replace('`', ""));
+        }
+    }
+    lines.join("\n").trim().to_owned()
+}
+
 #[derive(Debug, Clone)]
 pub struct LspContext {
     sender: Sender<Message>,
@@ -651,6 +720,11 @@ pub struct LspContext {
     code_action_literals: bool,
     code_action_data: bool,
     code_action_resolve_edit: bool,
+    completion_snippets: bool,
+    completion_label_details: bool,
+    completion_documentation_format: lsp::MarkupKind,
+    hover_format: lsp::MarkupKind,
+    hierarchical_document_symbols: bool,
 }
 
 impl LspContext {
@@ -661,6 +735,11 @@ impl LspContext {
             code_action_literals: false,
             code_action_data: false,
             code_action_resolve_edit: false,
+            completion_snippets: false,
+            completion_label_details: false,
+            completion_documentation_format: lsp::MarkupKind::PlainText,
+            hover_format: lsp::MarkupKind::PlainText,
+            hierarchical_document_symbols: false,
         }
     }
 
@@ -685,6 +764,117 @@ impl LspContext {
         self.code_action_resolve_edit = support
             .and_then(|s| s.resolve_support.as_ref())
             .is_some_and(|s| s.properties.iter().any(|property| property == "edit"));
+    }
+
+    fn set_presentation_capabilities(&mut self, capabilities: &lsp::ClientCapabilities) {
+        let doc = capabilities.text_document.as_ref();
+        self.hierarchical_document_symbols = doc
+            .and_then(|doc| doc.document_symbol.as_ref())
+            .and_then(|symbols| symbols.hierarchical_document_symbol_support)
+            .unwrap_or(false);
+        let completion = doc
+            .and_then(|doc| doc.completion.as_ref())
+            .and_then(|completion| completion.completion_item.as_ref());
+        self.completion_snippets = completion
+            .and_then(|item| item.snippet_support)
+            .unwrap_or(false);
+        self.completion_label_details = completion
+            .and_then(|item| item.label_details_support)
+            .unwrap_or(false);
+        self.completion_documentation_format =
+            preferred_markup(completion.and_then(|item| item.documentation_format.as_deref()));
+        self.hover_format = preferred_markup(
+            doc.and_then(|doc| doc.hover.as_ref())
+                .and_then(|hover| hover.content_format.as_deref()),
+        );
+    }
+
+    fn adapt_document_symbols(
+        &self,
+        symbols: lsp::DocumentSymbolResponse,
+        uri: &lsp::Uri,
+    ) -> lsp::DocumentSymbolResponse {
+        fn flatten(
+            symbols: Vec<lsp::DocumentSymbol>,
+            uri: &lsp::Uri,
+            container_name: Option<&str>,
+            result: &mut Vec<lsp::SymbolInformation>,
+        ) {
+            for symbol in symbols {
+                #[allow(deprecated)]
+                result.push(lsp::SymbolInformation {
+                    name: symbol.name.clone(),
+                    kind: symbol.kind,
+                    tags: symbol.tags,
+                    deprecated: symbol.deprecated,
+                    location: lsp::Location::new(uri.clone(), symbol.range),
+                    container_name: container_name.map(str::to_owned),
+                });
+                flatten(
+                    symbol.children.unwrap_or_default(),
+                    uri,
+                    Some(&symbol.name),
+                    result,
+                );
+            }
+        }
+
+        match symbols {
+            lsp::DocumentSymbolResponse::Nested(symbols) if !self.hierarchical_document_symbols => {
+                let mut result = Vec::new();
+                flatten(symbols, uri, None, &mut result);
+                lsp::DocumentSymbolResponse::Flat(result)
+            }
+            symbols => symbols,
+        }
+    }
+
+    fn adapt_hover(&self, hover: &mut lsp::Hover) {
+        if self.hover_format == lsp::MarkupKind::PlainText {
+            let value = match &hover.contents {
+                lsp::HoverContents::Markup(content) => {
+                    if content.kind == lsp::MarkupKind::PlainText {
+                        return;
+                    }
+                    plaintext_markup(&content.value)
+                }
+                lsp::HoverContents::Scalar(value) => plaintext_marked_string(value),
+                lsp::HoverContents::Array(values) => values
+                    .iter()
+                    .map(plaintext_marked_string)
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            };
+            hover.contents = lsp::HoverContents::Markup(lsp::MarkupContent {
+                kind: lsp::MarkupKind::PlainText,
+                value,
+            });
+        }
+    }
+
+    fn adapt_completion(&self, completion: &mut lsp::CompletionResponse) {
+        let items = match completion {
+            lsp::CompletionResponse::Array(items) => items,
+            lsp::CompletionResponse::List(list) => &mut list.items,
+        };
+        for item in items {
+            if !self.completion_snippets
+                && item.insert_text_format == Some(lsp::InsertTextFormat::SNIPPET)
+            {
+                item.insert_text = Some(item.label.clone());
+                item.insert_text_format = Some(lsp::InsertTextFormat::PLAIN_TEXT);
+            }
+            if !self.completion_label_details {
+                item.label_details = None;
+            }
+            if self.completion_documentation_format == lsp::MarkupKind::PlainText
+                && let Some(lsp::Documentation::MarkupContent(content)) = &mut item.documentation
+                && content.kind == lsp::MarkupKind::Markdown
+            {
+                content.value = plaintext_markup(&content.value);
+                content.kind = lsp::MarkupKind::PlainText;
+            }
+        }
     }
 
     pub fn supports_code_action_resolve_edit(&self) -> bool {
@@ -883,6 +1073,7 @@ mod tests {
     struct StubServer {
         hover: Option<lsp::Hover>,
         completion: Option<lsp::CompletionResponse>,
+        document_symbols: Option<lsp::DocumentSymbolResponse>,
         allow_document_changes: bool,
         events: Option<Rc<RefCell<Vec<String>>>>,
     }
@@ -965,10 +1156,18 @@ mod tests {
 
         fn document_symbols(
             &self,
-            _doc: Document<'_>,
+            doc: Document<'_>,
             _ctx: &LspContext,
         ) -> anyhow::Result<lsp::DocumentSymbolResponse> {
-            Ok(lsp::DocumentSymbolResponse::Nested(vec![]))
+            if let Some(events) = &self.events {
+                events
+                    .borrow_mut()
+                    .push(format!("document_symbols:{}", doc.buffer().contents()));
+            }
+            Ok(self
+                .document_symbols
+                .clone()
+                .unwrap_or_else(|| lsp::DocumentSymbolResponse::Nested(vec![])))
         }
 
         fn workspace_symbol(
@@ -1030,6 +1229,332 @@ mod tests {
             },
             client,
         )
+    }
+
+    fn presentation_capabilities(formats: Value, enabled: bool) -> lsp::ClientCapabilities {
+        serde_json::from_value(json!({
+            "textDocument": {
+                "completion": {"completionItem": {
+                    "snippetSupport": enabled,
+                    "labelDetailsSupport": enabled,
+                    "documentationFormat": formats
+                }},
+                "hover": {"contentFormat": formats}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn presentation_capabilities_default_to_plaintext_without_optional_features() {
+        let (server, _client) = memory_server();
+        let mut ctx = server.context;
+        for capabilities in [
+            lsp::ClientCapabilities::default(),
+            serde_json::from_value(
+                json!({"textDocument": {"completion": {"completionItem": {}}, "hover": {}}}),
+            )
+            .unwrap(),
+            presentation_capabilities(json!([]), false),
+        ] {
+            ctx.set_presentation_capabilities(&capabilities);
+            assert!(!ctx.completion_snippets);
+            assert!(!ctx.completion_label_details);
+            assert_eq!(
+                ctx.completion_documentation_format,
+                lsp::MarkupKind::PlainText
+            );
+            assert_eq!(ctx.hover_format, lsp::MarkupKind::PlainText);
+        }
+    }
+
+    #[test]
+    fn presentation_capabilities_respect_format_preference_and_reset() {
+        let (server, _client) = memory_server();
+        let mut ctx = server.context;
+        for (formats, expected) in [
+            (json!(["markdown", "plaintext"]), lsp::MarkupKind::Markdown),
+            (json!(["plaintext", "markdown"]), lsp::MarkupKind::PlainText),
+            (json!(["markdown"]), lsp::MarkupKind::Markdown),
+        ] {
+            ctx.set_presentation_capabilities(&presentation_capabilities(formats, true));
+            assert!(ctx.completion_snippets);
+            assert!(ctx.completion_label_details);
+            assert_eq!(ctx.completion_documentation_format, expected);
+            assert_eq!(ctx.hover_format, expected);
+        }
+        ctx.set_presentation_capabilities(&lsp::ClientCapabilities::default());
+        assert!(!ctx.completion_snippets);
+        assert!(!ctx.completion_label_details);
+        assert_eq!(
+            ctx.completion_documentation_format,
+            lsp::MarkupKind::PlainText
+        );
+        assert_eq!(ctx.hover_format, lsp::MarkupKind::PlainText);
+    }
+
+    #[test]
+    fn completion_features_and_formats_are_negotiated_independently() {
+        let (server, _client) = memory_server();
+        let mut ctx = server.context;
+        ctx.set_presentation_capabilities(
+            &serde_json::from_value(json!({
+                "textDocument": {
+                    "completion": {"completionItem": {
+                        "snippetSupport": true,
+                        "documentationFormat": ["plaintext", "markdown"]
+                    }},
+                    "hover": {"contentFormat": ["markdown", "plaintext"]}
+                }
+            }))
+            .unwrap(),
+        );
+        let mut completion = serde_json::from_value(json!([{
+            "label": "Foo", "labelDetails": {"detail": "()"},
+            "insertText": "Foo()", "insertTextFormat": 2,
+            "documentation": {"kind": "markdown", "value": "---\nDocs."}
+        }]))
+        .unwrap();
+        ctx.adapt_completion(&mut completion);
+        let result = serde_json::to_value(completion).unwrap();
+        assert_eq!(result[0]["insertText"], "Foo()");
+        assert_eq!(result[0]["insertTextFormat"], 2);
+        assert!(result[0].get("labelDetails").is_none());
+        assert_eq!(
+            result[0]["documentation"],
+            json!({"kind": "plaintext", "value": "Docs."})
+        );
+        assert_eq!(ctx.hover_format, lsp::MarkupKind::Markdown);
+
+        ctx.set_presentation_capabilities(
+            &serde_json::from_value(json!({
+                "textDocument": {"completion": {"completionItem": {"labelDetailsSupport": true}}}
+            }))
+            .unwrap(),
+        );
+        let mut completion = serde_json::from_value(json!([{
+            "label": "Foo", "labelDetails": {"detail": "()"},
+            "insertText": "Foo(${1:value})", "insertTextFormat": 2
+        }]))
+        .unwrap();
+        ctx.adapt_completion(&mut completion);
+        let result = serde_json::to_value(completion).unwrap();
+        assert_eq!(result[0]["labelDetails"], json!({"detail": "()"}));
+        assert_eq!(result[0]["insertText"], "Foo");
+        assert_eq!(result[0]["insertTextFormat"], 1);
+    }
+
+    #[test]
+    fn plaintext_removes_generated_markdown_but_preserves_code() {
+        assert_eq!(
+            plaintext_markup(
+                "### Signature\n```\nFoo(value: Int32) -> Bool\n```\n---\nDocs with `code`.\n---\n### Symbol\n```\nFoo\n```\n"
+            ),
+            "Signature\nFoo(value: Int32) -> Bool\n\nDocs with code.\n\nSymbol\nFoo"
+        );
+        assert_eq!(
+            plaintext_markup("### Field\n```value: Int32```\n---\nThe stored value.\n\n"),
+            "Field\nvalue: Int32\n\nThe stored value."
+        );
+        assert_eq!(
+            plaintext_markup("### Type\n```\nInt32\n```\n"),
+            "Type\nInt32"
+        );
+        assert_eq!(
+            plaintext_markup("```reds\n### literal\n---\n`value`\n```"),
+            "### literal\n---\n`value`"
+        );
+        let docs = crate::display::DocDisplay::new(&["/// Example `value`."]).to_string();
+        assert_eq!(plaintext_markup(&docs), "Example value.");
+    }
+
+    #[test]
+    fn dispatch_negotiates_hover_and_both_completion_shapes_without_changing_source() {
+        let params = json!({
+            "textDocument": {"uri": "file:///C:/test.reds"},
+            "position": {"line": 0, "character": 3}
+        });
+        let hover = json!({
+            "contents": {"kind": "markdown", "value": "### Field\n```value: Int32```\n---\nDocs.\n"},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}
+        });
+        let items = json!([{
+            "label": "Foo",
+            "labelDetails": {"detail": "(value: Int32) -> Bool"},
+            "detail": "(value: Int32) -> Bool",
+            "kind": 2,
+            "insertText": "Foo(${1:value})",
+            "insertTextFormat": 2,
+            "documentation": {"kind": "markdown", "value": "---\nDocs with `code`.\n"}
+        }, {"label": "value", "insertText": "value", "insertTextFormat": 1}]);
+        for list in [false, true] {
+            let source = if list {
+                json!({"isIncomplete": true, "items": items})
+            } else {
+                items.clone()
+            };
+            let (mut server, _client) = memory_server();
+            server.server = Box::new(StubServer {
+                hover: Some(serde_json::from_value(hover.clone()).unwrap()),
+                completion: Some(serde_json::from_value(source.clone()).unwrap()),
+                ..Default::default()
+            });
+            // Repeated requests with changing capabilities must not mutate semantic results.
+            for formats in [
+                json!([]),
+                json!(["markdown", "plaintext"]),
+                json!(["plaintext", "markdown"]),
+            ] {
+                let markdown = formats == json!(["markdown", "plaintext"]);
+                server
+                    .context
+                    .set_presentation_capabilities(&presentation_capabilities(formats, markdown));
+                let result = server
+                    .dispatch(lsp::request::Completion::METHOD, params.clone())
+                    .unwrap();
+                let result_items = if list { &result["items"] } else { &result };
+                if markdown {
+                    assert_eq!(result, source);
+                } else {
+                    assert_eq!(result_items[0]["insertText"], "Foo");
+                    assert_eq!(result_items[0]["insertTextFormat"], 1);
+                    assert!(result_items[0].get("labelDetails").is_none());
+                    assert_eq!(result_items[0]["detail"], items[0]["detail"]);
+                    assert_eq!(
+                        result_items[0]["documentation"],
+                        json!({"kind": "plaintext", "value": "Docs with code."})
+                    );
+                    assert_eq!(result_items[1], items[1]);
+                    if list {
+                        assert_eq!(result["isIncomplete"], true);
+                    }
+                }
+                let result = server
+                    .dispatch(lsp::request::HoverRequest::METHOD, params.clone())
+                    .unwrap();
+                assert_eq!(result["range"], hover["range"]);
+                if markdown {
+                    assert_eq!(result, hover);
+                } else {
+                    assert_eq!(
+                        result["contents"],
+                        json!({"kind": "plaintext", "value": "Field\nvalue: Int32\n\nDocs."})
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plaintext_hover_handles_legacy_contents_and_leaves_plaintext_literal() {
+        let (server, _client) = memory_server();
+        for (contents, expected) in [
+            (json!("### Type\n```\nInt32\n```"), "Type\nInt32"),
+            (
+                json!(["### Type", {"language": "reds", "value": "`literal`"}]),
+                "Type\n\n`literal`",
+            ),
+            (
+                json!({"kind": "plaintext", "value": "### literal"}),
+                "### literal",
+            ),
+        ] {
+            let mut hover = serde_json::from_value(json!({"contents": contents})).unwrap();
+            server.context.adapt_hover(&mut hover);
+            assert_eq!(
+                serde_json::to_value(hover).unwrap()["contents"],
+                json!({"kind": "plaintext", "value": expected})
+            );
+        }
+    }
+
+    #[test]
+    fn document_symbol_dispatch_negotiates_hierarchy_and_advertises_provider() {
+        let uri = "file:///C:/test.reds";
+        let range = json!({
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 0, "character": 7}
+        });
+        // The buffer is é😀test: test starts at UTF-16 column 3, not byte offset 6.
+        let selection = json!({
+            "start": {"line": 0, "character": 3},
+            "end": {"line": 0, "character": 7}
+        });
+        let source = json!([{
+            "name": "é😀", "detail": "class", "kind": 5,
+            "range": range, "selectionRange": selection,
+            "children": [{
+                "name": "test", "kind": 6, "tags": [1], "deprecated": true,
+                "range": selection, "selectionRange": selection,
+                "children": [{
+                    "name": "local", "kind": 13,
+                    "range": selection, "selectionRange": selection
+                }]
+            }]
+        }, {
+            "name": "top", "kind": 12,
+            "range": selection, "selectionRange": selection
+        }]);
+        let flat = json!([
+            {"name": "é😀", "kind": 5, "location": {"uri": uri, "range": range}},
+            {"name": "test", "kind": 6, "tags": [1], "deprecated": true,
+             "location": {"uri": uri, "range": selection}, "containerName": "é😀"},
+            {"name": "local", "kind": 13,
+             "location": {"uri": uri, "range": selection}, "containerName": "test"},
+            {"name": "top", "kind": 12, "location": {"uri": uri, "range": selection}}
+        ]);
+        let (mut server, _client) = memory_server();
+        let events = Rc::new(RefCell::new(vec![]));
+        server.server = Box::new(StubServer {
+            document_symbols: Some(serde_json::from_value(source.clone()).unwrap()),
+            events: Some(events.clone()),
+            ..Default::default()
+        });
+        let params = json!({"textDocument": {"uri": uri}});
+        // Cover default capabilities, explicit support, explicit denial, and reset.
+        for support in [None, Some(true), Some(false), Some(true), None] {
+            if let Some(support) = support {
+                server.context.set_presentation_capabilities(
+                    &serde_json::from_value(json!({"textDocument": {"documentSymbol": {
+                        "hierarchicalDocumentSymbolSupport": support
+                    }}}))
+                    .unwrap(),
+                );
+            } else {
+                server
+                    .context
+                    .set_presentation_capabilities(&lsp::ClientCapabilities::default());
+            }
+            let result = server
+                .dispatch(lsp::request::DocumentSymbolRequest::METHOD, params.clone())
+                .unwrap();
+            let expected = if support == Some(true) {
+                &source
+            } else {
+                &flat
+            };
+            assert_eq!(&result, expected);
+        }
+        assert_eq!(
+            &*events.borrow(),
+            &vec!["document_symbols:é😀test".to_owned(); 5]
+        );
+        let capabilities = serde_json::to_value(capabilities()).unwrap();
+        assert_eq!(capabilities["documentSymbolProvider"], true);
+
+        // A server already returning SymbolInformation needs no adaptation.
+        server.server = Box::new(StubServer {
+            document_symbols: Some(lsp::DocumentSymbolResponse::Flat(
+                serde_json::from_value(flat.clone()).unwrap(),
+            )),
+            ..Default::default()
+        });
+        assert_eq!(
+            server
+                .dispatch(lsp::request::DocumentSymbolRequest::METHOD, params)
+                .unwrap(),
+            flat
+        );
     }
 
     #[test]
