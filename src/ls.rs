@@ -25,6 +25,9 @@ use crate::dialect::{self, Dialect, ParsedSources};
 use crate::query::{AtContext, ExprAt};
 use crate::server::{CodeLocation, Document, LanguageServer, LspContext};
 
+#[path = "document_symbols.rs"]
+mod document_symbols;
+
 const DIAGNOSTIC_PASSES: &[&'static (dyn DiagnosticPass + 'static)] = &[&UnusedLocals];
 
 type FixMap = HashMap<PathBuf, BTreeMap<(u32, u32), Fix>>;
@@ -478,6 +481,16 @@ impl RedscriptLanguageServer {
             results.extend(funcs);
             Ok(lsp::WorkspaceSymbolResponse::Flat(results))
         })
+    }
+
+    pub(crate) fn document_symbols(
+        &self,
+        doc: Document<'_>,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<lsp::DocumentSymbolResponse> {
+        Ok(lsp::DocumentSymbolResponse::Nested(
+            document_symbols::document_symbols(doc.path(), doc.buffer().contents().to_string()),
+        ))
     }
 
     fn format_document(
@@ -1291,6 +1304,14 @@ impl LanguageServer for RedscriptLanguageServer {
         self.definition_at(loc, ctx)
     }
 
+    fn document_symbols(
+        &self,
+        doc: Document<'_>,
+        ctx: &LspContext,
+    ) -> anyhow::Result<lsp::DocumentSymbolResponse> {
+        RedscriptLanguageServer::document_symbols(self, doc, ctx)
+    }
+
     fn workspace_symbol(
         &self,
         query: &str,
@@ -1632,6 +1653,69 @@ mod tests {
             .document_changed(path.to_owned(), buffers.get(&uri), ctx)
             .unwrap();
         buffers
+    }
+
+    #[test]
+    fn document_symbols_use_unsaved_buffers_in_workspaces_and_standalone_files() {
+        let (temp, mut server, ctx, _) = fixture();
+        let external = tempdir();
+        for root in [temp.path(), external.path()] {
+            for (extension, saved, live, replacement) in [
+                (
+                    "reds",
+                    "public class Saved {}",
+                    "public class Live { public let value: Int32; }",
+                    "public struct Changed {}",
+                ),
+                (
+                    "SCRIPT",
+                    "class Saved {}",
+                    "class Live { var value : Int32; }",
+                    "struct Changed {}",
+                ),
+            ] {
+                let path = root.join(format!("outline.{extension}"));
+                fs::write(&path, saved).unwrap();
+                for (version, text, name) in
+                    [(1, live, "Live"), (2, replacement, "Changed"), (3, "", "")]
+                {
+                    let buffers = open(&mut server, &ctx, &path, text, version);
+                    let uri = ctx.uri(&path).unwrap();
+                    let doc = Document::new(path.clone(), buffers.get(&uri).unwrap());
+                    let lsp::DocumentSymbolResponse::Nested(symbols) =
+                        server.document_symbols(doc, &ctx).unwrap()
+                    else {
+                        panic!("expected hierarchical document symbols");
+                    };
+                    if name.is_empty() {
+                        assert!(symbols.is_empty());
+                    } else {
+                        assert_eq!(symbols.len(), 1);
+                        assert_eq!(symbols[0].name, name);
+                        if version == 1 {
+                            assert_eq!(symbols[0].children.as_ref().unwrap()[0].name, "value");
+                        } else {
+                            assert_eq!(symbols[0].kind, lsp::SymbolKind::STRUCT);
+                        }
+                    }
+                    assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+                }
+            }
+        }
+        let path = temp.path().join("new/nested/unsaved.script");
+        let buffers = open(&mut server, &ctx, &path, "class NewFile {}", 1);
+        let uri = ctx.uri(&path).unwrap();
+        let lsp::DocumentSymbolResponse::Nested(symbols) = server
+            .document_symbols(
+                Document::new(path.clone(), buffers.get(&uri).unwrap()),
+                &ctx,
+            )
+            .unwrap()
+        else {
+            panic!("expected hierarchical document symbols");
+        };
+        assert_eq!(symbols[0].name, "NewFile");
+        assert!(!path.exists());
     }
 
     #[test]

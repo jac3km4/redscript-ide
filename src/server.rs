@@ -235,6 +235,12 @@ impl LspServer<'_> {
                     .map_err(invalid_params)?;
                 response_value(self.server.goto_definition(doc, &self.context))
             }
+            lsp::request::DocumentSymbolRequest::METHOD => {
+                let lsp::DocumentSymbolParams { text_document, .. } =
+                    serde_json::from_value(params).map_err(invalid_params)?;
+                let doc = self.document(&text_document.uri).map_err(invalid_params)?;
+                response_value(self.server.document_symbols(doc, &self.context))
+            }
             lsp::request::WorkspaceSymbolRequest::METHOD => {
                 let lsp::WorkspaceSymbolParams { query, .. } =
                     serde_json::from_value(params).map_err(invalid_params)?;
@@ -606,6 +612,11 @@ pub trait LanguageServer {
         doc: CodeLocation<'_>,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp::GotoDefinitionResponse>;
+    fn document_symbols(
+        &self,
+        doc: Document<'_>,
+        ctx: &LspContext,
+    ) -> anyhow::Result<lsp::DocumentSymbolResponse>;
     fn workspace_symbol(
         &self,
         query: &str,
@@ -822,6 +833,7 @@ fn capabilities() -> lsp::ServerCapabilities {
             ..Default::default()
         }),
         workspace_symbol_provider: Some(lsp::OneOf::Left(true)),
+        document_symbol_provider: Some(lsp::OneOf::Left(true)),
         document_formatting_provider: Some(lsp::OneOf::Left(true)),
         code_action_provider: Some(lsp::CodeActionProviderCapability::Options(
             lsp::CodeActionOptions {
@@ -922,6 +934,14 @@ mod tests {
             _ctx: &LspContext,
         ) -> anyhow::Result<lsp::GotoDefinitionResponse> {
             Ok(lsp::GotoDefinitionResponse::Array(vec![]))
+        }
+
+        fn document_symbols(
+            &self,
+            _doc: Document<'_>,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<lsp::DocumentSymbolResponse> {
+            Ok(lsp::DocumentSymbolResponse::Nested(vec![]))
         }
 
         fn workspace_symbol(
