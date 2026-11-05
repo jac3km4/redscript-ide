@@ -430,23 +430,52 @@ impl RedscriptLanguageServer {
                         container_name: None,
                     })
                 });
-            let types = syms
-                .types()
-                .filter_map(|(id, def)| Some((id, def.span()?)))
-                .filter(|(id, _)| id.as_str().contains(query))
-                .filter_map(|(id, span)| {
-                    #[allow(deprecated)]
-                    Some(lsp::SymbolInformation {
-                        name: id.to_string(),
-                        kind: lsp::SymbolKind::CLASS,
-                        tags: None,
-                        deprecated: None,
-                        location: location(span, sources, ctx)?,
-                        container_name: None,
-                    })
-                });
-
-            let results = types.chain(funcs).collect();
+            let mut results = Vec::new();
+            for (id, def) in syms.types() {
+                let kind = match def.schema() {
+                    TypeSchema::Aggregate(agg) if agg.flags().is_struct() => {
+                        lsp::SymbolKind::STRUCT
+                    }
+                    TypeSchema::Aggregate(_) => lsp::SymbolKind::CLASS,
+                    TypeSchema::Enum(_) => lsp::SymbolKind::ENUM,
+                    TypeSchema::Primitive => continue,
+                };
+                let mut push = |name: &str, kind, span: Option<Span>, container_name| {
+                    if name.contains(query)
+                        && let Some(location) = span.and_then(|span| location(span, sources, ctx))
+                    {
+                        #[allow(deprecated)]
+                        results.push(lsp::SymbolInformation {
+                            name: name.to_owned(),
+                            kind,
+                            tags: None,
+                            deprecated: None,
+                            location,
+                            container_name,
+                        });
+                    }
+                };
+                push(id.as_str(), kind, def.span(), None);
+                if let TypeSchema::Aggregate(agg) = def.schema() {
+                    for method in agg.methods().iter() {
+                        push(
+                            method.name(),
+                            lsp::SymbolKind::METHOD,
+                            method.func().span(),
+                            Some(id.to_string()),
+                        );
+                    }
+                    for field in agg.fields().iter() {
+                        push(
+                            field.name(),
+                            lsp::SymbolKind::FIELD,
+                            field.field().span(),
+                            Some(id.to_string()),
+                        );
+                    }
+                }
+            }
+            results.extend(funcs);
             Ok(lsp::WorkspaceSymbolResponse::Flat(results))
         })
     }
@@ -1603,6 +1632,106 @@ mod tests {
             .document_changed(path.to_owned(), buffers.get(&uri), ctx)
             .unwrap();
         buffers
+    }
+
+    #[test]
+    fn workspace_symbols_include_members_containers_and_type_kinds() {
+        let (temp, _, ctx, _) = fixture();
+        let community = temp.path().join("symbols.reds");
+        fs::write(
+            &community,
+            "module Symbols\npublic class Base { public let inherited: Int32; }\n\
+             public class Owner extends Base {\n\
+               public let value: Int32;\n\
+               public func Act() {}\n\
+               public func Act(value: Int32) {}\n\
+             }\npublic struct Record { public let count: Int32; }\n\
+             public enum Choice { First = 0, Second = 1 }\n\
+             public func Global() {}",
+        )
+        .unwrap();
+        let native = temp.path().join("native.Script");
+        fs::write(
+            &native,
+            "class NativeOwner { var nativeValue : Int32; function NativeAct() {} }\n\
+             struct NativeRecord { var count : Int32; }\n\
+             enum NativeChoice { First = 0, Second = 1 }",
+        )
+        .unwrap();
+        let server =
+            RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
+        let lsp::WorkspaceSymbolResponse::Flat(symbols) =
+            server.workspace_symbols("", &ctx).unwrap()
+        else {
+            panic!("expected flat workspace symbols");
+        };
+        for (name, kind, container, path) in [
+            ("Symbols.Owner", lsp::SymbolKind::CLASS, None, &community),
+            ("Symbols.Record", lsp::SymbolKind::STRUCT, None, &community),
+            ("Symbols.Choice", lsp::SymbolKind::ENUM, None, &community),
+            (
+                "Symbols.Global",
+                lsp::SymbolKind::FUNCTION,
+                None,
+                &community,
+            ),
+            (
+                "value",
+                lsp::SymbolKind::FIELD,
+                Some("Symbols.Owner"),
+                &community,
+            ),
+            (
+                "Act",
+                lsp::SymbolKind::METHOD,
+                Some("Symbols.Owner"),
+                &community,
+            ),
+            ("NativeRecord", lsp::SymbolKind::STRUCT, None, &native),
+            ("NativeChoice", lsp::SymbolKind::ENUM, None, &native),
+            (
+                "nativeValue",
+                lsp::SymbolKind::FIELD,
+                Some("NativeOwner"),
+                &native,
+            ),
+            (
+                "NativeAct",
+                lsp::SymbolKind::METHOD,
+                Some("NativeOwner"),
+                &native,
+            ),
+        ] {
+            assert!(
+                symbols.iter().any(|symbol| {
+                    symbol.name == name
+                        && symbol.kind == kind
+                        && symbol.container_name.as_deref() == container
+                        && symbol.location.uri == ctx.uri(path).unwrap()
+                }),
+                "missing symbol {name}: {symbols:?}"
+            );
+        }
+        assert_eq!(
+            symbols.iter().filter(|symbol| symbol.name == "Act").count(),
+            2
+        );
+        assert_eq!(
+            symbols
+                .iter()
+                .filter(|symbol| symbol.name == "inherited")
+                .count(),
+            1
+        );
+        assert!(symbols.iter().all(|symbol| symbol.name != "Int32"));
+        let lsp::WorkspaceSymbolResponse::Flat(filtered) =
+            server.workspace_symbols("nativeV", &ctx).unwrap()
+        else {
+            panic!("expected flat workspace symbols");
+        };
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "nativeValue");
+        assert_eq!(filtered[0].container_name.as_deref(), Some("NativeOwner"));
     }
 
     #[test]
