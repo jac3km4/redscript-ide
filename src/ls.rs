@@ -923,24 +923,23 @@ impl CompilationCache {
             let func = unit
                 .all_functions()
                 .find(|f| f.span.file == id && f.span.contains(preceding_pos));
-            let expr = func.and_then(|f| f.block.find_at(preceding_pos));
-
             let typ = typ
                 .and_then(|t| unit.scopes.get(&id)?.get(t)?.id())
                 .or_else(|| cache.interner.get_index(cache.interner.get_index_of(typ?)?));
-            let at = ExprAt::new(expr, func, typ, syms, cache.sources, query_context);
-            ctx.logger().info(format!(
+            ExprAt::new(None, func, typ, syms, cache.sources, query_context).with_expr_at(preceding_pos, |at| {
+                ctx.logger().info(format!(
                 "Query result lookup_byte_offset={preceding_pos} parsed_module={} ast_match={} function={} expression={} named_type={} receiver_type={} context={query_context:?} parse_diagnostics={} semantic_diagnostics={}",
                 analysis.parsed.modules.iter().any(|(file, _)| *file == id),
                 match_.is_some(),
                 func.is_some(),
-                expr.is_some(),
+                at.expr().is_some(),
                 typ.is_some(),
                 at.expr_type().is_some(),
                 analysis.parsed.diagnostics.len(),
                 analysis.diagnostics.len(),
             ));
-            cb(at)
+                cb(at)
+            })
         })
     }
 }
@@ -1951,30 +1950,53 @@ mod tests {
     fn implicit_redmod_members_keep_hover_and_definition_targets() {
         let (temp, mut server, ctx, _receiver) = fixture();
         let path = temp.path().join("implicit.script");
-        let text = "class Host { var value: Int32; function Value(): Int32 { return 1; } function Read(): Int32 { return value; } function Run(): Int32 { return Value(); } }";
+        let text = "class Host { var value: Int32; function Value(): Int32 { return 1; } function Read(): Int32 { return value; } function Run(): Int32 { return Value(); } function Nested(): Int32 { if (true) { return value; } return Value(); } function Explicit(): Int32 { if (true) { return this.value; } return this.Value(); } }";
         let buffers = open(&mut server, &ctx, &path, text, 1);
         let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
         for (name, heading) in [("value", "### Field"), ("Value", "### Signature")] {
             let declaration = text.find(name).unwrap() as u32;
-            let usage = text.rfind(name).unwrap() as u32;
-            for offset in 1..=name.len() as u32 {
-                server
-                    .expr_at(
-                        CodeLocation::new(Document::new(path.clone(), buffer), usage + offset),
-                        |at| {
-                            let span = at.definition_span().unwrap_or_else(|| {
-                                panic!("missing definition for {name} at {offset}: {:?}", at.expr())
-                            });
-                            assert!(span.contains(declaration));
-                            let hover = at.display().to_string();
-                            assert!(hover.contains(heading), "{hover}");
-                            assert!(hover.contains("Int32"), "{hover}");
-                            Ok(())
-                        },
-                        &ctx,
-                    )
-                    .unwrap();
+            for (usage, _) in text.match_indices(name).skip(1) {
+                for offset in 1..=name.len() as u32 {
+                    let loc = CodeLocation::new(
+                        Document::new(path.clone(), buffer),
+                        usage as u32 + offset,
+                    );
+                    let check = |at: ExprAt<'_, '_>| {
+                        let span = at.definition_span().unwrap_or_else(|| {
+                            panic!(
+                                "missing definition for {name} at {usage}+{offset}: {:?}",
+                                at.expr()
+                            )
+                        });
+                        assert!(span.contains(declaration));
+                        let hover = at.display().to_string();
+                        assert!(hover.contains(heading), "{hover}");
+                        assert!(hover.contains("Int32"), "{hover}");
+                        Ok(())
+                    };
+                    server.expr_at(loc.clone(), check, &ctx).unwrap();
+                    let pos = loc.pos() as usize;
+                    server
+                        .expr_at_with(loc, Some(pos..pos), check, &ctx)
+                        .unwrap();
+                }
             }
+        }
+        for (usage, _) in text.match_indices("this") {
+            let loc = CodeLocation::new(Document::new(path.clone(), buffer), usage as u32 + 1);
+            let check = |at: ExprAt<'_, '_>| {
+                assert!(matches!(
+                    at.expr(),
+                    Some(ir::Expr::Local(ir::Local::This, _))
+                ));
+                assert!(at.display().to_string().contains("### Type"));
+                Ok(())
+            };
+            server.expr_at(loc.clone(), check, &ctx).unwrap();
+            let pos = loc.pos() as usize;
+            server
+                .expr_at_with(loc, Some(pos..pos), check, &ctx)
+                .unwrap();
         }
     }
 
