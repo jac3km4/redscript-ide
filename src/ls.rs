@@ -1973,10 +1973,9 @@ mod tests {
             .collect();
         assert!(params.iter().any(|params| {
             params.version == Some(6)
-                && params
-                    .diagnostics
-                    .iter()
-                    .any(|diag| diag.code == Some(lsp::NumberOrString::String("OTHER".into())))
+                && params.diagnostics.iter().any(|diag| {
+                    diag.code == Some(lsp::NumberOrString::String("REDMOD_PARSE".into()))
+                })
         }));
     }
 
@@ -2461,11 +2460,9 @@ mod tests {
                         })
                         .collect();
                     assert!(!errors.is_empty());
-                    assert!(
-                        errors
-                            .iter()
-                            .all(|diag| matches!(diag, Diagnostic::Other(_, _, _)))
-                    );
+                    assert!(errors.iter().all(|diag| {
+                        matches!(diag, Diagnostic::Custom(_, code, _, _) if code.starts_with("REDMOD_"))
+                    }));
                     Ok(())
                 })
                 .unwrap();

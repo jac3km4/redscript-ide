@@ -164,7 +164,8 @@ impl<'src> ParsedSources<'src> {
 
 fn redmod_diagnostic<'src>(error: redscript_redmod_adapter::Error) -> Diagnostic<'src> {
     let span = error.span();
-    Diagnostic::Other(Box::new(error), DiagnosticLevel::Error, span)
+    let code = error.code();
+    Diagnostic::Custom(Box::new(error), code, DiagnosticLevel::Error, span)
 }
 
 pub fn parse(sources: &ast::SourceMap) -> ParsedSources<'_> {
@@ -288,6 +289,11 @@ mod tests {
         assert!(!parsed.modules.iter().any(|(id, _)| *id == broken));
         assert!(parsed.diagnostic_files().contains(&broken));
         assert!(!parsed.diagnostics.is_empty());
-        assert!(parsed.diagnostics.iter().all(|diag| diag.code() == "OTHER"));
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .all(|diag| diag.code() == "REDMOD_PARSE")
+        );
     }
 }
