@@ -27,7 +27,8 @@ impl fmt::Display for ExprAtDisplay<'_, '_> {
             } else if let ir::Expr::Field { field, .. } = expr {
                 writeln!(f, "### Field")?;
                 let (name, field) = inner.symbols().get_field(*field).ok_or(fmt::Error)?;
-                writeln!(f, "```{name}: {}```", field.type_())?;
+                let typ = inner.expr_type().unwrap_or_else(|| field.type_().clone());
+                writeln!(f, "```{name}: {typ}```")?;
                 writeln!(f, "{}", DocDisplay::new(field.doc()))?;
                 true
             } else if let Some(typ) = type_of(expr, func, inner.symbols()) {
@@ -159,7 +160,10 @@ impl fmt::Display for SnippetDisplay<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use redscript_compiler_frontend::{Param, ParamFlags, predef, types::Type};
+    use redscript_compiler_api::ast::SourceMap;
+    use redscript_compiler_api::{CompileErrorReporter, SourceMapExt, TypeInterner};
+    use redscript_compiler_frontend::types::Type;
+    use redscript_compiler_frontend::{Param, ParamFlags, PolyType, infer_from_sources, predef};
 
     use super::*;
 
@@ -187,6 +191,79 @@ mod tests {
             FunctionTypeDisplay::new(&func).to_string(),
             "(value: Int32, opt value: Int32, const value: Int32, out value: Int32, skip value: Int32, opt const out skip value: Int32) -> Bool"
         );
+    }
+
+    fn field_hover(receiver: &str, expected: &str, invalid_receiver: bool) {
+        let sources = SourceMap::new();
+        sources.populate_boot_lib();
+        sources.push_back(
+            "display.reds",
+            format!(
+                r#"
+                class Box<T> {{
+                    /// The stored value.
+                    public let value: T;
+                }}
+                class Derived<T> extends Box<array<T>> {{}}
+                func Test(value: {receiver}) -> {expected} {{ return value.value; }}
+                "#
+            ),
+        );
+        let interner = TypeInterner::default();
+        let mut reporter = CompileErrorReporter::default();
+        let (mut unit, symbols) = infer_from_sources(
+            &sources,
+            Symbols::with_default_types(),
+            &mut reporter,
+            &interner,
+        );
+        let diagnostics = reporter.into_reported();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let entry = symbols
+            .free_functions()
+            .find(|entry| entry.name().to_string() == "Test")
+            .unwrap();
+        let function = &mut unit.functions[entry.key()];
+        let ir::Stmt::Return(Some(expr), _) = function.block.stmts.back_mut().unwrap() else {
+            panic!("expected field return expression")
+        };
+        let ir::Expr::Field { receiver_type, .. } = &mut **expr else {
+            panic!("expected field expression")
+        };
+        if invalid_receiver {
+            *receiver_type = PolyType::nullary(predef::INT32)
+                .upper_bound(&symbols)
+                .unwrap()
+                .into_owned()
+                .into();
+        }
+        let ir::Stmt::Return(Some(expr), _) = function.block.stmts.back().unwrap() else {
+            unreachable!()
+        };
+        let at = ExprAt::new(Some(expr), Some(function), None, &symbols, &sources, None);
+        if invalid_receiver {
+            assert!(at.expr_type().is_none());
+        }
+        let typ = if invalid_receiver { "T" } else { expected };
+        assert_eq!(
+            at.display().to_string(),
+            format!("### Field\n```value: {typ}```\n---\nThe stored value.\n\n")
+        );
+    }
+
+    #[test]
+    fn field_hover_instantiates_generic_type_and_retains_docs() {
+        field_hover("Box<Int32>", "Int32", false);
+    }
+
+    #[test]
+    fn field_hover_instantiates_inherited_generic_type_and_retains_docs() {
+        field_hover("Derived<Int32>", "array<Int32>", false);
+    }
+
+    #[test]
+    fn field_hover_falls_back_to_declaration_type_and_retains_docs() {
+        field_hover("Box<Int32>", "Int32", true);
     }
 
     #[test]
