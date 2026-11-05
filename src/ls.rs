@@ -880,6 +880,12 @@ impl RedscriptLanguageServer {
         let mut contents = loc.doc().buffer().contents().to_string();
         if let Some(range) = patch {
             contents.replace_range(range.clone(), &" ".repeat(range.len()));
+            if Dialect::of(&path) == Some(Dialect::Redmod)
+                && repair_completion_terminator(&mut contents, range)
+            {
+                ctx.logger()
+                    .info("Query recovery=inserted speculative REDmod statement terminator");
+            }
         }
 
         let id = sources.push_back(&path, contents);
@@ -941,6 +947,84 @@ impl CompilationCache {
                 cb(at)
             })
         })
+    }
+}
+
+/// Repair only a missing terminator immediately after the completion expression.
+/// The adapter deliberately rejects recovered trees, so reparse the temporary
+/// source strictly instead of allowing invalid modules into normal analysis.
+fn repair_completion_terminator(source: &mut String, member: Range<usize>) -> bool {
+    let sources = ast::SourceMap::new();
+    let id = sources.push_back("completion.script", "");
+    let insertion = {
+        let (_, errors) = redscript_redmod_adapter::parse_file_with_metadata(source, id);
+        let [redscript_redmod_adapter::Error::Parse(error)] = errors.as_slice() else {
+            return false;
+        };
+        // The pinned parser exposes this recovery as a message, not a typed kind.
+        if error.to_string() != "expected ';' after statement in statement" {
+            return false;
+        }
+        let span = error.span();
+        if span.start != span.end {
+            return false;
+        }
+        span.start as usize
+    };
+    let Some(tail) = source.get(member.end..insertion) else {
+        return false;
+    };
+    // Closing calls/indexes may separate the receiver from its statement end.
+    // Do not repair another statement or an unfinished argument/operator.
+    let Some(end) = completion_statement_end(tail) else {
+        return false;
+    };
+    let insertion = member.end + end;
+    source.insert(insertion, ';');
+    let valid = {
+        let (module, errors) = redscript_redmod_adapter::parse_file_with_metadata(source, id);
+        module.is_some() && errors.is_empty()
+    };
+    if !valid {
+        source.remove(insertion);
+    }
+    valid
+}
+
+// Only traverse closing delimiters and trivia, including nested block comments.
+// Return the end of the expression, before trailing comments.
+fn completion_statement_end(mut tail: &str) -> Option<usize> {
+    let length = tail.len();
+    let mut end = 0;
+    loop {
+        tail = tail.trim_start();
+        if tail.is_empty() {
+            return Some(end);
+        }
+        if tail.starts_with([')', ']']) {
+            tail = &tail[1..];
+            end = length - tail.len();
+        } else if tail.starts_with("//") {
+            tail = tail
+                .find([
+                    '\n', '\r', '\u{000B}', '\u{000C}', '\u{0085}', '\u{2028}', '\u{2029}',
+                ])
+                .map_or("", |newline| &tail[newline..]);
+        } else {
+            tail = tail.strip_prefix("/*")?;
+            let mut depth = 1;
+            while depth != 0 {
+                if let Some(rest) = tail.strip_prefix("/*") {
+                    depth += 1;
+                    tail = rest;
+                } else if let Some(rest) = tail.strip_prefix("*/") {
+                    depth -= 1;
+                    tail = rest;
+                } else {
+                    tail = tail.get(tail.chars().next()?.len_utf8()..)?;
+                }
+            }
+        }
     }
 }
 
@@ -2709,6 +2793,109 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn redmod_member_completion_recovers_missing_terminators() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let path = temp.path().join("incomplete.script");
+        for (index, statement) in [
+            "values.",
+            "values.Si",
+            "values.é界",
+            "values.;",
+            "Use(values.)",
+            "Use(values.);",
+            "Use(values.) // trailing comment\n",
+            "Use(values.) /* nested /* comment */ é */",
+            "Use(values. /* comment */)",
+            "Use(values. // comment\r)",
+            "Use(values. // comment\u{2028})",
+            "Use(Identity(values.))",
+            "values.child.",
+            "items[0].",
+            "let result: Other; result = values.",
+            "values. // trailing comment\n",
+            "let result: Other = values.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text = format!(
+                "class Other {{ public var child: Other; \
+                     public function Size() -> String {{ return \"custom\"; }} }} \
+                 function Use(value: Other) {{}} \
+                 function Identity(value: Other) -> Other {{ return value; }} \
+                 function Test(values: Other) {{ let items: array<Other>; {statement} }}"
+            );
+            let response = dot_completions(&mut server, &ctx, &path, &text, index as i32 + 1);
+            let lsp::CompletionResponse::Array(items) = &*response else {
+                panic!("expected completion items");
+            };
+            assert!(
+                items.iter().any(|item| item.label == "Size"),
+                "{statement}: {items:?}"
+            );
+            server.compilation_cache.with_sources(|sources| {
+                assert_eq!(
+                    sources
+                        .files()
+                        .find(|(_, file)| file.path() == dialect::identity(&path))
+                        .unwrap()
+                        .1
+                        .source(),
+                    text,
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn completion_terminator_repair_is_local_and_strict() {
+        for (statement, expected) in [
+            ("values.", true),
+            ("values.;", false),
+            ("Use(values.)", true),
+            ("Use(items[values.])", true),
+            ("Use(values.,", false),
+            ("values. +", false),
+            ("values.; other", false),
+            ("other values.", false),
+            ("values. other", false),
+            ("values.\nlet other: Int32 = 1", false),
+            ("values. /* unterminated", false),
+            ("new Other().", false),
+        ] {
+            let mut source = format!("function Test(values: Int32) {{ {statement} }}");
+            let dot = source.find('.').unwrap();
+            let member = member_completion_range(&source, dot as u32 + 1).unwrap();
+            source.replace_range(member.clone(), &" ".repeat(member.len()));
+            let original = source.clone();
+            assert_eq!(
+                repair_completion_terminator(&mut source, member),
+                expected,
+                "{statement}"
+            );
+            if !expected {
+                assert_eq!(
+                    source, original,
+                    "failed repairs must not modify the source"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redmod_array_completion_recovers_missing_terminator() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let path = temp.path().join("arrays.script");
+        let text = "function Test(values: array<String>) { values.Si }";
+        let response = dot_completions(&mut server, &ctx, &path, text, 1);
+        let lsp::CompletionResponse::Array(items) = &*response else {
+            panic!("expected completion items");
+        };
+        let last = items.iter().find(|item| item.label == "Last").unwrap();
+        assert_eq!(last.detail.as_deref(), Some("() -> String"));
     }
 
     #[test]
