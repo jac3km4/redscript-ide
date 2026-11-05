@@ -93,31 +93,6 @@ and refresh the workspace. Analysis can be slow in large workspaces.
   - Ensure that you downloaded the `redscript-ide` executable and it is in your PATH.
     - You can set it by searching for 'Edit the system environment variables' on Windows, clicking on 'Environment Variables', and adding the path to the `redscript-ide` executable to the `Path` variable.
 
-### Debugging hover and completion in Zed
-
-After rebuilding/installing the updated executable, restart the language server
-in Zed, then run **See LSP Logs** from the command palette and select
-`redscript-ide`. Inspect the server log messages (`window/logMessage`); no
-extra logging configuration is required.
-
-The logs include startup/cache/workspace details, document lifecycle events,
-hover/completion request IDs, URI and zero-based UTF-16 positions, response
-summaries, timings, and request errors. Query messages include the normalized
-path, byte offset, document version, workspace membership, speculative member
-patch, diagnostic counts, and whether an AST node, function, expression, or type
-was found. Source text and hover contents are not logged, but paths are included;
-redact them before sharing logs if necessary.
-
-- No hover/completion `Request` entry: check that the file is associated with
-  `REDscript` and that Zed is using the expected executable.
-- No `Language server ready for requests`: inspect startup errors and the
-  configured `game_dir`/cache path (also check server stderr).
-- `Completion empty ... cursor is not after a member-access dot`: expected for
-  non-member completion; keyword/local completion is not implemented.
-- `Query result` with missing AST/function/expression or nonzero diagnostics:
-  inspect file diagnostics and the REDmod limitations above. A missing named
-  type alone is normal for expression queries.
-
 - ### IntelliJ
 
   Use the (work in progress) [Redscript-IntelliJ Plugin](https://github.com/pawrequest/redscript-intellij).
