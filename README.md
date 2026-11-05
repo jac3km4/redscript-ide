@@ -124,85 +124,100 @@ redact them before sharing logs if necessary.
 
 - ### Neovim
 
-  Add the snippet below to your `init.lua` and replace `/path/to/redscript-ide` with the path to
-  a redscript-ide executable downloaded from [here](https://github.com/jac3km4/redscript-ide/releases/latest)
-  and `/path/to/cyberpunk2077` with the path to the root of your Cyberpunk 2077 installation directory:
+  With **Neovim 0.11 or newer**, add the following to your `init.lua`. This uses
+  the built-in LSP configuration API; `nvim-lspconfig` is not required. Replace
+  `/path/to/redscript-ide` with a downloaded
+  [redscript-ide executable](https://github.com/jac3km4/redscript-ide/releases/latest)
+  and `/path/to/cyberpunk2077` with the root of your Cyberpunk 2077 installation:
 
   ```lua
-  local configs = require 'lspconfig.configs'
-  local util = require 'lspconfig.util'
-  local lsp = require 'lspconfig'
+  vim.filetype.add({
+      extension = {
+          reds = 'redscript',
+          script = 'redmod',
+      },
+  })
 
-  -- define the redscript filetype
-  vim.cmd [[
-      augroup RedscriptFile
-          autocmd!
-          autocmd BufNewFile,BufRead *.reds,*.script set filetype=reds | set syntax=swift
-      augroup END
-  ]]
+  vim.api.nvim_create_autocmd('FileType', {
+      group = vim.api.nvim_create_augroup('RedscriptSyntax', { clear = true }),
+      pattern = 'redscript',
+      callback = function(args)
+          vim.bo[args.buf].syntax = 'swift'
+      end,
+  })
 
-  -- configure the redscript language server
-  configs.redscript_ide = {
-      default_config = {
-          cmd = { '/path/to/redscript-ide' },
-          filetypes = 'reds',
-          init_options = {
-              game_dir = '/path/to/cyberpunk2077',
-          },
-          root_dir = function(fname)
-              return util.root_pattern('.git')(fname) or util.path.dirname(fname)
-          end,
-          single_file_support = true
-      }
-  }
-
-  -- invoke the lsp-config setup
-  lsp.redscript_ide.setup {}
+  vim.lsp.config('redscript_ide', {
+      cmd = { '/path/to/redscript-ide' },
+      filetypes = { 'redscript', 'redmod' },
+      root_markers = { '.redscript', '.git' },
+      init_options = {
+          game_dir = '/path/to/cyberpunk2077',
+      },
+  })
+  vim.lsp.enable('redscript_ide')
   ```
+
+  Both dialects use the same language server, which selects the dialect by file
+  extension. Create a `.redscript` file (it can be empty) at the workspace root
+  so `.reds` and `.script` files share the same project and source roots. See
+  [REDmod support](#redmod-support) for supported features and limitations.
+
+  Community REDscript (`.reds`) uses Swift syntax highlighting as an approximate
+  fallback by default, while retaining the `redscript` filetype for LSP attachment.
+  REDmod (`.script`) does not use this fallback. For grammar-specific Tree-sitter
+  highlighting, remove the `RedscriptSyntax` autocmd above and use [tree-sitter-reds](https://github.com/jac3km4/tree-sitter-reds)
+  (parser name `redscript`) for the `redscript` filetype and
+  [tree-sitter-redmod](https://github.com/jac3km4/tree-sitter-redmod) (parser name
+  `redmod`) for the `redmod` filetype, with each grammar's matching queries. The
+  old community grammar and Swift syntax fallback do not cover REDmod correctly.
+
+  Restart Neovim and open one file of each type. Use `:set filetype?` to verify
+  detection and `:checkhealth vim.lsp` to check language-server setup.
 
 - ### Helix
 
-  Add the snippet below to your [`languages.toml`](https://docs.helix-editor.com/languages.html)
-  and replace the paths, similarly to the Neovim setup:
+  1. Install [Helix 25.07.1 or newer](https://github.com/helix-editor/helix/releases/latest),
+     Git, and a C/C++ toolchain: Visual Studio Build Tools with the C++ workload on
+     Windows, or `xcode-select --install` on macOS.
+  2. Run the setup command for your platform (no checkout needed). These commands
+     download and execute code from GitHub; review the linked scripts first.
 
-  ```toml
-  [language-server.redscript-ide]
-  command = "/path/to/redscript-ide"
-  config = { game_dir = "/path/to/cyberpunk2077" }
+     **Windows ([PowerShell script](scripts/helix/setup-windows.ps1)):**
+     ```powershell
+     Invoke-RestMethod https://raw.githubusercontent.com/jac3km4/redscript-ide/0.2.x/scripts/helix/setup-windows.ps1 | Invoke-Expression
+     ```
 
-  [[language]]
-  name = "redscript"
-  scope = "source.reds"
-  file-types = ["reds", "script"]
-  # you have to have a .redscript file for workspace to be detected (it can be empty)
-  roots = [".redscript"]
-  auto-format = true
-  comment-tokens = "//"
-  block-comment-tokens = { start = "/*", end = "*/" }
-  indent = { tab-width = 2, unit = "  " }
-  language-servers = ["redscript-ide"]
+     **macOS ([shell script](scripts/helix/setup-macos.sh)):**
+     ```sh
+     curl -fsSL https://raw.githubusercontent.com/jac3km4/redscript-ide/0.2.x/scripts/helix/setup-macos.sh | sh
+     ```
 
-  [language.auto-pairs]
-  '(' = ')'
-  '{' = '}'
-  '[' = ']'
-  '"' = '"'
+     The scripts build the pinned [REDscript](https://github.com/jac3km4/tree-sitter-reds)
+     and [REDmod](https://github.com/jac3km4/tree-sitter-redmod) grammars and install
+     matching highlighting queries. They also download the latest `redscript-ide`
+     release into the Helix config directory's `bin` folder and configure its absolute
+     path (no administrator privileges or `PATH` changes needed). They create your user `languages.toml` if
+     missing, or back it up and append the [language configuration](scripts/helix/languages.toml),
+     preserving other settings. Existing query directories are backed up too.
+     If the file mentions REDscript or REDmod (even in comments), setup stops with
+     instructions rather than risking duplicate configuration.
 
-  [[grammar]]
-  name = "redscript"
-  source = { git = "https://github.com/jac3km4/tree-sitter-redscript", rev = "master" }
-  ```
-
-  To get the syntax highlighting to work, you also need to rebuild the grammars and populate the queries folder:
-
-  ```powerhsell
-  # build the grammars
-  helix --grammar fetch
-  helix --grammar build
-
-  # populate the queries
-  # on Linux run:
-  # git clone -b queries --single-branch https://github.com/jac3km4/tree-sitter-redscript "$HOME/.config/helix/runtime/queries/redscript"
-  # on Windows run:
-  # git clone -b queries --single-branch https://github.com/jac3km4/tree-sitter-redscript "$env:USERPROFILE\AppData\Roaming\helix\runtime\queries\redscript"
-  ```
+     Alternatively, run the scripts from a checkout. For a custom runtime directory,
+     run a local copy with `-Runtime /path/to/runtime` on Windows or `/path/to/runtime`
+     as the first argument on macOS; this does not change the user configuration path.
+     To specify the game location, set the `REDSCRIPT_GAME_DIR` environment variable
+     before running setup, or pass `-GameDir /path/to/game` to the Windows script
+     (the second argument on macOS).
+  3. Setup tries to find Cyberpunk 2077 in Steam libraries (including additional
+     libraries), GOG/Epic launcher records on Windows, and common application bundle
+     locations on macOS. Candidates must contain a script cache under `r6/cache`.
+     If detection fails, setup warns and leaves a placeholder: edit `game_dir` in your user
+     [`languages.toml`](https://docs.helix-editor.com/languages.html)
+     (`%AppData%\helix\languages.toml` on Windows, `~/.config/helix/languages.toml`
+     on macOS, or `$XDG_CONFIG_HOME/helix/languages.toml` if set) to point to the
+     Cyberpunk 2077 installation root. Use forward slashes for Windows paths in TOML.
+  4. Create a `.redscript` file (it can be empty) at your workspace root and restart
+     Helix. `.reds` and `.script` use separate grammars with the shared language
+     server; see [REDmod limitations](#redmod-support). Check setup with
+     `hx --health redscript` and `hx --health redmod`; missing indentation and
+     text-object queries are expected.

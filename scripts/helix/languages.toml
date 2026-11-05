@@ -1,0 +1,33 @@
+[language-server.redscript-ide]
+command = "/path/to/redscript-ide"
+config = { game_dir = "/path/to/cyberpunk2077" }
+
+[[language]]
+name = "redscript"
+scope = "source.reds"
+file-types = ["reds"]
+roots = [".redscript"]
+auto-format = true
+comment-tokens = "//"
+block-comment-tokens = { start = "/*", end = "*/" }
+indent = { tab-width = 2, unit = "  " }
+language-servers = ["redscript-ide"]
+
+[[language]]
+name = "redmod"
+scope = "source.redmod"
+file-types = ["script"]
+roots = [".redscript"]
+auto-format = true
+comment-tokens = "//"
+block-comment-tokens = { start = "/*", end = "*/" }
+indent = { tab-width = 4, unit = "    " }
+language-servers = ["redscript-ide"]
+
+[[grammar]]
+name = "redscript"
+source = { git = "https://github.com/jac3km4/tree-sitter-reds", rev = "3f1cf9b3954dcfd61fda9887d923a143a73c4be0" }
+
+[[grammar]]
+name = "redmod"
+source = { git = "https://github.com/jac3km4/tree-sitter-redmod", rev = "f17f236cffdc918429f4f5d86f8ed35e4c2a900f" }
