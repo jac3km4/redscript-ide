@@ -124,7 +124,7 @@ impl fmt::Display for FunctionTypeDisplay<'_, '_> {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{}: {}", param.name(), param.type_())?;
+            write!(f, "{param}")?;
         }
         write!(f, ") -> {}", self.func.return_type())?;
         Ok(())
@@ -154,6 +154,45 @@ impl fmt::Display for SnippetDisplay<'_, '_> {
         }
         write!(f, ")")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use redscript_compiler_frontend::{Param, ParamFlags, predef, types::Type};
+
+    use super::*;
+
+    #[test]
+    fn function_type_preserves_parameter_qualifiers() {
+        let flags = [
+            ParamFlags::new(),
+            ParamFlags::new().with_is_optional(true),
+            ParamFlags::new().with_is_const(true),
+            ParamFlags::new().with_is_out(true),
+            ParamFlags::new().with_is_short_circuit(true),
+            ParamFlags::new()
+                .with_is_optional(true)
+                .with_is_const(true)
+                .with_is_out(true)
+                .with_is_short_circuit(true),
+        ];
+        let params = flags
+            .into_iter()
+            .map(|flags| Param::new("value", flags, Type::nullary(predef::INT32), None))
+            .collect::<Vec<_>>();
+        let func = FunctionType::new([], params, Type::nullary(predef::BOOL));
+
+        assert_eq!(
+            FunctionTypeDisplay::new(&func).to_string(),
+            "(value: Int32, opt value: Int32, const value: Int32, out value: Int32, skip value: Int32, opt const out skip value: Int32) -> Bool"
+        );
+    }
+
+    #[test]
+    fn function_type_without_parameters() {
+        let func = FunctionType::new([], [], Type::nullary(predef::INT32));
+        assert_eq!(FunctionTypeDisplay::new(&func).to_string(), "() -> Int32");
     }
 }
 
