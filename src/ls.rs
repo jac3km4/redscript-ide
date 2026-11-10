@@ -814,7 +814,7 @@ impl RedscriptLanguageServer {
                                         .collect();
                                     (!related.is_empty()).then_some(related)
                                 },
-                                tags: (matches!(diag, Diagnostic::UnusedLocal(_))
+                                tags: (matches!(diag, Diagnostic::UnusedLocal(_, _))
                                     && ctx
                                         .supports_diagnostic_tag(lsp::DiagnosticTag::UNNECESSARY))
                                 .then(|| vec![lsp::DiagnosticTag::UNNECESSARY]),
@@ -3385,7 +3385,7 @@ mod tests {
         let sources = ast::SourceMap::new();
         let id = sources.push_back(root.join("test.reds"), "let unused = 1;\n");
         let diags = [
-            Diagnostic::UnusedLocal(Span::new(4, 10, id)),
+            Diagnostic::UnusedLocal(None, Span::new(4, 10, id)),
             Diagnostic::MissingFunctionBody(Span::new(0, 3, id)),
         ];
         let symbols = Symbols::with_default_types();
@@ -3522,7 +3522,7 @@ mod tests {
         );
         let sources = ast::SourceMap::new();
         let id = sources.push_back(root.join("test.reds"), "let unused = 1;\n");
-        let diags = [Diagnostic::UnusedLocal(Span::new(4, 10, id))];
+        let diags = [Diagnostic::UnusedLocal(None, Span::new(4, 10, id))];
         let symbols = Symbols::with_default_types();
         let (sender, receiver) = crossbeam_channel::unbounded();
         let ctx = LspContext::new(sender);
@@ -3572,12 +3572,12 @@ mod tests {
         let z = sources.push_back(root.join("z.reds"), "test");
         let a = sources.push_back(root.join("a.reds"), "test");
         let mut diags = [
-            Diagnostic::UnusedLocal(Span::new(0, 1, z)),
-            Diagnostic::UnusedLocal(Span::new(2, 3, a)),
+            Diagnostic::UnusedLocal(None, Span::new(0, 1, z)),
+            Diagnostic::UnusedLocal(None, Span::new(2, 3, a)),
             Diagnostic::UnknownIntrinsic("z", Span::new(0, 2, a)),
             Diagnostic::UnknownIntrinsic("a", Span::new(0, 2, a)),
             Diagnostic::MissingFunctionBody(Span::new(0, 2, a)),
-            Diagnostic::UnusedLocal(Span::new(0, 1, a)),
+            Diagnostic::UnusedLocal(None, Span::new(0, 1, a)),
         ];
         let expected = [5, 3, 2, 4, 1].map(|i| diags[i].to_string());
         let symbols = Symbols::with_default_types();

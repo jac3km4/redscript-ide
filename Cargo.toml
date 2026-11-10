@@ -1,6 +1,6 @@
 [package]
 name = "redscript-ide"
-version = "0.2.27"
+version = "1.0.0-preview.0"
 edition = "2024"
 
 [dependencies]
@@ -20,31 +20,31 @@ lsp-types = "0.97"
 
 [dependencies.redscript-redmod-formatter]
 git = "https://github.com/jac3km4/redscript"
-rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55"
+rev = "v1.0.0"
 
 [dependencies.redscript-redmod-adapter]
 git = "https://github.com/jac3km4/redscript"
-rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55"
+rev = "v1.0.0"
 
 [dependencies.redscript-community-formatter]
 git = "https://github.com/jac3km4/redscript"
-rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55"
+rev = "v1.0.0"
 
 [dependencies.redscript-compiler-api]
 git = "https://github.com/jac3km4/redscript"
-rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55"
+rev = "v1.0.0"
 
 [dependencies.redscript-dotfile]
 git = "https://github.com/jac3km4/redscript"
-rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55"
+rev = "v1.0.0"
 
 [dependencies.redscript-code-edit]
 git = "https://github.com/jac3km4/redscript"
-rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55"
+rev = "v1.0.0"
 
 [dev-dependencies]
 tempfile = "3"
-redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "5c8933c027c1f83e9bffaa1e6d3e0f969821ba55" }
+redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.0" }
 
 [patch.crates-io]
 stable_deref_trait = { git = "https://github.com/Storyyeller/stable_deref_trait", rev = "59a35e0" }
