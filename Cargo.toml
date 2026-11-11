@@ -15,7 +15,7 @@ fluent-uri = "0.3"
 ropey = "1"
 crossbeam-channel = "0.5"
 mimalloc = { version = "0.1", features = ["v3"] }
-lsp-server = "0.7"
+lsp-server = "0.10"
 lsp-types = "0.97"
 
 [dependencies.redscript-redmod-formatter]
