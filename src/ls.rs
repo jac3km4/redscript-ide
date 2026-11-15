@@ -949,10 +949,12 @@ impl RedscriptLanguageServer {
             }
         }
         for root in current.difference(&reported) {
-            ctx.logger().warn(format!(
+            let message = format!(
                 "Source root '{}' is missing; treating it as temporarily empty. Restore/create the directory or update source_roots in .redscript, then refresh the workspace.",
                 root.display()
-            ));
+            );
+            ctx.logger().warn(&message);
+            ctx.show_message(lsp::MessageType::WARNING, message);
         }
         *reported = current.clone();
         drop(reported);
@@ -965,6 +967,7 @@ impl RedscriptLanguageServer {
         let mut reported = self.reported_io_warnings.borrow_mut();
         for warning in current.difference(&reported) {
             ctx.logger().warn(warning);
+            ctx.show_message(lsp::MessageType::WARNING, warning);
         }
         *reported = current.clone();
     }
@@ -973,6 +976,7 @@ impl RedscriptLanguageServer {
         let mut reported = self.reported_config_warnings.borrow_mut();
         for warning in self.config_warnings.difference(&reported) {
             ctx.logger().warn(warning);
+            ctx.show_message(lsp::MessageType::WARNING, warning);
         }
         *reported = self.config_warnings.clone();
     }
@@ -3510,6 +3514,18 @@ mod tests {
             }),
             initially_missing
         );
+        assert_eq!(
+            startup.iter().any(|message| {
+                let lsp_server::Message::Notification(notification) = message else {
+                    return false;
+                };
+                notification.method == "window/showMessage"
+                    && serde_json::from_value::<lsp::ShowMessageParams>(notification.params.clone())
+                        .is_ok_and(|params| params.typ == lsp::MessageType::WARNING
+                            && params.message.contains("Source root"))
+            }),
+            initially_missing
+        );
         server.check(standalone.clone(), &ctx).unwrap();
         let initial: Vec<lsp::PublishDiagnosticsParams> = startup
             .into_iter()
@@ -4876,6 +4892,13 @@ mod tests {
                         .is_ok_and(|p| p.typ == lsp::MessageType::WARNING
                             && p.message.contains("REDSCRIPT_IDE_UNSET_TEST_VAR")))
         }));
+        assert!(fixed_messages.iter().any(|msg| {
+            matches!(msg, lsp_server::Message::Notification(notif)
+                if notif.method == "window/showMessage"
+                    && serde_json::from_value::<lsp::ShowMessageParams>(notif.params.clone())
+                        .is_ok_and(|p| p.typ == lsp::MessageType::WARNING
+                            && p.message.contains("REDSCRIPT_IDE_UNSET_TEST_VAR")))
+        }));
         server
             .check_workspace(|_, symbols, _, _| {
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "ExternalType"));
@@ -4942,6 +4965,13 @@ mod tests {
             matches!(msg, lsp_server::Message::Notification(notif)
                 if notif.method == "window/logMessage"
                     && serde_json::from_value::<lsp::LogMessageParams>(notif.params.clone())
+                        .is_ok_and(|p| p.typ == lsp::MessageType::WARNING
+                            && p.message.contains("Skipping invalid source root")))
+        }));
+        assert!(initial.iter().any(|msg| {
+            matches!(msg, lsp_server::Message::Notification(notif)
+                if notif.method == "window/showMessage"
+                    && serde_json::from_value::<lsp::ShowMessageParams>(notif.params.clone())
                         .is_ok_and(|p| p.typ == lsp::MessageType::WARNING
                             && p.message.contains("Skipping invalid source root")))
         }));
