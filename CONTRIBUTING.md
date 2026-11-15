@@ -7,8 +7,8 @@ Clippy, and documentation. Install the pinned nightly rustfmt because stable
 rustfmt does not honor all repository formatting options:
 
 ```sh
-rustup toolchain install nightly-2026-10-15 --profile minimal --component rustfmt
-cargo +nightly-2026-10-15 fmt --package redscript-ide -- --check
+rustup toolchain install nightly-2026-11-13 --profile minimal --component rustfmt
+cargo +nightly-2026-11-13 fmt --all -- --check
 cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo +stable test --workspace --all-features --locked
 cargo +stable build --release --locked
@@ -18,7 +18,7 @@ cargo +stable doc --workspace --all-features --no-deps --locked
 To apply formatting rather than check it, run:
 
 ```sh
-cargo +nightly-2026-10-15 fmt --package redscript-ide
+cargo +nightly-2026-11-13 fmt --all
 ```
 
 Keep `--all-targets` in the Clippy command so test code is linted too.
