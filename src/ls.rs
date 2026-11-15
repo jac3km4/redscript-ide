@@ -65,6 +65,7 @@ pub struct RedscriptLanguageServer {
     standalone: HashMap<PathBuf, CompilationCache>,
     generation: u64,
     missing_roots: RefCell<BTreeSet<PathBuf>>,
+    reported_missing_roots: RefCell<BTreeSet<PathBuf>>,
     warned_extensions: HashSet<PathBuf>,
     completion_cache: RefCell<Option<CachedCompletion>>,
 }
@@ -124,6 +125,7 @@ impl RedscriptLanguageServer {
             standalone: HashMap::new(),
             generation: 0,
             missing_roots: RefCell::new(missing_roots),
+            reported_missing_roots: RefCell::new(BTreeSet::new()),
             warned_extensions: HashSet::new(),
             completion_cache: RefCell::new(None),
         })
@@ -173,8 +175,9 @@ impl RedscriptLanguageServer {
         roots: impl IntoIterator<Item = PathBuf>,
     ) -> anyhow::Result<CompilationCache> {
         let sources = ast::SourceMap::new();
+        let mut missing_roots = BTreeSet::new();
         let mut files: BTreeMap<_, _> = dialect::discover(roots, |root| {
-            self.missing_roots.borrow_mut().insert(root.to_owned());
+            missing_roots.insert(root.to_owned());
         })?
         .into_iter()
         .map(|path| {
@@ -186,6 +189,7 @@ impl RedscriptLanguageServer {
             text.map(|text| (path, text))
         })
         .collect::<Result<_, _>>()?;
+        *self.missing_roots.borrow_mut() = missing_roots;
         // Unsaved new files are absent from discovery but still own an active module.
         for (path, overlay) in &self.overlays {
             if self.resolve_file(path).as_workspace().is_some() {
@@ -289,7 +293,9 @@ impl RedscriptLanguageServer {
         }
         self.compilation_cache = workspace;
         self.standalone = standalone;
-        self.log_missing_roots(ctx);
+        if reload {
+            self.log_missing_roots(ctx);
+        }
         Ok(())
     }
 
@@ -752,15 +758,28 @@ impl RedscriptLanguageServer {
     }
 
     pub fn log_missing_roots(&self, ctx: &LspContext) {
-        for root in std::mem::take(&mut *self.missing_roots.borrow_mut()) {
-            ctx.notify::<lsp::notification::LogMessage>(lsp::LogMessageParams {
-                typ: lsp::MessageType::WARNING,
-                message: format!(
-                    "Source root '{}' is missing; treating it as temporarily empty. Restore/create the directory or update source_roots in .redscript, then refresh the workspace.",
+        let current = self.missing_roots.borrow();
+        let mut reported = self.reported_missing_roots.borrow_mut();
+        let configured: HashSet<_> = self
+            .workspaces
+            .values()
+            .flat_map(|workspace| workspace.roots.iter())
+            .collect();
+        for root in reported.difference(&current) {
+            if configured.contains(root) {
+                ctx.logger().info(format!(
+                    "Source root '{}' is available again.",
                     root.display()
-                ),
-            });
+                ));
+            }
         }
+        for root in current.difference(&reported) {
+            ctx.logger().warn(format!(
+                "Source root '{}' is missing; treating it as temporarily empty. Restore/create the directory or update source_roots in .redscript, then refresh the workspace.",
+                root.display()
+            ));
+        }
+        *reported = current.clone();
     }
 
     fn check_workspace_and_publish(&self, ctx: &LspContext) -> anyhow::Result<()> {
@@ -2880,22 +2899,25 @@ mod tests {
             )
             .unwrap();
         let messages: Vec<_> = receiver.try_iter().collect();
-        assert!(messages.iter().any(|message| {
-            let lsp_server::Message::Notification(notification) = message else {
-                return false;
-            };
-            if notification.method != "window/logMessage" {
-                return false;
-            }
-            let params: lsp::LogMessageParams =
-                serde_json::from_value(notification.params.clone()).unwrap();
-            params.typ == lsp::MessageType::WARNING
-                && params
-                    .message
-                    .contains(&dialect::identity(&root).display().to_string())
-                && params.message.contains("source_roots")
-                && params.message.contains("Restore/create")
-        }));
+        assert_eq!(
+            messages.iter().any(|message| {
+                let lsp_server::Message::Notification(notification) = message else {
+                    return false;
+                };
+                if notification.method != "window/logMessage" {
+                    return false;
+                }
+                let params: lsp::LogMessageParams =
+                    serde_json::from_value(notification.params.clone()).unwrap();
+                params.typ == lsp::MessageType::WARNING
+                    && params
+                        .message
+                        .contains(&dialect::identity(&root).display().to_string())
+                    && params.message.contains("source_roots")
+                    && params.message.contains("Restore/create")
+            }),
+            !initially_missing,
+        );
         assert!(!messages.iter().any(|message| {
             matches!(message, lsp_server::Message::Notification(notification)
                 if notification.method == "textDocument/publishDiagnostics")
@@ -2949,6 +2971,49 @@ mod tests {
                         && !params.diagnostics.is_empty())
             );
         }
+
+        // Restoring and deleting the root again transitions warnings cleanly.
+        receiver.try_iter().for_each(drop);
+        fs::create_dir_all(&root).unwrap();
+        server.files_changed(vec![root.clone()], &ctx).unwrap();
+        let restored: Vec<lsp::LogMessageParams> = receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                lsp_server::Message::Notification(notif) if notif.method == "window/logMessage" => {
+                    serde_json::from_value(notif.params).ok()
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            restored
+                .iter()
+                .all(|log| log.typ != lsp::MessageType::WARNING)
+        );
+        assert!(
+            restored
+                .iter()
+                .any(|log| log.message.contains("is available again"))
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+        server.files_changed(vec![root.clone()], &ctx).unwrap();
+        let re_deleted: Vec<lsp::LogMessageParams> = receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                lsp_server::Message::Notification(notif) if notif.method == "window/logMessage" => {
+                    serde_json::from_value(notif.params).ok()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            re_deleted
+                .iter()
+                .filter(|log| log.typ == lsp::MessageType::WARNING)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -3438,6 +3503,7 @@ mod tests {
             standalone: HashMap::new(),
             generation: 0,
             missing_roots: RefCell::new(BTreeSet::new()),
+            reported_missing_roots: RefCell::new(BTreeSet::new()),
             warned_extensions: HashSet::new(),
             completion_cache: RefCell::new(None),
         }
