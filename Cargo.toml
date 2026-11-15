@@ -18,14 +18,14 @@ miniz_oxide = "0.8"
 lsp-server = "0.7"
 lsp-types = "0.97"
 tempfile = "3"
-redscript-io = { git = "https://github.com/jac3km4/redscript", rev = "4f5c3d9" }
-redscript-redmod-formatter = { git = "https://github.com/jac3km4/redscript", rev = "4f5c3d9" }
-redscript-redmod-adapter = { git = "https://github.com/jac3km4/redscript", rev = "4f5c3d9" }
-redscript-community-formatter = { git = "https://github.com/jac3km4/redscript", rev = "4f5c3d9" }
-redscript-compiler-api = { git = "https://github.com/jac3km4/redscript", rev = "4f5c3d9" }
-redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "4f5c3d9" }
-redscript-dotfile = { git = "https://github.com/jac3km4/redscript", rev = "4f5c3d9" }
-redscript-code-edit = { git = "https://github.com/jac3km4/redscript", rev = "4f5c3d9" }
+redscript-io = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.1" }
+redscript-redmod-formatter = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.1" }
+redscript-redmod-adapter = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.1" }
+redscript-community-formatter = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.1" }
+redscript-compiler-api = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.1" }
+redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.1" }
+redscript-dotfile = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.1" }
+redscript-code-edit = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.1" }
 
 [workspace.metadata.release]
 pre-release-commit-message = "chore: release {{version}}"
