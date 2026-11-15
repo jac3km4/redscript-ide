@@ -53,15 +53,32 @@ pub fn identity(path: &Path) -> PathBuf {
     })
 }
 
+#[derive(Debug)]
+pub enum DiscoveryIssue {
+    MissingRoot(PathBuf),
+    InvalidRoot { root: PathBuf, error: io::Error },
+    WalkError { root: PathBuf, error: io::Error },
+}
+
 pub fn discover(
     roots: impl IntoIterator<Item = impl Into<PathBuf>>,
-    mut missing_root: impl FnMut(&Path),
-) -> io::Result<Vec<PathBuf>> {
+    mut on_issue: impl FnMut(DiscoveryIssue),
+) -> Vec<PathBuf> {
     let mut paths = BTreeSet::new();
-    for root in roots {
+    'roots: for root in roots {
         let root = root.into();
         match fs::metadata(&root) {
-            Ok(_) => {}
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                on_issue(DiscoveryIssue::InvalidRoot {
+                    error: io::Error::new(
+                        io::ErrorKind::NotADirectory,
+                        format!("source root '{}' is not a directory", root.display()),
+                    ),
+                    root,
+                });
+                continue;
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 // Windows also reports NotFound for children of a regular file.
                 // Only absent directories should be treated as temporarily empty.
@@ -72,33 +89,52 @@ pub fn discover(
                     match fs::metadata(ancestor) {
                         Ok(metadata) if metadata.is_dir() => break,
                         Ok(_) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::NotADirectory,
-                                format!(
-                                    "source root ancestor '{}' is not a directory",
-                                    ancestor.display()
+                            on_issue(DiscoveryIssue::InvalidRoot {
+                                error: io::Error::new(
+                                    io::ErrorKind::NotADirectory,
+                                    format!(
+                                        "source root ancestor '{}' is not a directory",
+                                        ancestor.display()
+                                    ),
                                 ),
-                            ));
+                                root,
+                            });
+                            continue 'roots;
                         }
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error),
+                        Err(error) => {
+                            on_issue(DiscoveryIssue::InvalidRoot { root, error });
+                            continue 'roots;
+                        }
                     }
                 }
-                missing_root(&root);
+                on_issue(DiscoveryIssue::MissingRoot(root));
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                on_issue(DiscoveryIssue::InvalidRoot { root, error });
+                continue;
+            }
         }
-        for entry in ignore::WalkBuilder::new(root).follow_links(true).build() {
-            let entry = entry.map_err(io::Error::other)?;
-            if entry.file_type().is_some_and(|kind| kind.is_file())
-                && Dialect::of(entry.path()).is_some()
-            {
-                paths.insert(identity(entry.path()));
+        for entry in ignore::WalkBuilder::new(&root).follow_links(true).build() {
+            match entry {
+                Ok(entry) => {
+                    if entry.file_type().is_some_and(|kind| kind.is_file())
+                        && Dialect::of(entry.path()).is_some()
+                    {
+                        paths.insert(identity(entry.path()));
+                    }
+                }
+                Err(error) => {
+                    on_issue(DiscoveryIssue::WalkError {
+                        root: root.clone(),
+                        error: io::Error::other(error),
+                    });
+                }
             }
         }
     }
-    Ok(paths.into_iter().collect())
+    paths.into_iter().collect()
 }
 
 pub enum ParsedModule<'src> {
@@ -218,21 +254,22 @@ mod tests {
         fs::write(temp.path().join("upper.SCRIPT"), "").unwrap();
         fs::write(temp.path().join("wrong.REDS"), "").unwrap();
         fs::write(temp.path().join(".ignore"), "ignored.script\n").unwrap();
-        let paths = discover([temp.path(), temp.path()], |_| {
-            panic!("unexpected missing root")
-        })
-        .unwrap();
+        let paths = discover([temp.path(), temp.path()], |issue| {
+            panic!("unexpected discovery issue: {issue:?}")
+        });
         assert_eq!(paths.len(), 4);
         for name in ["a.reds", "b.script", "mixed.Script", "upper.SCRIPT"] {
             assert!(paths.contains(&identity(&temp.path().join(name))));
         }
         // A non-directory ancestor is an error, not a temporarily absent root.
+        let mut issues = Vec::new();
         assert!(
-            discover([temp.path().join("a.reds/child")], |_| {
-                panic!("unexpected missing root")
-            })
-            .is_err()
+            discover([temp.path().join("a.reds/child")], |issue| issues.push(issue)).is_empty()
         );
+        assert!(matches!(
+            issues.as_slice(),
+            [DiscoveryIssue::InvalidRoot { .. }]
+        ));
     }
 
     #[test]
@@ -261,12 +298,37 @@ mod tests {
         fs::write(&healthy, "").unwrap();
         let missing = temp.path().join("missing/nested");
         let mut warnings = Vec::new();
-        let paths = discover([missing.clone(), temp.path().to_owned()], |root| {
-            warnings.push(root.to_owned());
-        })
-        .unwrap();
+        let paths = discover([missing.clone(), temp.path().to_owned()], |issue| {
+            let DiscoveryIssue::MissingRoot(root) = issue else {
+                panic!("expected missing root, got {issue:?}");
+            };
+            warnings.push(root);
+        });
         assert_eq!(warnings, [missing]);
         assert_eq!(paths, [identity(&healthy)]);
+    }
+
+    #[test]
+    fn discovery_isolates_invalid_roots_and_keeps_healthy_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let healthy = temp.path().join("healthy.reds");
+        fs::write(&healthy, "public class Healthy {}").unwrap();
+        let mut issues = Vec::new();
+        let paths = discover(
+            [
+                healthy.clone(),
+                healthy.join("child"),
+                temp.path().to_owned(),
+            ],
+            |issue| issues.push(issue),
+        );
+        assert_eq!(paths, [identity(&healthy)]);
+        assert_eq!(issues.len(), 2);
+        assert!(
+            issues
+                .iter()
+                .all(|issue| matches!(issue, DiscoveryIssue::InvalidRoot { .. }))
+        );
     }
 
     #[test]

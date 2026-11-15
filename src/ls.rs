@@ -62,6 +62,11 @@ pub struct RedscriptLanguageServer {
     config_warnings: BTreeSet<String>,
     reported_config_warnings: RefCell<BTreeSet<String>>,
     last_published_configs: RefCell<HashSet<PathBuf>>,
+    read_diagnostics: RefCell<BTreeMap<PathBuf, lsp::Diagnostic>>,
+    io_warnings: RefCell<BTreeSet<String>>,
+    reported_io_warnings: RefCell<BTreeSet<String>>,
+    last_published_reads: RefCell<HashSet<PathBuf>>,
+    standalone_paths: HashSet<PathBuf>,
     compilation_cache: CompilationCache,
     cached_fixes: RefCell<FixMap>,
     last_published_files: RefCell<HashSet<PathBuf>>,
@@ -115,22 +120,34 @@ impl RedscriptLanguageServer {
             config_warnings.extend(loaded.warnings);
             workspaces.insert(dir, loaded.workspace);
         }
-        let workspace_dirs = workspaces.iter().flat_map(|(_, w)| &w.roots);
+        let workspace_dirs = workspaces.iter().flat_map(|(_, w)| w.roots.clone());
         let mut missing_roots = BTreeSet::new();
+        let mut read_diagnostics = BTreeMap::new();
+        let mut io_warnings = BTreeSet::new();
+        let sources = collect_workspace_sources(
+            workspace_dirs,
+            &HashMap::new(),
+            |_| false,
+            &mut missing_roots,
+            &mut read_diagnostics,
+            &mut io_warnings,
+        );
         Ok(Self {
-            compilation_cache: CompilationCache::make(
+            compilation_cache: CompilationCache::from_sources(
                 cache_bytes,
-                workspace_dirs,
+                sources,
                 TypeInterner::default(),
-                |root| {
-                    missing_roots.insert(root.to_owned());
-                },
             )?,
             workspaces,
             config_diagnostics,
             config_warnings,
             reported_config_warnings: RefCell::new(BTreeSet::new()),
             last_published_configs: RefCell::new(HashSet::new()),
+            read_diagnostics: RefCell::new(read_diagnostics),
+            io_warnings: RefCell::new(io_warnings),
+            reported_io_warnings: RefCell::new(BTreeSet::new()),
+            last_published_reads: RefCell::new(HashSet::new()),
+            standalone_paths: HashSet::new(),
             cached_fixes: RefCell::new(HashMap::new()),
             last_published_files: RefCell::new(HashSet::new()),
             overlays: HashMap::new(),
@@ -185,32 +202,19 @@ impl RedscriptLanguageServer {
     fn make_snapshot(
         &self,
         roots: impl IntoIterator<Item = PathBuf>,
+        read_diagnostics: &mut BTreeMap<PathBuf, lsp::Diagnostic>,
+        io_warnings: &mut BTreeSet<String>,
     ) -> anyhow::Result<CompilationCache> {
-        let sources = ast::SourceMap::new();
         let mut missing_roots = BTreeSet::new();
-        let mut files: BTreeMap<_, _> = dialect::discover(roots, |root| {
-            missing_roots.insert(root.to_owned());
-        })?
-        .into_iter()
-        .map(|path| {
-            let text = self
-                .overlays
-                .get(&path)
-                .map(|overlay| Ok(overlay.text.clone()))
-                .unwrap_or_else(|| fs::read_to_string(&path));
-            text.map(|text| (path, text))
-        })
-        .collect::<Result<_, _>>()?;
+        let sources = collect_workspace_sources(
+            roots,
+            &self.overlays,
+            |path| self.resolve_file(path).as_workspace().is_some(),
+            &mut missing_roots,
+            read_diagnostics,
+            io_warnings,
+        );
         *self.missing_roots.borrow_mut() = missing_roots;
-        // Unsaved new files are absent from discovery but still own an active module.
-        for (path, overlay) in &self.overlays {
-            if self.resolve_file(path).as_workspace().is_some() {
-                files.insert(path.clone(), overlay.text.clone());
-            }
-        }
-        for (path, text) in files {
-            sources.push_back(path, text);
-        }
         CompilationCache::from_sources(
             self.compilation_cache.borrow_cache_bytes().clone(),
             sources,
@@ -251,9 +255,25 @@ impl RedscriptLanguageServer {
     fn rebuild_inner(&mut self, ctx: &LspContext, reload: bool) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
         self.invalidate();
-        if reload {
+        let mut read_diagnostics = if reload {
             self.completion_cache.borrow_mut().take();
-        }
+            BTreeMap::new()
+        } else {
+            self.read_diagnostics
+                .borrow()
+                .iter()
+                .filter(|(path, _)| {
+                    self.resolve_file(path).as_workspace().is_some()
+                        && !self.overlays.contains_key(*path)
+                })
+                .map(|(path, diag)| (path.clone(), diag.clone()))
+                .collect()
+        };
+        let mut io_warnings = if reload {
+            BTreeSet::new()
+        } else {
+            self.io_warnings.borrow().clone()
+        };
         let workspace = if reload {
             ctx.logger()
                 .info("Rebuild phase=workspace discovery, parsing and analysis");
@@ -261,6 +281,8 @@ impl RedscriptLanguageServer {
                 self.workspaces
                     .values()
                     .flat_map(|workspace| workspace.roots.clone()),
+                &mut read_diagnostics,
+                &mut io_warnings,
             )?
         } else {
             ctx.logger()
@@ -275,11 +297,13 @@ impl RedscriptLanguageServer {
         let paths: HashSet<_> = self
             .standalone
             .keys()
+            .chain(self.standalone_paths.iter())
             .chain(self.overlays.keys())
             .filter(|path| self.resolve_file(path).as_workspace().is_none())
             .cloned()
             .collect();
         let mut standalone = HashMap::new();
+        let mut active_standalone_paths = HashSet::new();
         for path in paths {
             let text = self
                 .overlays
@@ -288,6 +312,7 @@ impl RedscriptLanguageServer {
                 .unwrap_or_else(|| fs::read_to_string(&path));
             match text {
                 Ok(text) => {
+                    active_standalone_paths.insert(path.clone());
                     let sources = ast::SourceMap::new();
                     sources.push_back(&path, text);
                     standalone.insert(
@@ -300,13 +325,26 @@ impl RedscriptLanguageServer {
                     );
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    active_standalone_paths.insert(path.clone());
+                    record_source_read_error(
+                        &path,
+                        &error,
+                        &mut read_diagnostics,
+                        &mut io_warnings,
+                    );
+                }
             }
         }
         self.compilation_cache = workspace;
         self.standalone = standalone;
+        self.standalone_paths = active_standalone_paths;
+        *self.read_diagnostics.borrow_mut() = read_diagnostics;
+        *self.io_warnings.borrow_mut() = io_warnings;
         if reload {
             self.log_missing_roots(ctx);
+        } else {
+            self.log_io_warnings(ctx);
         }
         Ok(())
     }
@@ -330,6 +368,7 @@ impl RedscriptLanguageServer {
             .last_published_files
             .borrow()
             .difference(&active)
+            .filter(|path| !self.read_diagnostics.borrow().contains_key(*path))
             .cloned()
             .collect();
         for path in stale {
@@ -340,7 +379,44 @@ impl RedscriptLanguageServer {
             });
             self.last_published_files.borrow_mut().remove(&path);
         }
+        for path in self.read_diagnostics.borrow().keys() {
+            self.last_published_files.borrow_mut().remove(path);
+        }
+        self.publish_read_diagnostics(ctx)?;
         self.publish_config_diagnostics(ctx)?;
+        Ok(())
+    }
+
+    fn publish_read_diagnostics(&self, ctx: &LspContext) -> anyhow::Result<()> {
+        let read_diagnostics = self.read_diagnostics.borrow();
+        let mut last_published = self.last_published_reads.borrow_mut();
+        for (path, diagnostic) in &*read_diagnostics {
+            ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
+                uri: ctx.uri(path)?,
+                diagnostics: vec![diagnostic.clone()],
+                version: None,
+            });
+            last_published.insert(path.clone());
+        }
+        let mut stale: Vec<_> = last_published
+            .iter()
+            .filter(|path| !read_diagnostics.contains_key(*path))
+            .cloned()
+            .collect();
+        stale.sort();
+        let published_files = self.last_published_files.borrow();
+        for path in stale {
+            if !published_files.contains(&path) {
+                ctx.notify::<lsp::notification::PublishDiagnostics>(
+                    lsp::PublishDiagnosticsParams {
+                        uri: ctx.uri(&path)?,
+                        diagnostics: vec![],
+                        version: self.overlays.get(&path).map(|overlay| overlay.version),
+                    },
+                );
+            }
+            last_published.remove(&path);
+        }
         Ok(())
     }
 
@@ -822,6 +898,16 @@ impl RedscriptLanguageServer {
         *reported = current.clone();
         drop(reported);
         self.log_config_warnings(ctx);
+        self.log_io_warnings(ctx);
+    }
+
+    fn log_io_warnings(&self, ctx: &LspContext) {
+        let current = self.io_warnings.borrow();
+        let mut reported = self.reported_io_warnings.borrow_mut();
+        for warning in current.difference(&reported) {
+            ctx.logger().warn(warning);
+        }
+        *reported = current.clone();
     }
 
     fn log_config_warnings(&self, ctx: &LspContext) {
@@ -976,10 +1062,12 @@ impl RedscriptLanguageServer {
         let is_workspace = sources
             .files()
             .any(|(_, file)| self.resolve_file(file.path()).as_workspace().is_some());
+        let read_diagnostics = self.read_diagnostics.borrow();
         for path in last_diagnostics.difference(&current_files).filter(|path| {
-            analyzed_paths.contains(*path)
-                || (is_workspace && self.resolve_file(path).as_workspace().is_some())
-                || (!self.overlays.contains_key(*path) && !path.exists())
+            !read_diagnostics.contains_key(*path)
+                && (analyzed_paths.contains(*path)
+                    || (is_workspace && self.resolve_file(path).as_workspace().is_some())
+                    || (!self.overlays.contains_key(*path) && !path.exists()))
         }) {
             publications.push((
                 path.as_path(),
@@ -1396,6 +1484,7 @@ impl LanguageServer for RedscriptLanguageServer {
         } else {
             self.overlays.remove(&path);
             self.standalone.remove(&path);
+            self.standalone_paths.remove(&path);
         }
         // Closing must restore disk contents (or remove an unsaved file).
         // Open/change use known sources; filesystem notifications refresh discovery.
@@ -1418,21 +1507,7 @@ impl LanguageServer for RedscriptLanguageServer {
             && Dialect::of(&path).is_some()
             && path.is_file()
         {
-            let sources = ast::SourceMap::new();
-            let text = self
-                .overlays
-                .get(&path)
-                .map(|overlay| Ok(overlay.text.clone()))
-                .unwrap_or_else(|| fs::read_to_string(&path))?;
-            sources.push_back(&path, text);
-            self.standalone.insert(
-                path,
-                CompilationCache::from_sources(
-                    self.compilation_cache.borrow_cache_bytes().clone(),
-                    sources,
-                    TypeInterner::default(),
-                )?,
-            );
+            self.standalone_paths.insert(path);
         }
         self.rebuild(ctx)?;
         self.publish_all_diagnostics(ctx)
@@ -1618,16 +1693,6 @@ impl CompilationCache {
         })
     }
 
-    pub fn make(
-        cache_bytes: CacheBytes,
-        workspace_dirs: impl IntoIterator<Item = impl Into<PathBuf>>,
-        interner: TypeInterner,
-        missing_root: impl FnMut(&Path),
-    ) -> anyhow::Result<Self> {
-        let sources = ast::SourceMap::from_files(dialect::discover(workspace_dirs, missing_root)?)?;
-        Self::from_sources(cache_bytes, sources, interner)
-    }
-
     fn from_sources(
         cache_bytes: CacheBytes,
         sources: ast::SourceMap,
@@ -1799,6 +1864,98 @@ impl WorkspaceDir {
             },
         }
     }
+}
+
+fn collect_workspace_sources(
+    roots: impl IntoIterator<Item = PathBuf>,
+    overlays: &HashMap<PathBuf, Overlay>,
+    is_workspace_file: impl Fn(&Path) -> bool,
+    missing_roots: &mut BTreeSet<PathBuf>,
+    read_diagnostics: &mut BTreeMap<PathBuf, lsp::Diagnostic>,
+    io_warnings: &mut BTreeSet<String>,
+) -> ast::SourceMap {
+    let sources = ast::SourceMap::new();
+    let mut files = BTreeMap::new();
+    let discovered = dialect::discover(roots, |issue| match issue {
+        dialect::DiscoveryIssue::MissingRoot(root) => {
+            missing_roots.insert(root);
+        }
+        dialect::DiscoveryIssue::InvalidRoot { root, error } => {
+            io_warnings.insert(format!(
+                "Skipping invalid source root '{}': {error}.",
+                root.display()
+            ));
+        }
+        dialect::DiscoveryIssue::WalkError { root, error } => {
+            io_warnings.insert(format!(
+                "Encountered filesystem error while scanning source root '{}': {error}.",
+                root.display()
+            ));
+        }
+    });
+    for path in discovered {
+        if let Some(overlay) = overlays.get(&path) {
+            files.insert(path, overlay.text.clone());
+        } else {
+            match fs::read_to_string(&path) {
+                Ok(text) => {
+                    files.insert(path, text);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    record_source_read_error(&path, &error, read_diagnostics, io_warnings);
+                }
+            }
+        }
+    }
+    // Unsaved new files are absent from discovery but still own an active module.
+    for (path, overlay) in overlays {
+        if is_workspace_file(path) {
+            read_diagnostics.remove(path);
+            files.insert(path.clone(), overlay.text.clone());
+        }
+    }
+    for (path, text) in files {
+        sources.push_back(path, text);
+    }
+    sources
+}
+
+fn record_source_read_error(
+    path: &Path,
+    error: &std::io::Error,
+    read_diagnostics: &mut BTreeMap<PathBuf, lsp::Diagnostic>,
+    io_warnings: &mut BTreeSet<String>,
+) {
+    let (code, message, warning) = if error.kind() == std::io::ErrorKind::InvalidData {
+        (
+            "INVALID_UTF8",
+            "file is not valid UTF-8; re-save it with UTF-8 encoding to enable analysis"
+                .to_owned(),
+            format!(
+                "Skipping '{}': file is not valid UTF-8 ({error}). Re-save it with UTF-8 encoding to enable analysis.",
+                path.display()
+            ),
+        )
+    } else {
+        (
+            "IO_ERROR",
+            format!("failed to read source file: {error}"),
+            format!("Skipping '{}': failed to read source file ({error}).", path.display()),
+        )
+    };
+    io_warnings.insert(warning);
+    read_diagnostics.insert(
+        path.to_owned(),
+        lsp::Diagnostic {
+            range: lsp::Range::default(),
+            severity: Some(lsp::DiagnosticSeverity::ERROR),
+            code: Some(lsp::NumberOrString::String(code.into())),
+            source: Some("redscript".into()),
+            message,
+            ..Default::default()
+        },
+    );
 }
 
 fn config_diagnostic(range: lsp::Range, message: String) -> lsp::Diagnostic {
@@ -3693,6 +3850,11 @@ mod tests {
             config_warnings: BTreeSet::new(),
             reported_config_warnings: RefCell::new(BTreeSet::new()),
             last_published_configs: RefCell::new(HashSet::new()),
+            read_diagnostics: RefCell::new(BTreeMap::new()),
+            io_warnings: RefCell::new(BTreeSet::new()),
+            reported_io_warnings: RefCell::new(BTreeSet::new()),
+            last_published_reads: RefCell::new(HashSet::new()),
+            standalone_paths: HashSet::new(),
             compilation_cache: CompilationCache::default(),
             cached_fixes: RefCell::new(HashMap::new()),
             last_published_files: RefCell::new(HashSet::new()),
@@ -4395,5 +4557,98 @@ mod tests {
                     && serde_json::from_value::<lsp::PublishDiagnosticsParams>(notif.params.clone())
                         .is_ok_and(|p| p.uri == dotfile_uri && !p.diagnostics.is_empty()))
         }));
+    }
+
+    #[test]
+    fn non_utf8_files_and_invalid_roots_are_isolated_with_diagnostics() {
+        let (temp, _server, ctx, receiver) = fixture();
+        let healthy = temp.path().join("healthy.reds");
+        fs::write(&healthy, "public class Healthy {}").unwrap();
+        let bad_utf8 = temp.path().join("bad_encoding.reds");
+        fs::write(&bad_utf8, b"public class Bad { // \xff\xfe }\n").unwrap();
+        fs::write(
+            temp.path().join(".redscript"),
+            format!(
+                "source_roots = [\".\", {:?}]\n",
+                healthy.join("not-a-dir").to_string_lossy().replace('\\', "/"),
+            ),
+        )
+        .unwrap();
+
+        let mut server =
+            RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
+        server.log_missing_roots(&ctx);
+        server.publish_all_diagnostics(&ctx).unwrap();
+        server
+            .check_workspace(|_, symbols, _, _| {
+                assert!(symbols.types().any(|(id, _)| id.as_str() == "Healthy"));
+                Ok(())
+            })
+            .unwrap();
+
+        let bad_uri = ctx.uri(&dialect::identity(&bad_utf8)).unwrap();
+        let initial: Vec<_> = receiver.try_iter().collect();
+        assert!(initial.iter().any(|msg| {
+            matches!(msg, lsp_server::Message::Notification(notif)
+                if notif.method == "textDocument/publishDiagnostics"
+                    && serde_json::from_value::<lsp::PublishDiagnosticsParams>(notif.params.clone())
+                        .is_ok_and(|p| p.uri == bad_uri
+                            && p.diagnostics.len() == 1
+                            && p.diagnostics[0].code == Some(lsp::NumberOrString::String("INVALID_UTF8".into()))))
+        }));
+        assert!(initial.iter().any(|msg| {
+            matches!(msg, lsp_server::Message::Notification(notif)
+                if notif.method == "window/logMessage"
+                    && serde_json::from_value::<lsp::LogMessageParams>(notif.params.clone())
+                        .is_ok_and(|p| p.typ == lsp::MessageType::WARNING
+                            && p.message.contains("Skipping invalid source root")))
+        }));
+
+        // Re-saving as valid UTF-8 with a syntax error replaces INVALID_UTF8 with SYNTAX_ERR cleanly.
+        fs::write(&bad_utf8, "public class {").unwrap();
+        server.check(bad_utf8.clone(), &ctx).unwrap();
+        let bad_pubs: Vec<lsp::PublishDiagnosticsParams> = receiver
+            .try_iter()
+            .filter_map(|msg| match msg {
+                lsp_server::Message::Notification(notif)
+                    if notif.method == "textDocument/publishDiagnostics" =>
+                {
+                    serde_json::from_value::<lsp::PublishDiagnosticsParams>(notif.params)
+                        .ok()
+                        .filter(|p| p.uri == bad_uri)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bad_pubs.len(), 1, "{bad_pubs:?}");
+        assert_eq!(
+            bad_pubs[0].diagnostics[0].code,
+            Some(lsp::NumberOrString::String("SYNTAX_ERR".into()))
+        );
+
+        // Fixing the file clears diagnostics and exposes its symbols.
+        fs::write(&bad_utf8, "public class Recovered {}").unwrap();
+        server.check(bad_utf8, &ctx).unwrap();
+        let cleared: Vec<lsp::PublishDiagnosticsParams> = receiver
+            .try_iter()
+            .filter_map(|msg| match msg {
+                lsp_server::Message::Notification(notif)
+                    if notif.method == "textDocument/publishDiagnostics" =>
+                {
+                    serde_json::from_value::<lsp::PublishDiagnosticsParams>(notif.params)
+                        .ok()
+                        .filter(|p| p.uri == bad_uri)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cleared.len(), 1);
+        assert!(cleared[0].diagnostics.is_empty());
+        server
+            .check_workspace(|_, symbols, _, _| {
+                assert!(symbols.types().any(|(id, _)| id.as_str() == "Recovered"));
+                Ok(())
+            })
+            .unwrap();
     }
 }
