@@ -998,9 +998,17 @@ pub(crate) fn path_from_uri(uri: &lsp::Uri) -> anyhow::Result<PathBuf> {
 
     let stripped = uri.path().as_estr().decode().into_string()?;
     #[cfg(windows)]
-    let path = PathBuf::from(stripped.trim_start_matches("/"));
+    let path = PathBuf::from(stripped.trim_start_matches('/'));
     #[cfg(not(windows))]
-    let path = PathBuf::from(&*stripped);
+    let path = {
+        let bytes = stripped.as_bytes();
+        if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':'
+        {
+            PathBuf::from(&stripped[1..])
+        } else {
+            PathBuf::from(&*stripped)
+        }
+    };
     Ok(path)
 }
 
@@ -1010,8 +1018,9 @@ fn uri_from_path(path: &Path) -> anyhow::Result<lsp::Uri> {
     // canonicalize() uses Windows extended-length paths; these are not URI paths.
     let path_str = path_str.strip_prefix("//?/").unwrap_or(&path_str);
 
-    #[cfg(windows)]
-    encoded_path.encode::<fluent_uri::encoding::encoder::Path>(&b"/");
+    if !path_str.starts_with('/') {
+        encoded_path.encode::<fluent_uri::encoding::encoder::Path>(&b"/");
+    }
     encoded_path.encode::<fluent_uri::encoding::encoder::Path>(&path_str);
 
     let uri = fluent_uri::Uri::builder()
