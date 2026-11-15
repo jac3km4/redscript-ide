@@ -929,8 +929,8 @@ impl LspContext {
         self.code_action_literals && self.code_action_data && self.code_action_resolve_edit
     }
 
-    pub fn supports_diagnostic_tag(&self, tag: lsp::DiagnosticTag) -> bool {
-        self.diagnostic_tags.contains(&tag)
+    pub fn supports_diagnostic_tag(&self, tag: &lsp::DiagnosticTag) -> bool {
+        self.diagnostic_tags.contains(tag)
     }
 
     pub fn logger(&self) -> LspLog<'_> {

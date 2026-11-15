@@ -14,8 +14,8 @@ use redscript_community_formatter::{FormatSettings, format_document};
 use redscript_compiler_api::ast::Span;
 use redscript_compiler_api::pass::{DiagnosticPass, UnusedLocals};
 use redscript_compiler_api::{
-    CompilationInputs, CompileErrorReporter, Diagnostic, LoweredCompilationUnit, ScriptBundle,
-    SourceMapExt, Symbols, TypeFlagRegistry, TypeInterner, TypeSchema, ast,
+    CompilationInputs, CompileErrorReporter, Diagnostic, LowerError, LoweredCompilationUnit,
+    ScriptBundle, SourceMapExt, Symbols, TypeFlagRegistry, TypeInterner, TypeSchema, ast,
 };
 use redscript_dotfile::Dotfile;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,8 @@ mod document_symbols;
 
 const DIAGNOSTIC_PASSES: &[&'static (dyn DiagnosticPass + 'static)] = &[&UnusedLocals];
 const EMBEDDED_CACHE: &[u8] = include_bytes!("../assets/api.redscripts.zlib");
+const REDMOD_SUBSET_DOCS_URL: &str =
+    "https://github.com/jac3km4/redscript/blob/v1.0.0/crates/compiler/redmod/adapter/README.md";
 
 #[derive(Clone)]
 enum CacheBytes {
@@ -676,6 +678,7 @@ impl RedscriptLanguageServer {
         &self,
         doc: Document<'_>,
         _tab_size: u16,
+        ctx: &LspContext,
     ) -> anyhow::Result<Vec<lsp::TextEdit>> {
         let Some(dialect) = Dialect::of(doc.path()) else {
             return Ok(vec![]);
@@ -692,12 +695,29 @@ impl RedscriptLanguageServer {
         let file = map.get(id).context("missing source file")?;
 
         let formatted = match dialect {
-            Dialect::Redmod => redscript_redmod_formatter::format_source(file.source(), id).ok(),
+            Dialect::Redmod => match redscript_redmod_formatter::format_source(file.source(), id) {
+                Ok(formatted) => Some(formatted),
+                Err(errors) => {
+                    if let Some(first) = errors.first() {
+                        ctx.logger().info(format!(
+                            "Formatting skipped path={}: syntax error ({first})",
+                            doc.path().display(),
+                        ));
+                    }
+                    None
+                }
+            },
             Dialect::Community => {
                 let (module, errors) = format_document(file.source(), id, settings);
-                module
-                    .filter(|_| errors.is_empty())
-                    .map(|module| module.to_string())
+                if let Some(first) = errors.first() {
+                    ctx.logger().info(format!(
+                        "Formatting skipped path={}: syntax error ({first})",
+                        doc.path().display(),
+                    ));
+                    None
+                } else {
+                    module.map(|module| module.to_string())
+                }
             }
         };
         if let Some(formatted) = formatted
@@ -1017,6 +1037,16 @@ impl RedscriptLanguageServer {
                     diagnostics: diags
                         .into_iter()
                         .filter_map(|(diag, message)| {
+                            let is_redmod_capability = diag.code() == "REDMOD_CAPABILITY";
+                            let message = if is_redmod_capability {
+                                format!("unsupported by IDE REDmod analyzer: {message}")
+                            } else {
+                                message
+                            };
+                            let code_description = is_redmod_capability
+                                .then(|| REDMOD_SUBSET_DOCS_URL.parse().ok())
+                                .flatten()
+                                .map(|href| lsp::CodeDescription { href });
                             Some(lsp::Diagnostic {
                                 range: range(diag.span(), file)?,
                                 severity: Some(if diag.is_error() {
@@ -1025,6 +1055,7 @@ impl RedscriptLanguageServer {
                                     lsp::DiagnosticSeverity::WARNING
                                 }),
                                 code: Some(lsp::NumberOrString::String(diag.code().into())),
+                                code_description,
                                 source: Some("redscript".into()),
                                 message,
                                 related_information: {
@@ -1043,10 +1074,7 @@ impl RedscriptLanguageServer {
                                         .collect();
                                     (!related.is_empty()).then_some(related)
                                 },
-                                tags: (matches!(diag, Diagnostic::UnusedLocal(_, _))
-                                    && ctx
-                                        .supports_diagnostic_tag(lsp::DiagnosticTag::UNNECESSARY))
-                                .then(|| vec![lsp::DiagnosticTag::UNNECESSARY]),
+                                tags: diagnostic_tags(diag, ctx),
                                 ..Default::default()
                             })
                         })
@@ -1575,9 +1603,9 @@ impl LanguageServer for RedscriptLanguageServer {
         &self,
         doc: Document<'_>,
         tab_size: u16,
-        _ctx: &LspContext,
+        ctx: &LspContext,
     ) -> anyhow::Result<Vec<lsp_types::TextEdit>> {
-        self.format_document(doc, tab_size)
+        self.format_document(doc, tab_size, ctx)
     }
 
     fn code_action(
@@ -1597,6 +1625,22 @@ impl LanguageServer for RedscriptLanguageServer {
     ) -> anyhow::Result<lsp_types::CodeAction> {
         self.code_action_resolve(action, ctx)
     }
+}
+
+fn diagnostic_tags(diag: &Diagnostic<'_>, ctx: &LspContext) -> Option<Vec<lsp::DiagnosticTag>> {
+    let tag = match diag {
+        Diagnostic::UnusedLocal(_, _)
+        | Diagnostic::UnusedItemQualifiers(_, _)
+        | Diagnostic::AddFieldConflict(_)
+        | Diagnostic::LoweringError(LowerError::RedundantDynCast(_)) => {
+            lsp::DiagnosticTag::UNNECESSARY
+        }
+        Diagnostic::LoweringError(LowerError::DeprecatedNameOf(_)) => {
+            lsp::DiagnosticTag::DEPRECATED
+        }
+        _ => return None,
+    };
+    ctx.supports_diagnostic_tag(&tag).then(|| vec![tag])
 }
 
 fn location(span: ast::Span, sources: &ast::SourceMap, ctx: &LspContext) -> Option<lsp::Location> {
@@ -3724,13 +3768,13 @@ mod tests {
 
     #[test]
     fn redmod_formatting_preserves_native_syntax_trivia_and_utf16_ranges() {
-        let (temp, server, ctx, _receiver) = fixture();
+        let (temp, server, ctx, receiver) = fixture();
         let path = temp.path().join("format.script");
         let source = "class Test {\r\n// comment { 😀\r\noverride function Run() {\r\nvar text: String = \"first\n  second\"; // }\r\n/* block\n unmodified */\r\n}\r\n} // é😀";
         let expected = "class Test {\r\n    // comment { 😀\r\n    override function Run() {\r\n        var text: String = \"first\n  second\"; // }\r\n        /* block\n unmodified */\r\n    }\r\n} // é😀";
         let buffer = crate::buffers::Buffer::new(source.into());
         let edits = server
-            .format_document(Document::new(path.clone(), &buffer), 2)
+            .format_document(Document::new(path.clone(), &buffer), 2, &ctx)
             .unwrap();
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].new_text, expected);
@@ -3743,20 +3787,27 @@ mod tests {
         assert_eq!(formatted.contents().to_string(), expected);
         assert!(
             server
-                .format_document(Document::new(path.clone(), &formatted), 8)
+                .format_document(Document::new(path.clone(), &formatted), 8, &ctx)
                 .unwrap()
                 .is_empty()
         );
+        receiver.try_iter().for_each(drop);
         let invalid = crate::buffers::Buffer::new("function Broken( {".into());
         assert!(
             server
-                .format_document(Document::new(path.clone(), &invalid), 4)
+                .format_document(Document::new(path.clone(), &invalid), 4, &ctx)
                 .unwrap()
                 .is_empty()
         );
+        assert!(receiver.try_iter().any(|msg| {
+            matches!(msg, lsp_server::Message::Notification(notif)
+                if notif.method == "window/logMessage"
+                    && serde_json::from_value::<lsp::LogMessageParams>(notif.params.clone())
+                        .is_ok_and(|p| p.message.contains("Formatting skipped")))
+        }));
         assert!(
             server
-                .format_document(Document::new(temp.path().join("unknown.txt"), &buffer), 4)
+                .format_document(Document::new(temp.path().join("unknown.txt"), &buffer), 4, &ctx)
                 .unwrap()
                 .is_empty()
         );
@@ -3773,7 +3824,8 @@ mod tests {
             server
                 .format_document(
                     Document::new(path.clone(), buffers.get(&ctx.uri(&path).unwrap()).unwrap()),
-                    2
+                    2,
+                    &ctx,
                 )
                 .unwrap()
                 .is_empty()
@@ -3884,6 +3936,8 @@ mod tests {
         let diags = [
             Diagnostic::UnusedLocal(None, Span::new(4, 10, id)),
             Diagnostic::MissingFunctionBody(Span::new(0, 3, id)),
+            Diagnostic::LoweringError(LowerError::DeprecatedNameOf(Span::new(11, 14, id))),
+            Diagnostic::LoweringError(LowerError::RedundantDynCast(Span::new(14, 15, id))),
         ];
         let symbols = Symbols::with_default_types();
         let (sender, receiver) = crossbeam_channel::unbounded();
@@ -3891,7 +3945,7 @@ mod tests {
         for supports_tags in [false, true] {
             if supports_tags {
                 let capabilities = serde_json::from_value(serde_json::json!({
-                    "textDocument": { "publishDiagnostics": { "tagSupport": { "valueSet": [1] } } }
+                    "textDocument": { "publishDiagnostics": { "tagSupport": { "valueSet": [1, 2] } } }
                 }))
                 .unwrap();
                 ctx.set_diagnostic_capabilities(&capabilities);
@@ -3921,6 +3975,14 @@ mod tests {
                 Some(lsp::DiagnosticSeverity::ERROR)
             );
             assert_eq!(params.diagnostics[0].tags, None);
+            assert_eq!(
+                params.diagnostics[2].tags,
+                supports_tags.then(|| vec![lsp::DiagnosticTag::DEPRECATED])
+            );
+            assert_eq!(
+                params.diagnostics[3].tags,
+                supports_tags.then(|| vec![lsp::DiagnosticTag::UNNECESSARY])
+            );
         }
     }
 
@@ -4650,5 +4712,51 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn redmod_capability_diagnostics_explain_analyzer_scope_and_link_docs() {
+        let (temp, mut server, ctx, receiver) = fixture();
+        let path = temp.path().join("capability.script");
+        let _buffers = open(
+            &mut server,
+            &ctx,
+            &path,
+            "class Example { var first, second: Int32 = 1; }",
+            1,
+        );
+        server.check(path.clone(), &ctx).unwrap();
+        let uri = ctx.uri(&dialect::identity(&path)).unwrap();
+        let published: Vec<lsp::PublishDiagnosticsParams> = receiver
+            .try_iter()
+            .filter_map(|msg| match msg {
+                lsp_server::Message::Notification(notif)
+                    if notif.method == "textDocument/publishDiagnostics" =>
+                {
+                    serde_json::from_value::<lsp::PublishDiagnosticsParams>(notif.params)
+                        .ok()
+                        .filter(|p| p.uri == uri)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(published.len(), 1);
+        let diag = &published[0].diagnostics[0];
+        assert_eq!(
+            diag.code,
+            Some(lsp::NumberOrString::String("REDMOD_CAPABILITY".into()))
+        );
+        assert!(
+            diag.message
+                .starts_with("unsupported by IDE REDmod analyzer:"),
+            "{}",
+            diag.message
+        );
+        assert_eq!(
+            diag.code_description
+                .as_ref()
+                .map(|desc| desc.href.as_str()),
+            Some(REDMOD_SUBSET_DOCS_URL)
+        );
     }
 }
