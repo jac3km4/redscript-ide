@@ -264,7 +264,9 @@ mod tests {
         // A non-directory ancestor is an error, not a temporarily absent root.
         let mut issues = Vec::new();
         assert!(
-            discover([temp.path().join("a.reds/child")], |issue| issues.push(issue)).is_empty()
+            discover([temp.path().join("a.reds/child")], |issue| issues
+                .push(issue))
+            .is_empty()
         );
         assert!(matches!(
             issues.as_slice(),

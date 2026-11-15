@@ -2051,8 +2051,11 @@ impl WorkspaceDir {
     fn load(dir: &Path, fallback: Option<&Self>) -> LoadedWorkspace {
         let raw_dotfile = dir.join(".redscript");
         let dotfile_path = dialect::identity(&raw_dotfile);
-        let fallback_workspace =
-            || fallback.cloned().unwrap_or_else(|| Self::from_dotfile(dir, &Dotfile::default()));
+        let fallback_workspace = || {
+            fallback
+                .cloned()
+                .unwrap_or_else(|| Self::from_dotfile(dir, &Dotfile::default()))
+        };
 
         match fs::read_to_string(&raw_dotfile) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => LoadedWorkspace {
@@ -2181,8 +2184,7 @@ fn record_source_read_error(
     let (code, message, warning) = if error.kind() == std::io::ErrorKind::InvalidData {
         (
             "INVALID_UTF8",
-            "file is not valid UTF-8; re-save it with UTF-8 encoding to enable analysis"
-                .to_owned(),
+            "file is not valid UTF-8; re-save it with UTF-8 encoding to enable analysis".to_owned(),
             format!(
                 "Skipping '{}': file is not valid UTF-8 ({error}). Re-save it with UTF-8 encoding to enable analysis.",
                 path.display()
@@ -2192,7 +2194,10 @@ fn record_source_read_error(
         (
             "IO_ERROR",
             format!("failed to read source file: {error}"),
-            format!("Skipping '{}': failed to read source file ({error}).", path.display()),
+            format!(
+                "Skipping '{}': failed to read source file ({error}).",
+                path.display()
+            ),
         )
     };
     io_warnings.insert(warning);
@@ -2317,7 +2322,10 @@ impl Fix {
         }
     }
 
-    fn matching_diagnostics(&self, context_diagnostics: &[lsp::Diagnostic]) -> Vec<lsp::Diagnostic> {
+    fn matching_diagnostics(
+        &self,
+        context_diagnostics: &[lsp::Diagnostic],
+    ) -> Vec<lsp::Diagnostic> {
         let Some(diag_range) = self.diagnostic_range else {
             return vec![];
         };
@@ -3523,8 +3531,10 @@ mod tests {
                 };
                 notification.method == "window/showMessage"
                     && serde_json::from_value::<lsp::ShowMessageParams>(notification.params.clone())
-                        .is_ok_and(|params| params.typ == lsp::MessageType::WARNING
-                            && params.message.contains("Source root"))
+                        .is_ok_and(|params| {
+                            params.typ == lsp::MessageType::WARNING
+                                && params.message.contains("Source root")
+                        })
             }),
             initially_missing
         );
@@ -4076,7 +4086,11 @@ mod tests {
         }));
         assert!(
             server
-                .format_document(Document::new(temp.path().join("unknown.txt"), &buffer), 4, &ctx)
+                .format_document(
+                    Document::new(temp.path().join("unknown.txt"), &buffer),
+                    4,
+                    &ctx
+                )
                 .unwrap()
                 .is_empty()
         );
@@ -4165,9 +4179,7 @@ mod tests {
             ..Default::default()
         };
         let resolved = server.code_action_resolve(action, &ctx).unwrap();
-        assert!(
-            matches!(resolved.edit.unwrap().changes, Some(changes) if changes.is_empty())
-        );
+        assert!(matches!(resolved.edit.unwrap().changes, Some(changes) if changes.is_empty()));
     }
 
     fn server() -> RedscriptLanguageServer {
@@ -4840,11 +4852,7 @@ mod tests {
             assert_eq!(messages.len(), 2, "{messages:?}");
             assert!(messages.iter().any(|msg| msg.contains("WrongCase.Reds")));
             assert!(messages.iter().any(|msg| msg.contains("UPPER.REDS")));
-            assert!(
-                messages
-                    .iter()
-                    .all(|msg| msg.contains("lowercase '.reds'"))
-            );
+            assert!(messages.iter().all(|msg| msg.contains("lowercase '.reds'")));
         }
     }
 
@@ -4949,7 +4957,10 @@ mod tests {
             temp.path().join(".redscript"),
             format!(
                 "source_roots = [\".\", {:?}]\n",
-                healthy.join("not-a-dir").to_string_lossy().replace('\\', "/"),
+                healthy
+                    .join("not-a-dir")
+                    .to_string_lossy()
+                    .replace('\\', "/"),
             ),
         )
         .unwrap();
@@ -5136,7 +5147,10 @@ mod tests {
             "Make field `second` public",
             "Make field public - fix all in the workspace",
         ] {
-            assert!(titles.contains(&expected), "missing {expected} in {titles:?}");
+            assert!(
+                titles.contains(&expected),
+                "missing {expected} in {titles:?}"
+            );
         }
         let first_action = actions
             .iter()
@@ -5196,7 +5210,10 @@ mod tests {
             "Replace with `NameOf<Child>()`",
             "Qualify static call as `Base.Create`",
         ] {
-            assert!(titles.contains(&expected), "missing {expected} in {titles:?}");
+            assert!(
+                titles.contains(&expected),
+                "missing {expected} in {titles:?}"
+            );
         }
 
         let owner_uri = ctx.uri(&dialect::identity(&owner)).unwrap();
@@ -5223,7 +5240,12 @@ mod tests {
                 }
             }
         }
-        assert!(owner_buf.contents().to_string().contains("public class Hidden {}"));
+        assert!(
+            owner_buf
+                .contents()
+                .to_string()
+                .contains("public class Hidden {}")
+        );
         let fixed_caller = caller_buf.contents().to_string();
         assert!(fixed_caller.contains("NameOf<Child>()"), "{fixed_caller}");
         assert!(fixed_caller.contains("Base.Create()"), "{fixed_caller}");

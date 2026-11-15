@@ -158,8 +158,11 @@ fn fallback_to_embedded(
     original_error: anyhow::Error,
 ) -> anyhow::Result<RedscriptLanguageServer> {
     let embedded = RedscriptLanguageServer::embedded(dirs).map_err(|_| original_error)?;
-    ctx.logger().warn(&warning);
-    ctx.show_message(lsp::MessageType::WARNING, &warning);
+    let message = format!(
+        "{warning} The bundled cache may be out of date; set a valid 'game_dir' or 'cache_file' in initializationOptions to load your game cache."
+    );
+    ctx.logger().warn(&message);
+    ctx.show_message(lsp::MessageType::WARNING, &message);
     Ok(embedded)
 }
 
@@ -170,11 +173,18 @@ fn main() -> anyhow::Result<()> {
             Ok((opts.workspace_dirs, source, warnings))
         },
         |(dirs, source, warnings), ctx| {
+            let has_warnings = !warnings.is_empty();
             for warning in warnings {
                 ctx.logger().warn(warning);
                 ctx.show_message(lsp::MessageType::WARNING, warning);
             }
             let ls = load_language_server(dirs, source, ctx)?;
+            if matches!(source, CacheSource::Embedded) && !has_warnings {
+                ctx.show_message(
+                    lsp::MessageType::INFO,
+                    "No 'game_dir' or 'cache_file' configured; using bundled base-game API cache (may be out of date). Set 'game_dir' or 'cache_file' in initializationOptions to load your game cache.",
+                );
+            }
             ls.log_missing_roots(ctx);
             ls.publish_all_diagnostics(ctx)?;
             ctx.logger().info("Language server ready for requests");
@@ -307,7 +317,9 @@ mod tests {
                     if notif.method == "window/showMessage"
                         && serde_json::from_value::<lsp::ShowMessageParams>(notif.params.clone())
                             .is_ok_and(|p| p.typ == lsp::MessageType::WARNING
-                                && p.message.contains("Falling back to bundled base-game API cache")))
+                                && p.message.contains("Falling back to bundled base-game API cache")
+                                && p.message.contains("out of date")
+                                && p.message.contains("initializationOptions")))
             }));
         }
     }

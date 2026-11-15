@@ -540,7 +540,10 @@ impl LspServer<'_> {
             return Ok(None);
         }
         let current_version = self.buffers.get(&doc.uri).and_then(Buffer::version);
-        match self.buffers.try_change(&doc.uri, doc.version, content_changes) {
+        match self
+            .buffers
+            .try_change(&doc.uri, doc.version, content_changes)
+        {
             Ok(()) => {
                 self.context.logger().info(format!(
                     "Document change uri={} version={}",
@@ -1092,7 +1095,10 @@ pub(crate) fn path_from_uri(uri: &lsp::Uri) -> anyhow::Result<PathBuf> {
     #[cfg(not(windows))]
     let path = {
         let bytes = stripped.as_bytes();
-        if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':'
+        if bytes.len() >= 3
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
         {
             PathBuf::from(&stripped[1..])
         } else {
@@ -2255,10 +2261,16 @@ mod tests {
             )))
             .unwrap();
         let log = receive_log(&client, lsp::MessageType::ERROR);
-        assert!(log.contains("Document change rejected (invalid range"), "{log}");
+        assert!(
+            log.contains("Document change rejected (invalid range"),
+            "{log}"
+        );
         assert!(log.contains("reopen or save"), "{log}");
         let popup = receive_show_message(&client, lsp::MessageType::ERROR);
-        assert!(popup.contains("Document change rejected (invalid range"), "{popup}");
+        assert!(
+            popup.contains("Document change rejected (invalid range"),
+            "{popup}"
+        );
         assert!(popup.contains("reopen or save"), "{popup}");
         assert!(events.borrow().is_empty());
         let buffer = server.buffers.get(&uri.parse().unwrap()).unwrap();
