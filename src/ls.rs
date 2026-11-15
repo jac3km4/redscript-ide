@@ -1699,10 +1699,12 @@ impl LanguageServer for RedscriptLanguageServer {
                 && ext.eq_ignore_ascii_case("reds")
                 && self.warned_extensions.insert(path.clone())
             {
-                ctx.logger().warn(format!(
+                let message = format!(
                     "File '{}' uses uppercase extension '.{ext}'; community REDscript requires lowercase '.reds', so this file will not be analyzed.",
                     path.display(),
-                ));
+                );
+                ctx.logger().warn(&message);
+                ctx.show_message(lsp::MessageType::WARNING, message);
             }
             return Ok(());
         }
@@ -4810,28 +4812,40 @@ mod tests {
                 lsp::GotoDefinitionResponse::Array(locations) if locations.is_empty()
             ));
         }
-        let warnings: Vec<_> = receiver
-            .try_iter()
-            .filter_map(|message| {
-                let lsp_server::Message::Notification(notification) = message else {
-                    return None;
-                };
-                if notification.method != "window/logMessage" {
-                    return None;
+        let mut warnings = Vec::new();
+        let mut popups = Vec::new();
+        for message in receiver.try_iter() {
+            let lsp_server::Message::Notification(notification) = message else {
+                continue;
+            };
+            match notification.method.as_str() {
+                "window/logMessage" => {
+                    let params: lsp::LogMessageParams =
+                        serde_json::from_value(notification.params).unwrap();
+                    if params.typ == lsp::MessageType::WARNING {
+                        warnings.push(params.message);
+                    }
                 }
-                let params: lsp::LogMessageParams =
-                    serde_json::from_value(notification.params).unwrap();
-                (params.typ == lsp::MessageType::WARNING).then_some(params.message)
-            })
-            .collect();
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings.iter().any(|msg| msg.contains("WrongCase.Reds")));
-        assert!(warnings.iter().any(|msg| msg.contains("UPPER.REDS")));
-        assert!(
-            warnings
-                .iter()
-                .all(|msg| msg.contains("lowercase '.reds'"))
-        );
+                "window/showMessage" => {
+                    let params: lsp::ShowMessageParams =
+                        serde_json::from_value(notification.params).unwrap();
+                    if params.typ == lsp::MessageType::WARNING {
+                        popups.push(params.message);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for messages in [&warnings, &popups] {
+            assert_eq!(messages.len(), 2, "{messages:?}");
+            assert!(messages.iter().any(|msg| msg.contains("WrongCase.Reds")));
+            assert!(messages.iter().any(|msg| msg.contains("UPPER.REDS")));
+            assert!(
+                messages
+                    .iter()
+                    .all(|msg| msg.contains("lowercase '.reds'"))
+            );
+        }
     }
 
     #[test]
