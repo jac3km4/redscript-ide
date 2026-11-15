@@ -58,6 +58,10 @@ type FixMap = HashMap<PathBuf, BTreeMap<(u32, u32), Fix>>;
 
 pub struct RedscriptLanguageServer {
     workspaces: HashMap<PathBuf, WorkspaceDir>,
+    config_diagnostics: BTreeMap<PathBuf, lsp::Diagnostic>,
+    config_warnings: BTreeSet<String>,
+    reported_config_warnings: RefCell<BTreeSet<String>>,
+    last_published_configs: RefCell<HashSet<PathBuf>>,
     compilation_cache: CompilationCache,
     cached_fixes: RefCell<FixMap>,
     last_published_files: RefCell<HashSet<PathBuf>>,
@@ -99,14 +103,18 @@ impl RedscriptLanguageServer {
         cache_bytes: CacheBytes,
         workspace_folders: impl IntoIterator<Item = impl Into<PathBuf>>,
     ) -> anyhow::Result<Self> {
-        let workspaces = workspace_folders
-            .into_iter()
-            .map(|dir| {
-                let dir = dir.into();
-                let workspace = WorkspaceDir::load(&dir)?;
-                Ok((dir, workspace))
-            })
-            .collect::<anyhow::Result<HashMap<_, _>>>()?;
+        let mut workspaces = HashMap::new();
+        let mut config_diagnostics = BTreeMap::new();
+        let mut config_warnings = BTreeSet::new();
+        for dir in workspace_folders {
+            let dir = dir.into();
+            let loaded = WorkspaceDir::load(&dir, None);
+            if let Some(diagnostic) = loaded.diagnostic {
+                config_diagnostics.insert(loaded.dotfile_path, diagnostic);
+            }
+            config_warnings.extend(loaded.warnings);
+            workspaces.insert(dir, loaded.workspace);
+        }
         let workspace_dirs = workspaces.iter().flat_map(|(_, w)| &w.roots);
         let mut missing_roots = BTreeSet::new();
         Ok(Self {
@@ -119,6 +127,10 @@ impl RedscriptLanguageServer {
                 },
             )?,
             workspaces,
+            config_diagnostics,
+            config_warnings,
+            reported_config_warnings: RefCell::new(BTreeSet::new()),
+            last_published_configs: RefCell::new(HashSet::new()),
             cached_fixes: RefCell::new(HashMap::new()),
             last_published_files: RefCell::new(HashSet::new()),
             overlays: HashMap::new(),
@@ -327,6 +339,34 @@ impl RedscriptLanguageServer {
                 version: None,
             });
             self.last_published_files.borrow_mut().remove(&path);
+        }
+        self.publish_config_diagnostics(ctx)?;
+        Ok(())
+    }
+
+    fn publish_config_diagnostics(&self, ctx: &LspContext) -> anyhow::Result<()> {
+        let mut last_published = self.last_published_configs.borrow_mut();
+        for (path, diagnostic) in &self.config_diagnostics {
+            ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
+                uri: ctx.uri(path)?,
+                diagnostics: vec![diagnostic.clone()],
+                version: None,
+            });
+            last_published.insert(path.clone());
+        }
+        let mut stale: Vec<_> = last_published
+            .iter()
+            .filter(|path| !self.config_diagnostics.contains_key(*path))
+            .cloned()
+            .collect();
+        stale.sort();
+        for path in stale {
+            ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
+                uri: ctx.uri(&path)?,
+                diagnostics: vec![],
+                version: None,
+            });
+            last_published.remove(&path);
         }
         Ok(())
     }
@@ -780,6 +820,33 @@ impl RedscriptLanguageServer {
             ));
         }
         *reported = current.clone();
+        drop(reported);
+        self.log_config_warnings(ctx);
+    }
+
+    fn log_config_warnings(&self, ctx: &LspContext) {
+        let mut reported = self.reported_config_warnings.borrow_mut();
+        for warning in self.config_warnings.difference(&reported) {
+            ctx.logger().warn(warning);
+        }
+        *reported = self.config_warnings.clone();
+    }
+
+    fn reload_workspaces(&mut self) {
+        let mut workspaces = HashMap::with_capacity(self.workspaces.len());
+        let mut config_diagnostics = BTreeMap::new();
+        let mut config_warnings = BTreeSet::new();
+        for (dir, previous) in &self.workspaces {
+            let loaded = WorkspaceDir::load(dir, Some(previous));
+            if let Some(diagnostic) = loaded.diagnostic {
+                config_diagnostics.insert(loaded.dotfile_path, diagnostic);
+            }
+            config_warnings.extend(loaded.warnings);
+            workspaces.insert(dir.clone(), loaded.workspace);
+        }
+        self.workspaces = workspaces;
+        self.config_diagnostics = config_diagnostics;
+        self.config_warnings = config_warnings;
     }
 
     fn check_workspace_and_publish(&self, ctx: &LspContext) -> anyhow::Result<()> {
@@ -1336,12 +1403,7 @@ impl LanguageServer for RedscriptLanguageServer {
     }
 
     fn files_changed(&mut self, _paths: Vec<PathBuf>, ctx: &LspContext) -> anyhow::Result<()> {
-        let workspaces = self
-            .workspaces
-            .keys()
-            .map(|path| Ok((path.clone(), WorkspaceDir::load(path)?)))
-            .collect::<anyhow::Result<HashMap<_, _>>>()?;
-        self.workspaces = workspaces;
+        self.reload_workspaces();
         self.rebuild(ctx)
     }
 
@@ -1382,13 +1444,15 @@ impl LanguageServer for RedscriptLanguageServer {
         removed: Vec<PathBuf>,
         ctx: &LspContext,
     ) -> anyhow::Result<()> {
-        for dir in added {
-            let value = WorkspaceDir::load(&dir)?;
-            self.workspaces.insert(dir, value);
-        }
         for folder in removed {
             self.workspaces.remove(&folder);
         }
+        for dir in added {
+            let previous = self.workspaces.get(&dir);
+            let loaded = WorkspaceDir::load(&dir, previous);
+            self.workspaces.insert(dir, loaded.workspace);
+        }
+        self.reload_workspaces();
         self.rebuild(ctx)
     }
 
@@ -1621,15 +1685,21 @@ struct Overlay {
     version: i32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct WorkspaceDir {
     roots: Vec<PathBuf>,
     format_settings: FormatSettings,
 }
 
+struct LoadedWorkspace {
+    workspace: WorkspaceDir,
+    dotfile_path: PathBuf,
+    diagnostic: Option<lsp::Diagnostic>,
+    warnings: Vec<String>,
+}
+
 impl WorkspaceDir {
-    fn load(dir: &Path) -> anyhow::Result<Self> {
-        let dotfile = Dotfile::load_or_default(dir)?;
+    fn from_dotfile(dir: &Path, dotfile: &Dotfile) -> Self {
         let roots = dotfile
             .expanded_source_roots()
             .into_iter()
@@ -1656,11 +1726,134 @@ impl WorkspaceDir {
             settings.max_chain_total = max_chain_total;
         }
 
-        Ok(Self {
+        Self {
             roots,
             format_settings: settings,
-        })
+        }
     }
+
+    fn load(dir: &Path, fallback: Option<&Self>) -> LoadedWorkspace {
+        let raw_dotfile = dir.join(".redscript");
+        let dotfile_path = dialect::identity(&raw_dotfile);
+        let fallback_workspace =
+            || fallback.cloned().unwrap_or_else(|| Self::from_dotfile(dir, &Dotfile::default()));
+
+        match fs::read_to_string(&raw_dotfile) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => LoadedWorkspace {
+                workspace: Self::from_dotfile(dir, &Dotfile::default()),
+                dotfile_path,
+                diagnostic: None,
+                warnings: vec![],
+            },
+            Err(err) => {
+                let message = format!("failed to read .redscript: {err}");
+                let warning = format!(
+                    "Failed to read '{}': {err}; keeping previous or default workspace configuration.",
+                    dotfile_path.display()
+                );
+                LoadedWorkspace {
+                    workspace: fallback_workspace(),
+                    dotfile_path,
+                    diagnostic: Some(config_diagnostic(lsp::Range::default(), message)),
+                    warnings: vec![warning],
+                }
+            }
+            Ok(content) => match toml::from_str::<Dotfile>(&content) {
+                Ok(dotfile) => {
+                    let warnings =
+                        inspect_source_root_templates(&dotfile.source_roots, &dotfile_path);
+                    LoadedWorkspace {
+                        workspace: Self::from_dotfile(dir, &dotfile),
+                        dotfile_path,
+                        diagnostic: None,
+                        warnings,
+                    }
+                }
+                Err(err) => {
+                    let range = err
+                        .span()
+                        .and_then(|span| {
+                            let start = crate::positions::position(
+                                &content,
+                                u32::try_from(span.start).ok()?,
+                            )?;
+                            let end = crate::positions::position(
+                                &content,
+                                u32::try_from(span.end).ok()?,
+                            )?;
+                            Some(lsp::Range::new(start, end))
+                        })
+                        .unwrap_or_default();
+                    let warning = format!(
+                        "Invalid configuration in '{}': {}; keeping previous or default workspace configuration.",
+                        dotfile_path.display(),
+                        err.message()
+                    );
+                    LoadedWorkspace {
+                        workspace: fallback_workspace(),
+                        dotfile_path,
+                        diagnostic: Some(config_diagnostic(range, err.message().to_owned())),
+                        warnings: vec![warning],
+                    }
+                }
+            },
+        }
+    }
+}
+
+fn config_diagnostic(range: lsp::Range, message: String) -> lsp::Diagnostic {
+    lsp::Diagnostic {
+        range,
+        severity: Some(lsp::DiagnosticSeverity::ERROR),
+        code: Some(lsp::NumberOrString::String("INVALID_CONFIG".into())),
+        source: Some("redscript".into()),
+        message,
+        ..Default::default()
+    }
+}
+
+fn inspect_source_root_templates(roots: &[String], dotfile_path: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for template in roots {
+        let mut chars = template.char_indices().peekable();
+        while let Some((_, ch)) = chars.next() {
+            if ch == '\\' {
+                chars.next();
+                continue;
+            }
+            if ch == '{' {
+                let mut key = String::new();
+                let mut closed = false;
+                while let Some((_, inner)) = chars.next() {
+                    if inner == '\\' {
+                        if let Some((_, escaped)) = chars.next() {
+                            key.push(escaped);
+                        }
+                        continue;
+                    }
+                    if inner == '}' {
+                        closed = true;
+                        break;
+                    }
+                    key.push(inner);
+                }
+                let trimmed = key.trim();
+                if !closed || trimmed.is_empty() {
+                    warnings.push(format!(
+                        "Malformed template '{template}' in '{}' source_roots; treating it literally.",
+                        dotfile_path.display()
+                    ));
+                    break;
+                } else if std::env::var_os(trimmed).is_none() {
+                    warnings.push(format!(
+                        "Environment variable '{trimmed}' referenced in '{}' source_roots is not set; expanding it to an empty string.",
+                        dotfile_path.display()
+                    ));
+                }
+            }
+        }
+    }
+    warnings
 }
 
 #[derive(Debug)]
@@ -3496,6 +3689,10 @@ mod tests {
     fn server() -> RedscriptLanguageServer {
         RedscriptLanguageServer {
             workspaces: HashMap::new(),
+            config_diagnostics: BTreeMap::new(),
+            config_warnings: BTreeSet::new(),
+            reported_config_warnings: RefCell::new(BTreeSet::new()),
+            last_published_configs: RefCell::new(HashSet::new()),
             compilation_cache: CompilationCache::default(),
             cached_fixes: RefCell::new(HashMap::new()),
             last_published_files: RefCell::new(HashSet::new()),
@@ -4115,5 +4312,88 @@ mod tests {
                 .iter()
                 .all(|msg| msg.contains("lowercase '.reds'"))
         );
+    }
+
+    #[test]
+    fn invalid_dotfile_publishes_config_diagnostic_and_preserves_workspace_analysis() {
+        let (temp, _server, ctx, receiver) = fixture();
+        let external = tempdir();
+        let external_file = external.path().join("ext.reds");
+        fs::write(&external_file, "public class ExternalType {}").unwrap();
+        let local_file = temp.path().join("local.reds");
+        fs::write(&local_file, "public class LocalType {}").unwrap();
+        let dotfile = temp.path().join(".redscript");
+        fs::write(&dotfile, "unknown_key = true\n").unwrap();
+
+        // Startup with broken .redscript still succeeds using default roots.
+        let mut server =
+            RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
+        server.log_missing_roots(&ctx);
+        server.publish_all_diagnostics(&ctx).unwrap();
+        server
+            .check_workspace(|_, symbols, _, _| {
+                assert!(symbols.types().any(|(id, _)| id.as_str() == "LocalType"));
+                Ok(())
+            })
+            .unwrap();
+        let dotfile_uri = ctx.uri(&dialect::identity(&dotfile)).unwrap();
+        let startup_messages: Vec<_> = receiver.try_iter().collect();
+        assert!(startup_messages.iter().any(|msg| {
+            matches!(msg, lsp_server::Message::Notification(notif)
+                if notif.method == "textDocument/publishDiagnostics"
+                    && serde_json::from_value::<lsp::PublishDiagnosticsParams>(notif.params.clone())
+                        .is_ok_and(|p| p.uri == dotfile_uri
+                            && p.diagnostics.len() == 1
+                            && p.diagnostics[0].code == Some(lsp::NumberOrString::String("INVALID_CONFIG".into()))
+                            && p.diagnostics[0].range.end.character > 0))
+        }));
+
+        // Fixing .redscript clears INVALID_CONFIG and activates external roots + template warnings.
+        fs::write(
+            &dotfile,
+            format!(
+                "source_roots = [{:?}, \"{{REDSCRIPT_IDE_UNSET_TEST_VAR}}/missing\"]\n",
+                external.path().to_string_lossy().replace('\\', "/"),
+            ),
+        )
+        .unwrap();
+        server.check(dotfile.clone(), &ctx).unwrap();
+        let fixed_messages: Vec<_> = receiver.try_iter().collect();
+        assert!(fixed_messages.iter().any(|msg| {
+            matches!(msg, lsp_server::Message::Notification(notif)
+                if notif.method == "textDocument/publishDiagnostics"
+                    && serde_json::from_value::<lsp::PublishDiagnosticsParams>(notif.params.clone())
+                        .is_ok_and(|p| p.uri == dotfile_uri && p.diagnostics.is_empty()))
+        }));
+        assert!(fixed_messages.iter().any(|msg| {
+            matches!(msg, lsp_server::Message::Notification(notif)
+                if notif.method == "window/logMessage"
+                    && serde_json::from_value::<lsp::LogMessageParams>(notif.params.clone())
+                        .is_ok_and(|p| p.typ == lsp::MessageType::WARNING
+                            && p.message.contains("REDSCRIPT_IDE_UNSET_TEST_VAR")))
+        }));
+        server
+            .check_workspace(|_, symbols, _, _| {
+                assert!(symbols.types().any(|(id, _)| id.as_str() == "ExternalType"));
+                Ok(())
+            })
+            .unwrap();
+
+        // Breaking .redscript mid-session preserves the previous valid roots while reporting the error.
+        fs::write(&dotfile, "source_roots = 123\n").unwrap();
+        server.check(dotfile, &ctx).unwrap();
+        server
+            .check_workspace(|_, symbols, _, _| {
+                assert!(symbols.types().any(|(id, _)| id.as_str() == "ExternalType"));
+                Ok(())
+            })
+            .unwrap();
+        let broken_again: Vec<_> = receiver.try_iter().collect();
+        assert!(broken_again.iter().any(|msg| {
+            matches!(msg, lsp_server::Message::Notification(notif)
+                if notif.method == "textDocument/publishDiagnostics"
+                    && serde_json::from_value::<lsp::PublishDiagnosticsParams>(notif.params.clone())
+                        .is_ok_and(|p| p.uri == dotfile_uri && !p.diagnostics.is_empty()))
+        }));
     }
 }
