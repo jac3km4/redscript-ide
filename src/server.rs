@@ -391,6 +391,13 @@ impl LspServer<'_> {
                     let lsp::DidSaveTextDocumentParams {
                         text_document: doc, ..
                     } = serde_json::from_value(notif.params)?;
+                    if !is_file_uri(&doc.uri) {
+                        self.context.logger().info(format!(
+                            "Document save ignored (non-file URI) uri={}",
+                            doc.uri.as_str(),
+                        ));
+                        return Ok(());
+                    }
                     self.context.logger().info(format!(
                         "Document save uri={} version={:?}",
                         doc.uri.as_str(),
@@ -402,29 +409,42 @@ impl LspServer<'_> {
                     let lsp::DidOpenTextDocumentParams { text_document: doc } =
                         serde_json::from_value(notif.params)?;
                     let uri = doc.uri;
+                    if !is_file_uri(&uri) {
+                        self.context.logger().info(format!(
+                            "Document open ignored (non-file URI) uri={} version={}",
+                            uri.as_str(),
+                            doc.version,
+                        ));
+                        return Ok(());
+                    }
+                    let path = path_from_uri(&uri)?;
                     self.context.logger().info(format!(
                         "Document open uri={} version={}",
                         uri.as_str(),
                         doc.version,
                     ));
                     self.buffers.open(uri.clone(), doc.text, doc.version);
-                    self.server.document_changed(
-                        path_from_uri(&uri)?,
-                        self.buffers.get(&uri),
-                        &self.context,
-                    )?;
+                    self.server
+                        .document_changed(path, self.buffers.get(&uri), &self.context)?;
                 }
                 lsp::notification::DidCloseTextDocument::METHOD => {
                     let lsp::DidCloseTextDocumentParams { text_document: doc } =
                         serde_json::from_value(notif.params)?;
+                    if !is_file_uri(&doc.uri) {
+                        self.context.logger().info(format!(
+                            "Document close ignored (non-file URI) uri={}",
+                            doc.uri.as_str(),
+                        ));
+                        return Ok(());
+                    }
+                    let path = path_from_uri(&doc.uri)?;
                     self.context.logger().info(format!(
                         "Document close uri={} version={:?}",
                         doc.uri.as_str(),
                         self.buffers.get(&doc.uri).and_then(Buffer::version),
                     ));
                     self.buffers.remove(&doc.uri);
-                    self.server
-                        .document_changed(path_from_uri(&doc.uri)?, None, &self.context)?;
+                    self.server.document_changed(path, None, &self.context)?;
                 }
                 lsp::notification::DidChangeTextDocument::METHOD => {
                     if let Some(uri) = self.apply_document_change(notif.params)? {
@@ -441,9 +461,12 @@ impl LspServer<'_> {
                     let paths = params
                         .changes
                         .into_iter()
+                        .filter(|event| is_file_uri(&event.uri))
                         .map(|event| path_from_uri(&event.uri))
                         .collect::<anyhow::Result<Vec<_>>>()?;
-                    self.server.files_changed(paths, &self.context)?;
+                    if !paths.is_empty() {
+                        self.server.files_changed(paths, &self.context)?;
+                    }
                 }
                 lsp::notification::DidChangeConfiguration::METHOD => {
                     self.server.files_changed(vec![], &self.context)?;
@@ -454,15 +477,19 @@ impl LspServer<'_> {
                     let added = event
                         .added
                         .into_iter()
+                        .filter(|folder| is_file_uri(&folder.uri))
                         .map(|folder| path_from_uri(&folder.uri))
                         .collect::<Result<Vec<_>, _>>()?;
                     let removed = event
                         .removed
                         .into_iter()
+                        .filter(|folder| is_file_uri(&folder.uri))
                         .map(|uri| path_from_uri(&uri.uri))
                         .collect::<Result<Vec<_>, _>>()?;
-                    self.server
-                        .change_workspace_folders(added, removed, &self.context)?;
+                    if !added.is_empty() || !removed.is_empty() {
+                        self.server
+                            .change_workspace_folders(added, removed, &self.context)?;
+                    }
                 }
 
                 _ => {
@@ -500,6 +527,14 @@ impl LspServer<'_> {
             text_document: doc,
             content_changes,
         } = serde_json::from_value(params)?;
+        if !is_file_uri(&doc.uri) {
+            self.context.logger().info(format!(
+                "Document change ignored (non-file URI) uri={} version={}",
+                doc.uri.as_str(),
+                doc.version,
+            ));
+            return Ok(None);
+        }
         let current_version = self.buffers.get(&doc.uri).and_then(Buffer::version);
         if self.buffers.change(&doc.uri, doc.version, content_changes) {
             self.context.logger().info(format!(
@@ -919,6 +954,14 @@ impl<'a> LspLog<'a> {
             });
     }
 
+    pub fn warn(&self, message: impl Display) {
+        self.context
+            .notify::<lsp::notification::LogMessage>(lsp::LogMessageParams {
+                typ: lsp::MessageType::WARNING,
+                message: message.to_string(),
+            });
+    }
+
     pub fn error(&self, message: impl Display) {
         self.context
             .notify::<lsp::notification::LogMessage>(lsp::LogMessageParams {
@@ -990,11 +1033,13 @@ impl Options {
     }
 }
 
-pub(crate) fn path_from_uri(uri: &lsp::Uri) -> anyhow::Result<PathBuf> {
-    if !uri
-        .scheme()
+fn is_file_uri(uri: &lsp::Uri) -> bool {
+    uri.scheme()
         .is_some_and(|scheme| scheme.eq_lowercase("file"))
-    {
+}
+
+pub(crate) fn path_from_uri(uri: &lsp::Uri) -> anyhow::Result<PathBuf> {
+    if !is_file_uri(uri) {
         bail!("Unsupported URI scheme");
     }
 
@@ -1115,8 +1160,12 @@ mod tests {
             Ok(())
         }
 
-        fn files_changed(&mut self, _paths: Vec<PathBuf>, _ctx: &LspContext) -> anyhow::Result<()> {
-            panic!("unexpected file change");
+        fn files_changed(&mut self, paths: Vec<PathBuf>, _ctx: &LspContext) -> anyhow::Result<()> {
+            assert!(self.allow_document_changes, "unexpected file change");
+            if let Some(events) = &self.events {
+                events.borrow_mut().push(format!("files:{}", paths.len()));
+            }
+            Ok(())
         }
 
         fn check(&mut self, _path: PathBuf, _ctx: &LspContext) -> anyhow::Result<()> {
@@ -2076,6 +2125,58 @@ mod tests {
             }
             assert!(!log.contains("PRIVATE"));
         }
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn non_file_notifications_are_ignored_without_errors_or_buffer_leaks() {
+        let (mut server, client) = memory_server();
+        let events = record_changes(&mut server);
+        let uri = "untitled:Untitled-1";
+        for (method, params, expected) in [
+            (
+                lsp::notification::DidOpenTextDocument::METHOD,
+                json!({ "textDocument": { "uri": uri, "languageId": "redscript", "version": 1, "text": "func Test() {}" } }),
+                "Document open ignored (non-file URI)",
+            ),
+            (
+                lsp::notification::DidChangeTextDocument::METHOD,
+                json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": "changed" }] }),
+                "Document change ignored (non-file URI)",
+            ),
+            (
+                lsp::notification::DidSaveTextDocument::METHOD,
+                json!({ "textDocument": { "uri": uri } }),
+                "Document save ignored (non-file URI)",
+            ),
+            (
+                lsp::notification::DidCloseTextDocument::METHOD,
+                json!({ "textDocument": { "uri": uri } }),
+                "Document close ignored (non-file URI)",
+            ),
+        ] {
+            server
+                .handle(Message::Notification(lsp_server::Notification::new(
+                    method.into(),
+                    params,
+                )))
+                .unwrap();
+            let log = receive_log(&client, lsp::MessageType::INFO);
+            assert!(log.starts_with(expected), "{log}");
+            assert!(server.buffers.get(&uri.parse().unwrap()).is_none());
+        }
+        server
+            .handle(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidChangeWatchedFiles::METHOD.into(),
+                json!({
+                    "changes": [
+                        { "uri": "git:/repo/test.reds", "type": 2 },
+                        { "uri": "file:///C:/test.reds", "type": 2 }
+                    ]
+                }),
+            )))
+            .unwrap();
+        assert_eq!(*events.borrow(), ["files:1"]);
         assert!(client.receiver.try_recv().is_err());
     }
 

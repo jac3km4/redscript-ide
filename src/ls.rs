@@ -65,6 +65,7 @@ pub struct RedscriptLanguageServer {
     standalone: HashMap<PathBuf, CompilationCache>,
     generation: u64,
     missing_roots: RefCell<BTreeSet<PathBuf>>,
+    warned_extensions: HashSet<PathBuf>,
     completion_cache: RefCell<Option<CachedCompletion>>,
 }
 
@@ -123,6 +124,7 @@ impl RedscriptLanguageServer {
             standalone: HashMap::new(),
             generation: 0,
             missing_roots: RefCell::new(missing_roots),
+            warned_extensions: HashSet::new(),
             completion_cache: RefCell::new(None),
         })
     }
@@ -353,6 +355,9 @@ impl RedscriptLanguageServer {
         loc: CodeLocation<'_>,
         ctx: &LspContext,
     ) -> anyhow::Result<Option<lsp::Hover>> {
+        if Dialect::of(loc.doc().path()).is_none() {
+            return Ok(None);
+        }
         let requested_pos = loc.pos();
         self.expr_at(
             loc,
@@ -388,6 +393,9 @@ impl RedscriptLanguageServer {
         loc: CodeLocation<'_>,
         ctx: &LspContext,
     ) -> anyhow::Result<Rc<lsp::CompletionResponse>> {
+        if Dialect::of(loc.doc().path()).is_none() {
+            return Ok(Rc::new(lsp::CompletionResponse::Array(vec![])));
+        }
         let contents = loc.doc().buffer().contents().to_string();
         let Some(member) = member_completion_range(&contents, loc.pos()) else {
             ctx.logger().info(format!(
@@ -445,6 +453,9 @@ impl RedscriptLanguageServer {
         loc: CodeLocation<'_>,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp::GotoDefinitionResponse> {
+        if Dialect::of(loc.doc().path()).is_none() {
+            return Ok(lsp::GotoDefinitionResponse::Array(vec![]));
+        }
         self.expr_at(
             loc,
             |at| {
@@ -1276,6 +1287,16 @@ impl LanguageServer for RedscriptLanguageServer {
     ) -> anyhow::Result<()> {
         let path = dialect::identity(&path);
         if Dialect::of(&path).is_none() {
+            if buffer.is_some()
+                && let Some(ext) = path.extension().and_then(|ext| ext.to_str())
+                && ext.eq_ignore_ascii_case("reds")
+                && self.warned_extensions.insert(path.clone())
+            {
+                ctx.logger().warn(format!(
+                    "File '{}' uses uppercase extension '.{ext}'; community REDscript requires lowercase '.reds', so this file will not be analyzed.",
+                    path.display(),
+                ));
+            }
             return Ok(());
         }
         if let Some(buffer) = buffer {
@@ -3417,6 +3438,7 @@ mod tests {
             standalone: HashMap::new(),
             generation: 0,
             missing_roots: RefCell::new(BTreeSet::new()),
+            warned_extensions: HashSet::new(),
             completion_cache: RefCell::new(None),
         }
     }
@@ -3980,5 +4002,52 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn unsupported_extensions_return_empty_queries_and_warn_once_for_uppercase_reds() {
+        let (temp, mut server, ctx, receiver) = fixture();
+        for name in ["notes.txt", "WrongCase.Reds", "UPPER.REDS"] {
+            let path = temp.path().join(name);
+            let text = "public class Test { public func Act() { this.Act(); } }";
+            let buffers = open(&mut server, &ctx, &path, text, 1);
+            let _buffers = open(&mut server, &ctx, &path, text, 2);
+            let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+            let loc = CodeLocation::new(
+                Document::new(path.clone(), buffer),
+                text.find("Act();").unwrap() as u32,
+            );
+            assert!(server.hover_at(loc.clone(), &ctx).unwrap().is_none());
+            assert!(matches!(
+                &*server.completion_at(loc.clone(), &ctx).unwrap(),
+                lsp::CompletionResponse::Array(items) if items.is_empty()
+            ));
+            assert!(matches!(
+                server.definition_at(loc, &ctx).unwrap(),
+                lsp::GotoDefinitionResponse::Array(locations) if locations.is_empty()
+            ));
+        }
+        let warnings: Vec<_> = receiver
+            .try_iter()
+            .filter_map(|message| {
+                let lsp_server::Message::Notification(notification) = message else {
+                    return None;
+                };
+                if notification.method != "window/logMessage" {
+                    return None;
+                }
+                let params: lsp::LogMessageParams =
+                    serde_json::from_value(notification.params).unwrap();
+                (params.typ == lsp::MessageType::WARNING).then_some(params.message)
+            })
+            .collect();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|msg| msg.contains("WrongCase.Reds")));
+        assert!(warnings.iter().any(|msg| msg.contains("UPPER.REDS")));
+        assert!(
+            warnings
+                .iter()
+                .all(|msg| msg.contains("lowercase '.reds'"))
+        );
     }
 }
