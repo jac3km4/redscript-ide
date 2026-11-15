@@ -1,6 +1,6 @@
 use std::cell::{LazyCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::{fmt, fs};
@@ -29,6 +29,30 @@ use crate::server::{CodeLocation, Document, LanguageServer, LspContext};
 mod document_symbols;
 
 const DIAGNOSTIC_PASSES: &[&'static (dyn DiagnosticPass + 'static)] = &[&UnusedLocals];
+const EMBEDDED_CACHE: &[u8] = include_bytes!("../assets/api.redscripts.zlib");
+
+#[derive(Clone)]
+enum CacheBytes {
+    Embedded(&'static [u8]),
+    Owned(Rc<[u8]>),
+}
+
+impl Deref for CacheBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Embedded(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+impl From<Vec<u8>> for CacheBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Owned(Rc::from(bytes))
+    }
+}
 
 type FixMap = HashMap<PathBuf, BTreeMap<(u32, u32), Fix>>;
 
@@ -58,6 +82,21 @@ impl RedscriptLanguageServer {
         workspace_folders: impl IntoIterator<Item = impl Into<PathBuf>>,
     ) -> anyhow::Result<Self> {
         let cache_bytes = fs::read(cache_path)?;
+        Self::from_bytes(cache_bytes.into(), workspace_folders)
+    }
+
+    pub fn embedded(
+        workspace_folders: impl IntoIterator<Item = impl Into<PathBuf>>,
+    ) -> anyhow::Result<Self> {
+        let cache_bytes = miniz_oxide::inflate::decompress_to_vec_zlib(EMBEDDED_CACHE)
+            .map_err(|err| anyhow::anyhow!("failed to decompress embedded cache: {err:?}"))?;
+        Self::from_bytes(cache_bytes.into(), workspace_folders)
+    }
+
+    fn from_bytes(
+        cache_bytes: CacheBytes,
+        workspace_folders: impl IntoIterator<Item = impl Into<PathBuf>>,
+    ) -> anyhow::Result<Self> {
         let workspaces = workspace_folders
             .into_iter()
             .map(|dir| {
@@ -1387,7 +1426,7 @@ fn range(span: ast::Span, file: &ast::File) -> Option<lsp::Range> {
 
 #[self_referencing]
 struct CompilationCache {
-    cache_bytes: Vec<u8>,
+    cache_bytes: CacheBytes,
     interner: TypeInterner,
     sources: ast::SourceMap,
     file_ids: HashMap<PathBuf, ast::FileId>,
@@ -1465,7 +1504,7 @@ impl CompilationCache {
     }
 
     pub fn make(
-        cache_bytes: Vec<u8>,
+        cache_bytes: CacheBytes,
         workspace_dirs: impl IntoIterator<Item = impl Into<PathBuf>>,
         interner: TypeInterner,
         missing_root: impl FnMut(&Path),
@@ -1475,7 +1514,7 @@ impl CompilationCache {
     }
 
     fn from_sources(
-        cache_bytes: Vec<u8>,
+        cache_bytes: CacheBytes,
         sources: ast::SourceMap,
         interner: TypeInterner,
     ) -> anyhow::Result<Self> {
@@ -1506,7 +1545,7 @@ impl CompilationCache {
 impl Default for CompilationCache {
     fn default() -> Self {
         Self::new(
-            vec![],
+            CacheBytes::Embedded(&[]),
             TypeInterner::default(),
             ast::SourceMap::default(),
             HashMap::default(),
@@ -3903,5 +3942,32 @@ mod tests {
                 2
             );
         }
+    }
+
+    #[test]
+    fn embedded_cache_loads_base_game_definitions() {
+        let dir = tempdir();
+        let file = dir.path().join("test.reds");
+        fs::write(
+            &file,
+            "func Test(obj: ref<IScriptable>) -> Bool { return IsDefined(obj); }",
+        )
+        .unwrap();
+
+        let server = RedscriptLanguageServer::embedded([dir.path()]).unwrap();
+        server
+            .check_workspace(|_, symbols, diagnostics, _| {
+                assert!(
+                    diagnostics.is_empty(),
+                    "unexpected diagnostics: {diagnostics:?}"
+                );
+                assert!(
+                    symbols
+                        .types()
+                        .any(|(name, _)| name.as_str() == "IScriptable")
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 }

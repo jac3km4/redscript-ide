@@ -1,9 +1,8 @@
-[package]
-name = "redscript-ide"
-version = "1.0.0"
-edition = "2024"
+[workspace]
+members = [".", "tools/compact-cache"]
+default-members = ["."]
 
-[dependencies]
+[workspace.dependencies]
 anyhow = "1"
 ignore = "0.4"
 hashbrown = "0.17"
@@ -15,36 +14,53 @@ fluent-uri = "0.3"
 ropey = "1"
 crossbeam-channel = "0.5"
 mimalloc = { version = "0.1", features = ["v3"] }
+miniz_oxide = "0.8"
 lsp-server = "0.7"
 lsp-types = "0.97"
+tempfile = "3"
+redscript-io = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.0" }
+redscript-redmod-formatter = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.0" }
+redscript-redmod-adapter = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.0" }
+redscript-community-formatter = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.0" }
+redscript-compiler-api = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.0" }
+redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.0" }
+redscript-dotfile = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.0" }
+redscript-code-edit = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.0" }
 
-[dependencies.redscript-redmod-formatter]
-git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0"
+[workspace.metadata.release]
+pre-release-commit-message = "chore: release {{version}}"
+publish = false
 
-[dependencies.redscript-redmod-adapter]
-git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0"
+[package]
+name = "redscript-ide"
+version = "1.0.0"
+edition = "2024"
 
-[dependencies.redscript-community-formatter]
-git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0"
-
-[dependencies.redscript-compiler-api]
-git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0"
-
-[dependencies.redscript-dotfile]
-git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0"
-
-[dependencies.redscript-code-edit]
-git = "https://github.com/jac3km4/redscript"
-rev = "v1.0.0"
+[dependencies]
+anyhow.workspace = true
+ignore.workspace = true
+hashbrown.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+ouroboros.workspace = true
+fluent-uri.workspace = true
+ropey.workspace = true
+crossbeam-channel.workspace = true
+mimalloc.workspace = true
+miniz_oxide.workspace = true
+lsp-server.workspace = true
+lsp-types.workspace = true
+redscript-redmod-formatter.workspace = true
+redscript-redmod-adapter.workspace = true
+redscript-community-formatter.workspace = true
+redscript-compiler-api.workspace = true
+redscript-dotfile.workspace = true
+redscript-code-edit.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
-redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.0" }
+tempfile.workspace = true
+redscript-compiler-frontend.workspace = true
 
 [patch.crates-io]
 stable_deref_trait = { git = "https://github.com/Storyyeller/stable_deref_trait", rev = "59a35e0" }
@@ -77,10 +93,6 @@ explicit_deref_methods = "warn"
 explicit_iter_loop = "warn"
 inefficient_to_string = "warn"
 match_bool = "warn"
-
-[workspace.metadata.release]
-pre-release-commit-message = "chore: release {{version}}"
-publish = false
 
 [profile.release]
 lto = true

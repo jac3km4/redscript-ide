@@ -80,7 +80,7 @@ and refresh the workspace. Analysis can be slow in large workspaces.
     "file_types": { "REDscript": ["**/*.reds", "**/*.script"] }
     ```
     This attaches the server; community syntax highlighting may not cover REDmod.
-  - Configure the required `lsp.redscript-ide.initialization_options.game_dir` setting in Zed's `settings.json`:
+  - Optionally configure `lsp.redscript-ide.initialization_options.game_dir` (or `cache_file`) in Zed's `settings.json` if you want to load a local or modded game cache instead of the bundled base-game API cache:
     ```json
       "lsp": {
         "redscript-ide": {
@@ -102,8 +102,10 @@ and refresh the workspace. Analysis can be slow in large workspaces.
   With **Neovim 0.11 or newer**, add the following to your `init.lua`. This uses
   the built-in LSP configuration API; `nvim-lspconfig` is not required. Replace
   `/path/to/redscript-ide` with a downloaded
-  [redscript-ide executable](https://github.com/jac3km4/redscript-ide/releases/latest)
-  and `/path/to/cyberpunk2077` with the root of your Cyberpunk 2077 installation:
+  [redscript-ide executable](https://github.com/jac3km4/redscript-ide/releases/latest).
+  `init_options.game_dir` (or `cache_file`) is optional: if omitted or empty,
+  the server uses its bundled base-game API cache. Otherwise, set `game_dir` to
+  the root of your Cyberpunk 2077 installation:
 
   ```lua
   vim.filetype.add({
