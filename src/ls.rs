@@ -354,8 +354,8 @@ impl RedscriptLanguageServer {
     pub fn publish_all_diagnostics(&self, ctx: &LspContext) -> anyhow::Result<()> {
         self.check_workspace_and_publish(ctx)?;
         for cache in self.standalone.values() {
-            cache.analyze(|_, symbols, diagnostics, sources| {
-                self.publish_diagnostics(diagnostics, symbols, sources, ctx)
+            cache.analyze(|unit, symbols, diagnostics, sources| {
+                self.publish_diagnostics_with_unit(Some(unit), diagnostics, symbols, sources, ctx)
             })?;
         }
         // Also clear removed folders, deleted files and closed unsaved standalone files.
@@ -995,8 +995,8 @@ impl RedscriptLanguageServer {
     }
 
     fn check_workspace_and_publish(&self, ctx: &LspContext) -> anyhow::Result<()> {
-        self.check_workspace(|_, symbols, diags, sources| {
-            self.publish_diagnostics(diags, symbols, sources, ctx)
+        self.check_workspace(|unit, symbols, diags, sources| {
+            self.publish_diagnostics_with_unit(Some(unit), diags, symbols, sources, ctx)
         })
     }
 
@@ -1012,8 +1012,20 @@ impl RedscriptLanguageServer {
         self.compilation_cache.analyze(cb)
     }
 
+    #[cfg(test)]
     fn publish_diagnostics<'ctx>(
         &self,
+        diags: &[&Diagnostic<'ctx>],
+        symbols: &Symbols<'ctx>,
+        sources: &'ctx ast::SourceMap,
+        ctx: &LspContext,
+    ) -> anyhow::Result<()> {
+        self.publish_diagnostics_with_unit(None, diags, symbols, sources, ctx)
+    }
+
+    fn publish_diagnostics_with_unit<'ctx>(
+        &self,
+        unit: Option<&LoweredCompilationUnit<'ctx>>,
         diags: &[&Diagnostic<'ctx>],
         symbols: &Symbols<'ctx>,
         sources: &'ctx ast::SourceMap,
@@ -1047,7 +1059,7 @@ impl RedscriptLanguageServer {
             let slots = fixes.entry_ref(path).or_default();
             for diag in &diags {
                 if Dialect::of(path) == Some(Dialect::Community)
-                    && let Some(mut fix) = generate_fix(diag, file, symbols, sources, ctx)
+                    && let Some(mut fix) = generate_fix(diag, file, unit, symbols, sources, ctx)
                 {
                     fix.generation = self.generation;
                     let span = diag.span();
@@ -1416,11 +1428,16 @@ fn member_completion_range(source: &str, pos: u32) -> Option<Range<usize>> {
 fn generate_fix<'ctx>(
     diag: &Diagnostic<'ctx>,
     diag_file: &ast::File,
+    unit: Option<&LoweredCompilationUnit<'ctx>>,
     symbols: &Symbols<'ctx>,
     sources: &'ctx ast::SourceMap,
     ctx: &LspContext,
 ) -> Option<Fix> {
-    let code_edit = CodeEdit::from_diagnostic(diag)?;
+    if let Some(fix) = generate_ide_fix(diag, diag_file, unit, ctx) {
+        return Some(fix);
+    }
+    let code_edit = CodeEdit::from_diagnostic(diag)
+        .or_else(|| private_import_code_edit(diag, diag_file, symbols))?;
     let target_name = match &code_edit {
         CodeEdit::FixStructNewConstructor(type_id, _) | CodeEdit::MakeTypePublic(type_id) => {
             Some(type_id.simple_name().to_owned())
@@ -1448,6 +1465,136 @@ fn generate_fix<'ctx>(
         expected_source: file.source().to_owned(),
         generation: 0,
     })
+}
+
+fn private_import_code_edit<'ctx>(
+    diag: &Diagnostic<'ctx>,
+    diag_file: &ast::File,
+    symbols: &Symbols<'ctx>,
+) -> Option<CodeEdit<'ctx>> {
+    let Diagnostic::ImportIsPrivate(name, span) = diag else {
+        return None;
+    };
+    let raw = diag_file
+        .source()
+        .get(span.start as usize..span.end as usize)?
+        .trim();
+    let rest = raw
+        .strip_prefix("import")?
+        .trim_start()
+        .trim_end_matches(';')
+        .trim();
+    let compact: String = rest.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let qualified = if let Some(prefix) = compact.strip_suffix(".*") {
+        format!("{prefix}.{name}")
+    } else if let Some((prefix, _)) = compact.split_once(".{") {
+        format!("{prefix}.{name}")
+    } else if compact == *name || compact.ends_with(&format!(".{name}")) {
+        compact
+    } else {
+        return None;
+    };
+    let (type_id, _) = symbols
+        .types()
+        .find(|(id, def)| id.as_str() == qualified && def.span().is_some())?;
+    Some(CodeEdit::MakeTypePublic(type_id))
+}
+
+fn generate_ide_fix<'ctx>(
+    diag: &Diagnostic<'ctx>,
+    diag_file: &ast::File,
+    unit: Option<&LoweredCompilationUnit<'ctx>>,
+    ctx: &LspContext,
+) -> Option<Fix> {
+    if Dialect::of(diag_file.path()) != Some(Dialect::Community) {
+        return None;
+    }
+    let source = diag_file.source();
+    let (kind, target_name, edit_span, replacement) = match diag {
+        Diagnostic::LoweringError(LowerError::DeprecatedNameOf(span)) => {
+            let slice = source.get(span.start as usize..span.end as usize)?;
+            let inner = slice
+                .strip_prefix("NameOf")?
+                .trim_start()
+                .strip_prefix('(')?
+                .strip_suffix(')')?
+                .trim();
+            if !is_ascii_ident(inner) {
+                return None;
+            }
+            (
+                FixKind::ReplaceDeprecatedNameOf,
+                Some(inner.to_owned()),
+                *span,
+                format!("NameOf<{inner}>()"),
+            )
+        }
+        Diagnostic::LoweringError(LowerError::CallingBaseStaticMethod {
+            type_id,
+            name,
+            span,
+        }) => {
+            let base_name = type_id.simple_name();
+            let in_scope = if let Some(unit) = unit {
+                unit.scopes
+                    .get(&span.file)
+                    .and_then(|scope| scope.get(base_name))
+                    .is_some_and(|type_ref| type_ref.id() == Some(*type_id))
+            } else {
+                type_id.as_str() == base_name
+            };
+            if !in_scope {
+                return None;
+            }
+            let slice = source.get(span.start as usize..span.end as usize)?;
+            let receiver_len = slice
+                .bytes()
+                .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                .count();
+            if receiver_len == 0 || !is_ascii_ident(&slice[..receiver_len]) {
+                return None;
+            }
+            let after_dot = slice[receiver_len..]
+                .trim_start()
+                .strip_prefix('.')?
+                .trim_start();
+            let after_method = after_dot.strip_prefix(*name)?.trim_start();
+            if !after_method.starts_with(['(', '<']) {
+                return None;
+            }
+            let receiver_span = Span::new(
+                span.start,
+                span.start.checked_add(u32::try_from(receiver_len).ok()?)?,
+                span.file,
+            );
+            (
+                FixKind::QualifyBaseStaticMethod,
+                Some(format!("{base_name}.{name}")),
+                receiver_span,
+                base_name.to_owned(),
+            )
+        }
+        _ => return None,
+    };
+    let edit_range = range(edit_span, diag_file)?;
+    Some(Fix {
+        kind,
+        target_name,
+        diagnostic_range: range(diag.span(), diag_file),
+        diagnostic_code: Some(diag.code().into()),
+        uri: ctx.uri(diag_file.path()).ok()?,
+        edit: lsp::TextEdit::new(edit_range, replacement),
+        expected_source: source.to_owned(),
+        generation: 0,
+    })
+}
+
+fn is_ascii_ident(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn generate_completions(
@@ -2159,6 +2306,8 @@ impl Fix {
             FixKind::MakeMethodPublic => format!("Make method `{name}` public"),
             FixKind::MakeFieldPublic => format!("Make field `{name}` public"),
             FixKind::MakeTypePublic => format!("Make type `{name}` public"),
+            FixKind::ReplaceDeprecatedNameOf => format!("Replace with `NameOf<{name}>()`"),
+            FixKind::QualifyBaseStaticMethod => format!("Qualify static call as `{name}`"),
         }
     }
 
@@ -2189,6 +2338,8 @@ enum FixKind {
     MakeMethodPublic,
     MakeFieldPublic,
     MakeTypePublic,
+    ReplaceDeprecatedNameOf,
+    QualifyBaseStaticMethod,
 }
 
 impl From<&CodeEdit<'_>> for FixKind {
@@ -2209,6 +2360,10 @@ impl fmt::Display for FixKind {
             Self::MakeMethodPublic => write!(f, "Make method public"),
             Self::MakeFieldPublic => write!(f, "Make field public"),
             Self::MakeTypePublic => write!(f, "Make type public"),
+            Self::ReplaceDeprecatedNameOf => write!(f, "Replace deprecated NameOf syntax"),
+            Self::QualifyBaseStaticMethod => {
+                write!(f, "Qualify static method call with declaring type")
+            }
         }
     }
 }
@@ -4968,5 +5123,65 @@ mod tests {
                 .iter()
                 .any(|a| a.title.contains("otherSameSpan"))
         );
+    }
+
+    #[test]
+    fn quick_fixes_cover_private_imports_deprecated_nameof_and_base_static_calls() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let owner = temp.path().join("owner.reds");
+        let caller = temp.path().join("caller.reds");
+        let owner_source = "module Other\nclass Hidden {}\npublic class Base { public static func Create() -> Int32 { return 1; } }\npublic class Child extends Base {}\n";
+        let caller_source = "import Other.{Hidden, Base, Child}\nfunc Use() -> Int32 {\n  let _n = NameOf(Child);\n  return Child.Create();\n}\n";
+        fs::write(&owner, owner_source).unwrap();
+        fs::write(&caller, caller_source).unwrap();
+        server.check(caller.clone(), &ctx).unwrap();
+
+        let actions = literal_actions(
+            server
+                .code_action(
+                    caller.clone(),
+                    0..caller_source.len() as u32,
+                    action_context(None),
+                    &ctx,
+                )
+                .unwrap(),
+        );
+        let titles: Vec<_> = actions.iter().map(|a| a.title.as_str()).collect();
+        for expected in [
+            "Make type `Hidden` public",
+            "Replace with `NameOf<Child>()`",
+            "Qualify static call as `Base.Create`",
+        ] {
+            assert!(titles.contains(&expected), "missing {expected} in {titles:?}");
+        }
+
+        let owner_uri = ctx.uri(&dialect::identity(&owner)).unwrap();
+        let caller_uri = ctx.uri(&dialect::identity(&caller)).unwrap();
+        let mut owner_buf = crate::buffers::Buffer::new(owner_source.into());
+        let mut caller_buf = crate::buffers::Buffer::new(caller_source.into());
+
+        for title in [
+            "Make type `Hidden` public",
+            "Qualify static call as `Base.Create`",
+            "Replace with `NameOf<Child>()`",
+        ] {
+            let action = actions.iter().find(|a| a.title == title).unwrap();
+            #[allow(clippy::mutable_key_type)]
+            let changes = action.edit.as_ref().unwrap().changes.as_ref().unwrap();
+            if let Some(edits) = changes.get(&owner_uri) {
+                for edit in edits {
+                    assert!(owner_buf.update_range(edit.range, edit.new_text.clone()));
+                }
+            }
+            if let Some(edits) = changes.get(&caller_uri) {
+                for edit in edits {
+                    assert!(caller_buf.update_range(edit.range, edit.new_text.clone()));
+                }
+            }
+        }
+        assert!(owner_buf.contents().to_string().contains("public class Hidden {}"));
+        let fixed_caller = caller_buf.contents().to_string();
+        assert!(fixed_caller.contains("NameOf<Child>()"), "{fixed_caller}");
+        assert!(fixed_caller.contains("Base.Create()"), "{fixed_caller}");
     }
 }
