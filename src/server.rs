@@ -768,6 +768,8 @@ pub struct LspContext {
     code_action_literals: bool,
     code_action_data: bool,
     code_action_resolve_edit: bool,
+    code_action_disabled: bool,
+    workspace_edit_document_changes: bool,
     completion_snippets: bool,
     completion_label_details: bool,
     completion_documentation_format: lsp::MarkupKind,
@@ -783,6 +785,8 @@ impl LspContext {
             code_action_literals: false,
             code_action_data: false,
             code_action_resolve_edit: false,
+            code_action_disabled: false,
+            workspace_edit_document_changes: false,
             completion_snippets: false,
             completion_label_details: false,
             completion_documentation_format: lsp::MarkupKind::PlainText,
@@ -812,6 +816,13 @@ impl LspContext {
         self.code_action_resolve_edit = support
             .and_then(|s| s.resolve_support.as_ref())
             .is_some_and(|s| s.properties.iter().any(|property| property == "edit"));
+        self.code_action_disabled = support.and_then(|s| s.disabled_support).unwrap_or(false);
+        self.workspace_edit_document_changes = capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.workspace_edit.as_ref())
+            .and_then(|edit| edit.document_changes)
+            .unwrap_or(false);
     }
 
     fn set_presentation_capabilities(&mut self, capabilities: &lsp::ClientCapabilities) {
@@ -927,6 +938,14 @@ impl LspContext {
 
     pub fn supports_code_action_resolve_edit(&self) -> bool {
         self.code_action_literals && self.code_action_data && self.code_action_resolve_edit
+    }
+
+    pub fn supports_code_action_disabled(&self) -> bool {
+        self.code_action_disabled
+    }
+
+    pub fn supports_workspace_edit_document_changes(&self) -> bool {
+        self.workspace_edit_document_changes
     }
 
     pub fn supports_diagnostic_tag(&self, tag: &lsp::DiagnosticTag) -> bool {

@@ -56,7 +56,7 @@ impl From<Vec<u8>> for CacheBytes {
     }
 }
 
-type FixMap = HashMap<PathBuf, BTreeMap<(u32, u32), Fix>>;
+type FixMap = HashMap<PathBuf, BTreeMap<(u32, u32), Vec<Fix>>>;
 
 pub struct RedscriptLanguageServer {
     workspaces: HashMap<PathBuf, WorkspaceDir>,
@@ -754,7 +754,9 @@ impl RedscriptLanguageServer {
 
         let mut actions = Vec::new();
         let mut fix_all_kinds = Vec::new();
-        for (&(start, end), fix) in fixes.get(&path).into_iter().flat_map(|fixes| fixes.iter()) {
+        for (&(start, end), slot_fixes) in
+            fixes.get(&path).into_iter().flat_map(|fixes| fixes.iter())
+        {
             let matches = if span.is_empty() {
                 start == span.start || (start < span.start && span.start < end)
             } else if start == end {
@@ -762,33 +764,42 @@ impl RedscriptLanguageServer {
             } else {
                 start < span.end && span.start < end
             };
-            if !matches || !self.valid_fix(fix) {
+            if !matches {
                 continue;
             }
-            let fix_one = lsp::CodeAction {
-                title: fix.kind.to_string(),
-                kind: Some(lsp::CodeActionKind::QUICKFIX),
-                data: Some(serde_json::to_value(FixRequest::FixOne(fix.clone()))?),
-                is_preferred: Some(true),
-                ..Default::default()
-            };
+            for fix in slot_fixes {
+                if !self.valid_fix(fix) {
+                    continue;
+                }
+                let matched_diagnostics = fix.matching_diagnostics(&context.diagnostics);
+                let fix_one = lsp::CodeAction {
+                    title: fix.title(),
+                    kind: Some(lsp::CodeActionKind::QUICKFIX),
+                    diagnostics: (!matched_diagnostics.is_empty()).then_some(matched_diagnostics),
+                    data: Some(serde_json::to_value(FixRequest::FixOne(Box::new(
+                        fix.clone(),
+                    )))?),
+                    is_preferred: Some(true),
+                    ..Default::default()
+                };
 
-            actions.push(fix_one);
-            if fix_all_kinds.contains(&fix.kind) {
-                continue;
+                actions.push(fix_one);
+                if fix_all_kinds.contains(&fix.kind) {
+                    continue;
+                }
+                fix_all_kinds.push(fix.kind);
+                let fix_all = lsp::CodeAction {
+                    title: format!("{} - fix all in the workspace", fix.kind),
+                    kind: Some(lsp::CodeActionKind::QUICKFIX),
+                    data: Some(serde_json::to_value(FixRequest::FixAll(
+                        fix.kind,
+                        self.generation,
+                    ))?),
+                    ..Default::default()
+                };
+
+                actions.push(fix_all);
             }
-            fix_all_kinds.push(fix.kind);
-            let fix_all = lsp::CodeAction {
-                title: format!("{} - fix all in the workspace", fix.kind),
-                kind: Some(lsp::CodeActionKind::QUICKFIX),
-                data: Some(serde_json::to_value(FixRequest::FixAll(
-                    fix.kind,
-                    self.generation,
-                ))?),
-                ..Default::default()
-            };
-
-            actions.push(fix_all);
         }
         drop(fixes);
         actions
@@ -809,7 +820,7 @@ impl RedscriptLanguageServer {
     fn code_action_resolve(
         &self,
         mut action: lsp::CodeAction,
-        _ctx: &LspContext,
+        ctx: &LspContext,
     ) -> anyhow::Result<lsp::CodeAction> {
         let Some(data) = action.data.clone() else {
             return Ok(action);
@@ -818,19 +829,20 @@ impl RedscriptLanguageServer {
         let request: FixRequest = serde_json::from_value(data)?;
         match request {
             FixRequest::FixOne(fix) if self.valid_fix(&fix) => {
-                action.edit = Some(self.workspace_edit(vec![(fix.uri, vec![fix.edit])]));
+                action.edit = Some(self.workspace_edit(vec![(fix.uri, vec![fix.edit])], ctx));
             }
             FixRequest::FixAll(kind, generation) if generation == self.generation => {
                 let mut unique = HashSet::<(lsp::Uri, lsp::Range)>::new();
 
                 #[allow(clippy::mutable_key_type)]
                 let mut edits = std::collections::HashMap::<lsp::Uri, Vec<lsp::TextEdit>>::new();
-                for (_, fix) in self
+                for fix in self
                     .cached_fixes
                     .borrow()
                     .values()
-                    .flat_map(|f| f.iter())
-                    .filter(|(_, f)| f.kind == kind && self.valid_fix(f))
+                    .flat_map(|f| f.values())
+                    .flatten()
+                    .filter(|f| f.kind == kind && self.valid_fix(f))
                 {
                     if unique.insert((fix.uri.clone(), fix.edit.range)) {
                         edits
@@ -840,41 +852,68 @@ impl RedscriptLanguageServer {
                     }
                 }
 
-                action.edit = Some(self.workspace_edit(edits.into_iter().collect()));
+                action.edit = Some(self.workspace_edit(edits.into_iter().collect(), ctx));
             }
-            _ => {
+            other => {
                 action.edit = None;
-                action.disabled = Some(lsp::CodeActionDisabled {
-                    reason: "This fix is stale or targets an unsupported dialect".into(),
-                });
+                if ctx.supports_code_action_disabled() {
+                    let reason = match other {
+                        FixRequest::FixOne(fix)
+                            if crate::server::path_from_uri(&fix.uri).is_ok_and(|path| {
+                                Dialect::of(&path) != Some(Dialect::Community)
+                            }) =>
+                        {
+                            "Quick fixes are only supported for community REDscript (.reds) files"
+                        }
+                        _ => {
+                            "This fix is stale because workspace files changed; save to refresh diagnostics"
+                        }
+                    };
+                    action.disabled = Some(lsp::CodeActionDisabled {
+                        reason: reason.into(),
+                    });
+                }
             }
         }
         Ok(action)
     }
 
-    fn workspace_edit(&self, edits: Vec<(lsp::Uri, Vec<lsp::TextEdit>)>) -> lsp::WorkspaceEdit {
+    fn workspace_edit(
+        &self,
+        edits: Vec<(lsp::Uri, Vec<lsp::TextEdit>)>,
+        ctx: &LspContext,
+    ) -> lsp::WorkspaceEdit {
         let mut edits = edits;
         edits.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
-        lsp::WorkspaceEdit {
-            document_changes: Some(lsp::DocumentChanges::Edits(
-                edits
-                    .into_iter()
-                    .map(|(uri, edits)| {
-                        let version = crate::server::path_from_uri(&uri)
-                            .ok()
-                            .and_then(|path| self.overlays.get(&dialect::identity(&path)))
-                            .map(|overlay| overlay.version);
-                        lsp::TextDocumentEdit {
-                            text_document: lsp::OptionalVersionedTextDocumentIdentifier {
-                                uri,
-                                version,
-                            },
-                            edits: edits.into_iter().map(lsp::OneOf::Left).collect(),
-                        }
-                    })
-                    .collect(),
-            )),
-            ..Default::default()
+        if ctx.supports_workspace_edit_document_changes() {
+            lsp::WorkspaceEdit {
+                document_changes: Some(lsp::DocumentChanges::Edits(
+                    edits
+                        .into_iter()
+                        .map(|(uri, edits)| {
+                            let version = crate::server::path_from_uri(&uri)
+                                .ok()
+                                .and_then(|path| self.overlays.get(&dialect::identity(&path)))
+                                .map(|overlay| overlay.version);
+                            lsp::TextDocumentEdit {
+                                text_document: lsp::OptionalVersionedTextDocumentIdentifier {
+                                    uri,
+                                    version,
+                                },
+                                edits: edits.into_iter().map(lsp::OneOf::Left).collect(),
+                            }
+                        })
+                        .collect(),
+                )),
+                ..Default::default()
+            }
+        } else {
+            #[allow(clippy::mutable_key_type)]
+            let changes = edits.into_iter().collect();
+            lsp::WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }
         }
     }
 
@@ -1008,11 +1047,11 @@ impl RedscriptLanguageServer {
             let slots = fixes.entry_ref(path).or_default();
             for diag in &diags {
                 if Dialect::of(path) == Some(Dialect::Community)
-                    && let Some(mut fix) = generate_fix(diag, symbols, sources, ctx)
+                    && let Some(mut fix) = generate_fix(diag, file, symbols, sources, ctx)
                 {
                     fix.generation = self.generation;
                     let span = diag.span();
-                    slots.insert((span.start, span.end), fix);
+                    slots.entry((span.start, span.end)).or_default().push(fix);
                 }
             }
 
@@ -1376,21 +1415,36 @@ fn member_completion_range(source: &str, pos: u32) -> Option<Range<usize>> {
 
 fn generate_fix<'ctx>(
     diag: &Diagnostic<'ctx>,
+    diag_file: &ast::File,
     symbols: &Symbols<'ctx>,
     sources: &'ctx ast::SourceMap,
     ctx: &LspContext,
 ) -> Option<Fix> {
     let code_edit = CodeEdit::from_diagnostic(diag)?;
+    let target_name = match &code_edit {
+        CodeEdit::FixStructNewConstructor(type_id, _) | CodeEdit::MakeTypePublic(type_id) => {
+            Some(type_id.simple_name().to_owned())
+        }
+        CodeEdit::MakeMethodPublic(method_id) => symbols
+            .get_method(*method_id)
+            .map(|(name, _)| name.to_owned()),
+        CodeEdit::MakeFieldPublic(field_id) => symbols
+            .get_field(*field_id)
+            .map(|(name, _)| name.to_owned()),
+    };
     let edit = TextEdit::from_code_edit(&code_edit, symbols, sources).ok()?;
     let file = sources.get(edit.file)?;
     if Dialect::of(file.path()) != Some(Dialect::Community) {
         return None;
     }
-    let range = range(Span::new(edit.start as _, edit.end as _, edit.file), file)?;
+    let edit_range = range(Span::new(edit.start as _, edit.end as _, edit.file), file)?;
     Some(Fix {
         kind: FixKind::from(&code_edit),
+        target_name,
+        diagnostic_range: range(diag.span(), diag_file),
+        diagnostic_code: Some(diag.code().into()),
         uri: ctx.uri(file.path()).ok()?,
-        edit: lsp::TextEdit::new(range, edit.content.to_string()),
+        edit: lsp::TextEdit::new(edit_range, edit.content.to_string()),
         expected_source: file.source().to_owned(),
         generation: 0,
     })
@@ -2074,17 +2128,59 @@ impl FileResolution<'_> {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum FixRequest {
-    FixOne(Fix),
+    FixOne(Box<Fix>),
     FixAll(FixKind, u64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Fix {
     kind: FixKind,
+    #[serde(default)]
+    target_name: Option<String>,
+    #[serde(default)]
+    diagnostic_range: Option<lsp::Range>,
+    #[serde(default)]
+    diagnostic_code: Option<String>,
     uri: lsp::Uri,
     edit: lsp::TextEdit,
     expected_source: String,
     generation: u64,
+}
+
+impl Fix {
+    fn title(&self) -> String {
+        let Some(name) = &self.target_name else {
+            return self.kind.to_string();
+        };
+        match self.kind {
+            FixKind::FixStructNewConstructor => {
+                format!("Fix by using `{name}` struct constructor")
+            }
+            FixKind::MakeMethodPublic => format!("Make method `{name}` public"),
+            FixKind::MakeFieldPublic => format!("Make field `{name}` public"),
+            FixKind::MakeTypePublic => format!("Make type `{name}` public"),
+        }
+    }
+
+    fn matching_diagnostics(&self, context_diagnostics: &[lsp::Diagnostic]) -> Vec<lsp::Diagnostic> {
+        let Some(diag_range) = self.diagnostic_range else {
+            return vec![];
+        };
+        context_diagnostics
+            .iter()
+            .filter(|diag| {
+                diag.range == diag_range
+                    && match (&diag.code, &self.diagnostic_code) {
+                        (Some(lsp::NumberOrString::String(actual)), Some(expected)) => {
+                            actual == expected
+                        }
+                        (Some(_), Some(_)) => false,
+                        _ => true,
+                    }
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3832,6 +3928,9 @@ mod tests {
         );
         let mut fix = Fix {
             kind: FixKind::MakeFieldPublic,
+            target_name: None,
+            diagnostic_range: None,
+            diagnostic_code: None,
             uri: ctx.uri(&path).unwrap(),
             edit: lsp::TextEdit::new(lsp::Range::default(), "public ".into()),
             expected_source: "class Native {}".into(),
@@ -3854,7 +3953,7 @@ mod tests {
         assert!(!server.valid_fix(&fix));
         let action = lsp::CodeAction {
             title: "stale".into(),
-            data: Some(serde_json::to_value(FixRequest::FixOne(fix)).unwrap()),
+            data: Some(serde_json::to_value(FixRequest::FixOne(Box::new(fix))).unwrap()),
             ..Default::default()
         };
         assert!(
@@ -3867,6 +3966,9 @@ mod tests {
         // A community diagnostic can still propose an edit in another dialect.
         let redmod_fix = Fix {
             kind: FixKind::MakeFieldPublic,
+            target_name: None,
+            diagnostic_range: None,
+            diagnostic_code: None,
             uri: ctx.uri(&path).unwrap(),
             edit: lsp::TextEdit::new(lsp::Range::default(), "public ".into()),
             expected_source: "class Native {}".into(),
@@ -3877,7 +3979,7 @@ mod tests {
             .borrow_mut()
             .entry(community)
             .or_default()
-            .insert((0, 1), redmod_fix);
+            .insert((0, 1), vec![redmod_fix]);
         let action = lsp::CodeAction {
             title: "fix all".into(),
             data: Some(
@@ -3891,7 +3993,7 @@ mod tests {
         };
         let resolved = server.code_action_resolve(action, &ctx).unwrap();
         assert!(
-            matches!(resolved.edit.unwrap().document_changes, Some(lsp::DocumentChanges::Edits(edits)) if edits.is_empty())
+            matches!(resolved.edit.unwrap().changes, Some(changes) if changes.is_empty())
         );
     }
 
@@ -4228,13 +4330,16 @@ mod tests {
             .map(|(start, end)| {
                 (
                     (start, end),
-                    Fix {
+                    vec![Fix {
                         kind: FixKind::MakeFieldPublic,
+                        target_name: None,
+                        diagnostic_range: None,
+                        diagnostic_code: None,
                         uri: uri.clone(),
                         edit: lsp::TextEdit::new(lsp::Range::default(), format!("fix {start}")),
                         expected_source: text.into(),
                         generation: if start == 12 { 1 } else { 0 },
-                    },
+                    }],
                 )
             })
             .collect();
@@ -4343,11 +4448,14 @@ mod tests {
             serde_json::json!({"codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["quickfix"]}}, "resolveSupport": {"properties": ["edit"]}}),
             serde_json::json!({"codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["quickfix"]}}, "dataSupport": true, "resolveSupport": {"properties": ["command"]}}),
             serde_json::json!({"codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["quickfix"]}}, "dataSupport": true, "resolveSupport": {"properties": ["edit"]}}),
+            serde_json::json!({"codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["quickfix"]}}, "dataSupport": true, "disabledSupport": true, "resolveSupport": {"properties": ["edit"]}}),
         ] {
             let lazy = support.get("codeActionLiteralSupport").is_some()
                 && support.get("dataSupport") == Some(&serde_json::json!(true))
                 && support.pointer("/resolveSupport/properties/0")
                     == Some(&serde_json::json!("edit"));
+            let disabled_supported =
+                support.get("disabledSupport") == Some(&serde_json::json!(true));
             let capabilities = serde_json::from_value(
                 serde_json::json!({"textDocument": {"codeAction": support}}),
             )
@@ -4384,7 +4492,7 @@ mod tests {
                 action.edit = Some(lsp::WorkspaceEdit::default());
                 let mut stale = server.code_action_resolve(action.clone(), &ctx).unwrap();
                 assert!(stale.edit.is_none());
-                assert!(stale.disabled.take().is_some());
+                assert_eq!(stale.disabled.take().is_some(), disabled_supported);
                 action.edit = None;
                 assert_eq!(stale, action);
                 server.generation -= 1;
@@ -4396,7 +4504,7 @@ mod tests {
     fn resolving_fix_all_preserves_cached_fixes() {
         let server = server();
         let (sender, _receiver) = crossbeam_channel::unbounded();
-        let ctx = LspContext::new(sender);
+        let mut ctx = LspContext::new(sender);
         let uri: lsp::Uri = "file:///C:/scripts/test.reds".parse().unwrap();
         let mut server = server;
         server.overlays.insert(
@@ -4414,8 +4522,11 @@ mod tests {
                 let start = i as u32;
                 (
                     (start, start + 1),
-                    Fix {
+                    vec![Fix {
                         kind,
+                        target_name: None,
+                        diagnostic_range: None,
+                        diagnostic_code: None,
                         uri: uri.clone(),
                         expected_source: String::new(),
                         generation: 0,
@@ -4426,7 +4537,7 @@ mod tests {
                             ),
                             "public".into(),
                         ),
-                    },
+                    }],
                 )
             })
             .collect();
@@ -4435,32 +4546,46 @@ mod tests {
             .borrow_mut()
             .insert(PathBuf::from("test.reds"), fixes);
 
-        for kind in [kinds[0], kinds[0], kinds[1]] {
-            let action = lsp::CodeAction {
-                data: Some(
-                    serde_json::to_value(FixRequest::FixAll(kind, server.generation)).unwrap(),
-                ),
-                ..Default::default()
-            };
-            let resolved = server.code_action_resolve(action, &ctx).unwrap();
-            let lsp::DocumentChanges::Edits(edits) =
-                resolved.edit.unwrap().document_changes.unwrap()
-            else {
-                panic!("expected document edits");
-            };
-            assert_eq!(edits.len(), 1);
-            assert_eq!(edits[0].text_document.uri, uri);
-            assert_eq!(edits[0].text_document.version, Some(1));
-            assert_eq!(edits[0].edits.len(), 1);
-            assert_eq!(
-                server
-                    .cached_fixes
-                    .borrow()
-                    .values()
-                    .map(BTreeMap::len)
-                    .sum::<usize>(),
-                2
+        for document_changes in [false, true] {
+            ctx.set_code_action_capabilities(
+                &serde_json::from_value(serde_json::json!({
+                    "workspace": { "workspaceEdit": { "documentChanges": document_changes } }
+                }))
+                .unwrap(),
             );
+            for kind in [kinds[0], kinds[0], kinds[1]] {
+                let action = lsp::CodeAction {
+                    data: Some(
+                        serde_json::to_value(FixRequest::FixAll(kind, server.generation)).unwrap(),
+                    ),
+                    ..Default::default()
+                };
+                let resolved = server.code_action_resolve(action, &ctx).unwrap();
+                let edit = resolved.edit.unwrap();
+                if document_changes {
+                    let lsp::DocumentChanges::Edits(edits) = edit.document_changes.unwrap() else {
+                        panic!("expected document edits");
+                    };
+                    assert_eq!(edits.len(), 1);
+                    assert_eq!(edits[0].text_document.uri, uri);
+                    assert_eq!(edits[0].text_document.version, Some(1));
+                    assert_eq!(edits[0].edits.len(), 1);
+                } else {
+                    #[allow(clippy::mutable_key_type)]
+                    let changes = edit.changes.unwrap();
+                    assert_eq!(changes.len(), 1);
+                    assert_eq!(changes[&uri].len(), 1);
+                }
+                assert_eq!(
+                    server
+                        .cached_fixes
+                        .borrow()
+                        .values()
+                        .map(BTreeMap::len)
+                        .sum::<usize>(),
+                    2
+                );
+            }
         }
     }
 
@@ -4757,6 +4882,91 @@ mod tests {
                 .as_ref()
                 .map(|desc| desc.href.as_str()),
             Some(REDMOD_SUBSET_DOCS_URL)
+        );
+    }
+
+    #[test]
+    fn quick_fixes_name_targets_link_diagnostics_and_keep_same_span_entries() {
+        let (temp, mut server, ctx, receiver) = fixture();
+        let owner = temp.path().join("owner.reds");
+        let caller = temp.path().join("caller.reds");
+        fs::write(
+            &owner,
+            "module Other\npublic class Vault { let first: Int32; let second: Int32; func Secret() {} }\npublic struct Record { public let x: Int32; }\n",
+        )
+        .unwrap();
+        let caller_source = "import Other.*\nfunc Use(v: ref<Vault>) -> Int32 {\n  v.Secret();\n  let r = new Record(1);\n  v.first;\n  v.second;\n  return r.x;\n}\n";
+        fs::write(&caller, caller_source).unwrap();
+        server.check(caller.clone(), &ctx).unwrap();
+
+        let caller_uri = ctx.uri(&dialect::identity(&caller)).unwrap();
+        let published = receiver
+            .try_iter()
+            .find_map(|msg| match msg {
+                lsp_server::Message::Notification(notif)
+                    if notif.method == "textDocument/publishDiagnostics" =>
+                {
+                    serde_json::from_value::<lsp::PublishDiagnosticsParams>(notif.params)
+                        .ok()
+                        .filter(|p| p.uri == caller_uri)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(published.diagnostics.len(), 4, "{published:?}");
+
+        let actions = literal_actions(
+            server
+                .code_action(
+                    caller.clone(),
+                    0..caller_source.len() as u32,
+                    lsp::CodeActionContext {
+                        diagnostics: published.diagnostics.clone(),
+                        only: None,
+                        trigger_kind: None,
+                    },
+                    &ctx,
+                )
+                .unwrap(),
+        );
+        let titles: Vec<_> = actions.iter().map(|a| a.title.as_str()).collect();
+        for expected in [
+            "Make method `Secret` public",
+            "Fix by using `Record` struct constructor",
+            "Make field `first` public",
+            "Make field `second` public",
+            "Make field public - fix all in the workspace",
+        ] {
+            assert!(titles.contains(&expected), "missing {expected} in {titles:?}");
+        }
+        let first_action = actions
+            .iter()
+            .find(|a| a.title == "Make field `first` public")
+            .unwrap();
+        assert_eq!(first_action.diagnostics.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            first_action.diagnostics.as_ref().unwrap()[0].code,
+            Some(lsp::NumberOrString::String("INACCESSIBLE_FIELD".into()))
+        );
+
+        // Two fixes stored at the exact same span are both returned.
+        let mut slots = server.cached_fixes.borrow_mut();
+        let caller_fixes = slots.get_mut(&dialect::identity(&caller)).unwrap();
+        let sample = caller_fixes.values().next().unwrap()[0].clone();
+        let mut second_same_span = sample.clone();
+        second_same_span.target_name = Some("otherSameSpan".into());
+        caller_fixes.insert((0, 1), vec![sample, second_same_span]);
+        drop(slots);
+
+        let same_span_actions = literal_actions(
+            server
+                .code_action(caller, 0..1, action_context(None), &ctx)
+                .unwrap(),
+        );
+        assert!(
+            same_span_actions
+                .iter()
+                .any(|a| a.title.contains("otherSameSpan"))
         );
     }
 }
