@@ -188,7 +188,9 @@ and refresh the workspace. Analysis can be slow in large workspaces.
   3. Setup tries to find Cyberpunk 2077 in Steam libraries (including additional
      libraries), GOG/Epic launcher records on Windows, and common application bundle
      locations on macOS. Candidates must contain a script cache under `r6/cache`.
-     If detection fails, setup warns and leaves a placeholder: edit `game_dir` in your user
+     If detection fails, setup warns and leaves `game_dir = ""` so the server uses
+     its bundled base-game API cache. To load a local or modded game cache instead,
+     edit `game_dir` in your user
      [`languages.toml`](https://docs.helix-editor.com/languages.html)
      (`%AppData%\helix\languages.toml` on Windows, `~/.config/helix/languages.toml`
      on macOS, or `$XDG_CONFIG_HOME/helix/languages.toml` if set) to point to the

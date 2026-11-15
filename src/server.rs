@@ -937,6 +937,13 @@ impl LspContext {
         LspLog::new(self)
     }
 
+    pub fn show_message(&self, typ: lsp::MessageType, message: impl Display) {
+        self.notify::<lsp::notification::ShowMessage>(lsp::ShowMessageParams {
+            typ,
+            message: message.to_string(),
+        });
+    }
+
     pub fn notify<N: lsp::notification::Notification>(&self, params: N::Params) {
         let notification = lsp_server::Notification::new(N::METHOD.into(), params);
         self.sender.send(Message::Notification(notification)).ok();

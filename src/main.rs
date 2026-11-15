@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use ls::RedscriptLanguageServer;
+use lsp_types as lsp;
 use mimalloc::MiMalloc;
-use serde::Deserialize;
-use server::LspServer;
+use serde_json::Value;
+use server::{LspContext, LspServer};
 
 mod buffers;
 mod completions;
@@ -18,12 +19,7 @@ mod server;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct InitializationOptions {
-    game_dir: Option<PathBuf>,
-    cache_file: Option<PathBuf>,
-}
+const PLACEHOLDER_GAME_DIR: &str = "/path/to/cyberpunk2077";
 
 #[derive(Debug, PartialEq, Eq)]
 enum CacheSource {
@@ -32,59 +28,153 @@ enum CacheSource {
     Embedded,
 }
 
-fn resolve_cache_source(init_options: Option<serde_json::Value>) -> anyhow::Result<CacheSource> {
-    let opts = init_options
-        .map(serde_json::from_value::<InitializationOptions>)
-        .transpose()?
-        .unwrap_or_default();
+fn resolve_cache_source(init_options: Option<Value>) -> (CacheSource, Vec<String>) {
+    let Some(init_options) = init_options.filter(|value| !value.is_null()) else {
+        return (CacheSource::Embedded, vec![]);
+    };
+    let Value::Object(map) = init_options else {
+        return (
+            CacheSource::Embedded,
+            vec![
+                "Ignoring invalid initializationOptions: expected a JSON object with optional 'game_dir' or 'cache_file' paths; using bundled base-game API cache.".into(),
+            ],
+        );
+    };
 
-    let non_empty = |path: Option<PathBuf>| path.filter(|p| !p.as_os_str().is_empty());
+    let mut warnings = Vec::new();
+    for key in map.keys() {
+        match key.as_str() {
+            "game_dir" | "cache_file" => {}
+            "gameDir" => warnings.push(
+                "Unknown initialization option 'gameDir'; use 'game_dir' instead.".into(),
+            ),
+            "cacheFile" => warnings.push(
+                "Unknown initialization option 'cacheFile'; use 'cache_file' instead.".into(),
+            ),
+            other => warnings.push(format!(
+                "Unknown initialization option '{other}'; supported options are 'game_dir' and 'cache_file'."
+            )),
+        }
+    }
 
-    if let Some(cache_file) = non_empty(opts.cache_file) {
-        return Ok(CacheSource::File(cache_file));
+    let extract_path = |key: &str, warnings: &mut Vec<String>| -> Option<PathBuf> {
+        match map.get(key)? {
+            Value::Null => None,
+            Value::String(text) if text.is_empty() => None,
+            Value::String(text) => Some(PathBuf::from(text)),
+            _ => {
+                warnings.push(format!(
+                    "Ignoring invalid '{key}' in initializationOptions: expected a path string."
+                ));
+                None
+            }
+        }
+    };
+
+    let cache_file = extract_path("cache_file", &mut warnings);
+    let game_dir = extract_path("game_dir", &mut warnings);
+
+    if let Some(cache_file) = cache_file {
+        return (CacheSource::File(cache_file), warnings);
     }
-    if let Some(game_dir) = non_empty(opts.game_dir) {
-        return Ok(CacheSource::GameDir(game_dir));
+    if let Some(game_dir) = game_dir {
+        if game_dir == Path::new(PLACEHOLDER_GAME_DIR) {
+            warnings.push(format!(
+                "Configured 'game_dir' is still set to placeholder '{PLACEHOLDER_GAME_DIR}'; using bundled base-game API cache instead. Update 'game_dir' to your Cyberpunk 2077 installation root or leave it empty."
+            ));
+            return (CacheSource::Embedded, warnings);
+        }
+        return (CacheSource::GameDir(game_dir), warnings);
     }
-    Ok(CacheSource::Embedded)
+    (CacheSource::Embedded, warnings)
+}
+
+fn load_language_server(
+    dirs: &[PathBuf],
+    source: &CacheSource,
+    ctx: &LspContext,
+) -> anyhow::Result<RedscriptLanguageServer> {
+    match source {
+        CacheSource::File(cache) => {
+            ctx.logger().info(format!(
+                "Loading analysis cache={} workspace_folders={dirs:?}",
+                cache.display(),
+            ));
+            match RedscriptLanguageServer::new(cache, dirs) {
+                Ok(ls) => Ok(ls),
+                Err(err) => fallback_to_embedded(
+                    dirs,
+                    ctx,
+                    format!(
+                        "Failed to load configured cache_file '{}': {err:#}. Falling back to bundled base-game API cache.",
+                        cache.display()
+                    ),
+                    err,
+                ),
+            }
+        }
+        CacheSource::GameDir(game_dir) => match find_cache_file(game_dir) {
+            Ok(cache) => {
+                ctx.logger().info(format!(
+                    "Loading analysis game_dir={} cache={} workspace_folders={dirs:?}",
+                    game_dir.display(),
+                    cache.display(),
+                ));
+                match RedscriptLanguageServer::new(&cache, dirs) {
+                    Ok(ls) => Ok(ls),
+                    Err(err) => fallback_to_embedded(
+                        dirs,
+                        ctx,
+                        format!(
+                            "Failed to load script cache '{}' from game_dir '{}': {err:#}. Falling back to bundled base-game API cache.",
+                            cache.display(),
+                            game_dir.display()
+                        ),
+                        err,
+                    ),
+                }
+            }
+            Err(err) => fallback_to_embedded(
+                dirs,
+                ctx,
+                format!("{err}. Falling back to bundled base-game API cache."),
+                err,
+            ),
+        },
+        CacheSource::Embedded => {
+            ctx.logger().info(format!(
+                "Loading analysis from embedded cache workspace_folders={dirs:?}",
+            ));
+            RedscriptLanguageServer::embedded(dirs)
+                .context("failed to load analysis from embedded cache")
+        }
+    }
+}
+
+fn fallback_to_embedded(
+    dirs: &[PathBuf],
+    ctx: &LspContext,
+    warning: String,
+    original_error: anyhow::Error,
+) -> anyhow::Result<RedscriptLanguageServer> {
+    let embedded = RedscriptLanguageServer::embedded(dirs).map_err(|_| original_error)?;
+    ctx.logger().warn(&warning);
+    ctx.show_message(lsp::MessageType::WARNING, &warning);
+    Ok(embedded)
 }
 
 fn main() -> anyhow::Result<()> {
     LspServer::spawn(
         |opts, _ctx| {
-            let source = resolve_cache_source(opts.init_options)?;
-            Ok((opts.workspace_dirs, source))
+            let (source, warnings) = resolve_cache_source(opts.init_options);
+            Ok((opts.workspace_dirs, source, warnings))
         },
-        |(dirs, source), ctx| {
-            let ls = match source {
-                CacheSource::File(cache) => {
-                    ctx.logger().info(format!(
-                        "Loading analysis cache={} workspace_folders={dirs:?}",
-                        cache.display(),
-                    ));
-                    RedscriptLanguageServer::new(cache, dirs).with_context(|| {
-                        format!("failed to load analysis from {}", cache.display())
-                    })?
-                }
-                CacheSource::GameDir(game_dir) => {
-                    let cache = find_cache_file(game_dir)?;
-                    ctx.logger().info(format!(
-                        "Loading analysis game_dir={} cache={} workspace_folders={dirs:?}",
-                        game_dir.display(),
-                        cache.display(),
-                    ));
-                    RedscriptLanguageServer::new(&cache, dirs).with_context(|| {
-                        format!("failed to load analysis from {}", cache.display())
-                    })?
-                }
-                CacheSource::Embedded => {
-                    ctx.logger().info(format!(
-                        "Loading analysis from embedded cache workspace_folders={dirs:?}",
-                    ));
-                    RedscriptLanguageServer::embedded(dirs)
-                        .context("failed to load analysis from embedded cache")?
-                }
-            };
+        |(dirs, source, warnings), ctx| {
+            for warning in warnings {
+                ctx.logger().warn(warning);
+                ctx.show_message(lsp::MessageType::WARNING, warning);
+            }
+            let ls = load_language_server(dirs, source, ctx)?;
             ls.log_missing_roots(ctx);
             ls.publish_all_diagnostics(ctx)?;
             ctx.logger().info("Language server ready for requests");
@@ -130,46 +220,95 @@ mod tests {
 
     #[test]
     fn resolve_cache_source_falls_back_to_embedded_when_missing_or_empty() {
-        assert_eq!(resolve_cache_source(None).unwrap(), CacheSource::Embedded);
-        assert_eq!(
-            resolve_cache_source(Some(json!({}))).unwrap(),
-            CacheSource::Embedded
-        );
-        assert_eq!(
-            resolve_cache_source(Some(json!({ "game_dir": "" }))).unwrap(),
-            CacheSource::Embedded
-        );
-        assert_eq!(
-            resolve_cache_source(Some(json!({ "cache_file": "" }))).unwrap(),
-            CacheSource::Embedded
-        );
-        assert_eq!(
-            resolve_cache_source(Some(json!({ "game_dir": "", "cache_file": "" }))).unwrap(),
-            CacheSource::Embedded
-        );
+        for input in [
+            None,
+            Some(Value::Null),
+            Some(json!({})),
+            Some(json!({ "game_dir": "" })),
+            Some(json!({ "cache_file": "" })),
+            Some(json!({ "game_dir": "", "cache_file": "" })),
+        ] {
+            let (source, warnings) = resolve_cache_source(input);
+            assert_eq!(source, CacheSource::Embedded);
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
     }
 
     #[test]
     fn resolve_cache_source_prefers_cache_file_over_game_dir() {
         assert_eq!(
-            resolve_cache_source(Some(json!({ "game_dir": "/game" }))).unwrap(),
-            CacheSource::GameDir(PathBuf::from("/game"))
+            resolve_cache_source(Some(json!({ "game_dir": "/game" }))),
+            (CacheSource::GameDir(PathBuf::from("/game")), vec![])
         );
         assert_eq!(
             resolve_cache_source(Some(json!({
                 "game_dir": "/game",
                 "cache_file": "/custom/final.redscripts"
-            })))
-            .unwrap(),
-            CacheSource::File(PathBuf::from("/custom/final.redscripts"))
+            }))),
+            (
+                CacheSource::File(PathBuf::from("/custom/final.redscripts")),
+                vec![]
+            )
         );
         assert_eq!(
             resolve_cache_source(Some(json!({
                 "game_dir": "/game",
                 "cache_file": ""
-            })))
-            .unwrap(),
-            CacheSource::GameDir(PathBuf::from("/game"))
+            }))),
+            (CacheSource::GameDir(PathBuf::from("/game")), vec![])
         );
+    }
+
+    #[test]
+    fn resolve_cache_source_warns_on_typos_invalid_types_and_placeholders() {
+        let (source, warnings) = resolve_cache_source(Some(json!(["bad"])));
+        assert_eq!(source, CacheSource::Embedded);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("expected a JSON object"));
+
+        let (source, warnings) = resolve_cache_source(Some(json!({
+            "gameDir": "/game",
+            "cacheFile": "/cache",
+            "extra": true,
+            "game_dir": 123
+        })));
+        assert_eq!(source, CacheSource::Embedded);
+        assert!(warnings.iter().any(|w| w.contains("use 'game_dir'")));
+        assert!(warnings.iter().any(|w| w.contains("use 'cache_file'")));
+        assert!(warnings.iter().any(|w| w.contains("'extra'")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Ignoring invalid 'game_dir'"))
+        );
+
+        let (source, warnings) =
+            resolve_cache_source(Some(json!({ "game_dir": "/path/to/cyberpunk2077" })));
+        assert_eq!(source, CacheSource::Embedded);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("placeholder"));
+    }
+
+    #[test]
+    fn load_language_server_falls_back_to_embedded_when_configured_cache_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("corrupt.redscripts");
+        std::fs::write(&corrupt, b"not a valid bundle").unwrap();
+        for source in [
+            CacheSource::GameDir(dir.path().join("missing-game")),
+            CacheSource::File(corrupt),
+        ] {
+            let (sender, receiver) = crossbeam_channel::unbounded();
+            let ctx = LspContext::new(sender);
+            let _ls = load_language_server(&[dir.path().to_path_buf()], &source, &ctx).unwrap();
+            let messages: Vec<_> = receiver.try_iter().collect();
+            assert!(messages.iter().any(|msg| {
+                matches!(msg, lsp_server::Message::Notification(notif)
+                    if notif.method == "window/showMessage"
+                        && serde_json::from_value::<lsp::ShowMessageParams>(notif.params.clone())
+                            .is_ok_and(|p| p.typ == lsp::MessageType::WARNING
+                                && p.message.contains("Falling back to bundled base-game API cache")))
+            }));
+        }
     }
 }

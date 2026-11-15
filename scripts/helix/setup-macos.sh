@@ -90,8 +90,8 @@ if [ -n "$game_dir" ]; then
     game_dir=$(CDPATH= cd -- "$game_dir" && pwd)
     printf 'Found game directory: %s\n' "$game_dir"
 else
-    game_dir=/path/to/cyberpunk2077
-    printf 'Game not found. Set game_dir in %s, or rerun with REDSCRIPT_GAME_DIR pointing to the directory containing r6/cache.\n' "$languages_file" >&2
+    game_dir=
+    printf 'Game not found; using bundled base-game API cache. Set game_dir in %s to use a local or modded game cache, or rerun with REDSCRIPT_GAME_DIR pointing to the directory containing r6/cache.\n' "$languages_file" >&2
 fi
 
 if [ -f "$0" ] && [ -f "$(dirname -- "$0")/languages.toml" ]; then

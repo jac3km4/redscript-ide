@@ -88,7 +88,7 @@ if ($GameDir) {
 if ($GameDir) {
     Write-Host "Using Cyberpunk 2077 installation: $GameDir"
 } else {
-    Write-Warning "Cyberpunk 2077 was not found. Set game_dir in $languagesFile after setup, or rerun with REDSCRIPT_GAME_DIR set before installing."
+    Write-Warning "Cyberpunk 2077 was not found; the bundled base-game API cache will be used. Set game_dir in $languagesFile after setup to use a local or modded game cache, or rerun with REDSCRIPT_GAME_DIR set."
 }
 
 try {
@@ -105,6 +105,8 @@ try {
     if ($GameDir) {
         $gameToml = ConvertTo-Json -Compress ($GameDir.Replace('\', '/'))
         $languages = $languages.Replace('"/path/to/cyberpunk2077"', $gameToml)
+    } else {
+        $languages = $languages.Replace('"/path/to/cyberpunk2077"', '""')
     }
     $config = 'use-grammars = { only = ["redscript", "redmod"] }' + "`n" + $languages
     [System.IO.File]::WriteAllText("$work\helix\languages.toml", $config)
@@ -149,7 +151,7 @@ try {
     Write-Host "Installed REDscript and REDmod grammars and queries in $Runtime"
     Write-Host "Configuration appended to $languagesFile"
     Write-Host "Language server installed at $serverPath (no PATH changes needed)."
-    if (-not $GameDir) { Write-Warning 'Set game_dir in languages.toml before using the language server.' }
+    if (-not $GameDir) { Write-Host 'Using bundled base-game API cache; set game_dir in languages.toml if you want to load a local or modded game cache.' }
     Write-Host 'Restart Helix to load the configuration.'
 } finally {
     $env:APPDATA = $previousAppData
