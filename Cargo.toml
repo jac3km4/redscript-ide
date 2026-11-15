@@ -15,7 +15,7 @@ ropey = "1"
 crossbeam-channel = "0.5"
 mimalloc = { version = "0.1", features = ["v3"] }
 miniz_oxide = "0.8"
-lsp-server = "0.7"
+lsp-server = "0.10"
 lsp-types = "0.97"
 tempfile = "3"
 redscript-io = { git = "https://github.com/jac3km4/redscript", rev = "v1.0.1" }
