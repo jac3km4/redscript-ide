@@ -14,7 +14,7 @@ use lsp_types::{self as lsp};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::buffers::{Buffer, Buffers};
+use crate::buffers::{Buffer, Buffers, ChangeError};
 
 pub struct LspServer<'a> {
     connection: Connection,
@@ -536,25 +536,36 @@ impl LspServer<'_> {
             return Ok(None);
         }
         let current_version = self.buffers.get(&doc.uri).and_then(Buffer::version);
-        if self.buffers.change(&doc.uri, doc.version, content_changes) {
-            self.context.logger().info(format!(
-                "Document change uri={} version={}",
-                doc.uri.as_str(),
-                doc.version,
-            ));
-            Ok(Some(doc.uri))
-        } else {
-            self.context.logger().info(format!(
-                "Document change ignored ({}) uri={} version={} current_version={current_version:?}",
-                if current_version.is_some_and(|version| version >= doc.version) {
-                    "stale"
-                } else {
-                    "not open"
-                },
-                doc.uri.as_str(),
-                doc.version,
-            ));
-            Ok(None)
+        match self.buffers.try_change(&doc.uri, doc.version, content_changes) {
+            Ok(()) => {
+                self.context.logger().info(format!(
+                    "Document change uri={} version={}",
+                    doc.uri.as_str(),
+                    doc.version,
+                ));
+                Ok(Some(doc.uri))
+            }
+            Err(ChangeError::StaleVersion { .. } | ChangeError::NotOpen) => {
+                self.context.logger().info(format!(
+                    "Document change ignored ({}) uri={} version={} current_version={current_version:?}",
+                    if current_version.is_some_and(|version| version >= doc.version) {
+                        "stale"
+                    } else {
+                        "not open"
+                    },
+                    doc.uri.as_str(),
+                    doc.version,
+                ));
+                Ok(None)
+            }
+            Err(ChangeError::InvalidRange(range)) => {
+                self.context.logger().error(format!(
+                    "Document change rejected (invalid range {range:?}) uri={} version={} current_version={current_version:?}; reopen or save the document to resynchronize",
+                    doc.uri.as_str(),
+                    doc.version,
+                ));
+                Ok(None)
+            }
         }
     }
 
@@ -2178,6 +2189,32 @@ mod tests {
             .unwrap();
         assert_eq!(*events.borrow(), ["files:1"]);
         assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn invalid_incremental_change_logs_error_and_preserves_buffer() {
+        let (mut server, client) = memory_server();
+        let events = record_changes(&mut server);
+        let uri = "file:///C:/test.reds";
+        server
+            .handle(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidChangeTextDocument::METHOD.into(),
+                json!({
+                    "textDocument": { "uri": uri, "version": 2 },
+                    "contentChanges": [{
+                        "range": { "start": { "line": 5, "character": 0 }, "end": { "line": 5, "character": 1 } },
+                        "text": "broken"
+                    }]
+                }),
+            )))
+            .unwrap();
+        let log = receive_log(&client, lsp::MessageType::ERROR);
+        assert!(log.contains("Document change rejected (invalid range"), "{log}");
+        assert!(log.contains("reopen or save"), "{log}");
+        assert!(events.borrow().is_empty());
+        let buffer = server.buffers.get(&uri.parse().unwrap()).unwrap();
+        assert_eq!(buffer.contents().to_string(), "é😀test");
+        assert_eq!(buffer.version(), Some(1));
     }
 
     #[test]

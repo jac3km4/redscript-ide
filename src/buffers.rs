@@ -2,6 +2,13 @@ use hashbrown::HashMap;
 use lsp_types as lsp;
 use ropey::Rope;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeError {
+    NotOpen,
+    StaleVersion { current: i32 },
+    InvalidRange(lsp::Range),
+}
+
 #[derive(Debug, Default)]
 pub struct Buffers {
     map: HashMap<lsp::Uri, Buffer>,
@@ -19,27 +26,43 @@ impl Buffers {
         self.map.insert(url, buffer);
     }
 
+    #[cfg(test)]
     pub fn change(
         &mut self,
         url: &lsp::Uri,
         version: i32,
         changes: Vec<lsp::TextDocumentContentChangeEvent>,
     ) -> bool {
+        self.try_change(url, version, changes).is_ok()
+    }
+
+    pub fn try_change(
+        &mut self,
+        url: &lsp::Uri,
+        version: i32,
+        changes: Vec<lsp::TextDocumentContentChangeEvent>,
+    ) -> Result<(), ChangeError> {
         let Some(buffer) = self.map.get_mut(url) else {
-            return false;
+            return Err(ChangeError::NotOpen);
         };
-        if buffer.version.is_some_and(|current| current >= version) {
-            return false;
+        if let Some(current) = buffer.version
+            && current >= version
+        {
+            return Err(ChangeError::StaleVersion { current });
         }
+        let mut staged = buffer.clone();
         for change in changes {
             if let Some(range) = change.range {
-                buffer.update_range(range, change.text);
+                if !staged.update_range(range, change.text) {
+                    return Err(ChangeError::InvalidRange(range));
+                }
             } else {
-                buffer.contents = Rope::from_str(&change.text);
+                staged.contents = Rope::from_str(&change.text);
             }
         }
-        buffer.version = Some(version);
-        true
+        staged.version = Some(version);
+        *buffer = staged;
+        Ok(())
     }
 
     pub fn get(&self, url: &lsp::Uri) -> Option<&Buffer> {
@@ -47,7 +70,7 @@ impl Buffers {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Buffer {
     contents: Rope,
     version: Option<i32>,
@@ -61,20 +84,21 @@ impl Buffer {
         }
     }
 
-    pub fn update_range(&mut self, range: lsp::Range, text: String) {
+    pub fn update_range(&mut self, range: lsp::Range, text: String) -> bool {
         let Some(start) = self.get_pos(range.start.line, range.start.character) else {
-            return;
+            return false;
         };
         let Some(end) = self.get_pos(range.end.line, range.end.character) else {
-            return;
+            return false;
         };
         let start = self.contents.byte_to_char(start as usize);
         let end = self.contents.byte_to_char(end as usize);
         if start > end {
-            return;
+            return false;
         }
         self.contents.remove(start..end);
         self.contents.insert(start, &text);
+        true
     }
 
     pub fn get_pos(&self, line: u32, col: u32) -> Option<u32> {
@@ -127,10 +151,44 @@ mod tests {
         assert_eq!(buffer.get_pos(1, 3), Some(13));
         assert_eq!(buffer.get_pos(1, 2), None);
         assert_eq!(buffer.get_pos(5, 0), None);
-        buffer.update_range(
+        assert!(buffer.update_range(
             lsp::Range::new(lsp::Position::new(1, 3), lsp::Position::new(1, 8)),
             "fixed".into(),
-        );
+        ));
         assert_eq!(buffer.contents().to_string(), "first\r\né😀fixed");
+    }
+
+    #[test]
+    fn invalid_incremental_ranges_roll_back_entire_change_batch() {
+        let uri: lsp::Uri = "file:///test.reds".parse().unwrap();
+        let mut buffers = Buffers::default();
+        buffers.open(uri.clone(), "hello world".into(), 1);
+        let invalid_range = lsp::Range::new(lsp::Position::new(9, 0), lsp::Position::new(9, 1));
+        let inverted_range = lsp::Range::new(lsp::Position::new(0, 5), lsp::Position::new(0, 2));
+        for bad_range in [invalid_range, inverted_range] {
+            let result = buffers.try_change(
+                &uri,
+                2,
+                vec![
+                    lsp::TextDocumentContentChangeEvent {
+                        range: Some(lsp::Range::new(
+                            lsp::Position::new(0, 0),
+                            lsp::Position::new(0, 5),
+                        )),
+                        range_length: None,
+                        text: "mutated".into(),
+                    },
+                    lsp::TextDocumentContentChangeEvent {
+                        range: Some(bad_range),
+                        range_length: None,
+                        text: "bad".into(),
+                    },
+                ],
+            );
+            assert_eq!(result, Err(ChangeError::InvalidRange(bad_range)));
+            let buffer = buffers.get(&uri).unwrap();
+            assert_eq!(buffer.contents().to_string(), "hello world");
+            assert_eq!(buffer.version(), Some(1));
+        }
     }
 }
