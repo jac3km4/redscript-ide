@@ -6,33 +6,14 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-*"
 
+permissions:
+  contents: read
+
 jobs:
   prepare:
-    name: Build and upload a release artifact for ${{ matrix.name }}
-    uses: ./.github/workflows/build.yml
-    strategy:
-      matrix:
-        os:
-          - windows-latest
-          - macos-15
-          - macos-15-intel
-          - ubuntu-latest
-        include:
-          - os: windows-latest
-            name: Windows
-            triplet: x86_64-pc-windows-msvc
-          - os: macos-15
-            name: MacOS Silicon
-            triplet: aarch64-apple-darwin
-          - os: macos-15-intel
-            name: MacOS Intel
-            triplet: x86_64-apple-darwin
-          - os: ubuntu-latest
-            name: Linux
-            triplet: x86_64-unknown-linux-gnu
-    with:
-      os: ${{ matrix.os }}
-      triplet: ${{ matrix.triplet }}
+    name: Check and build release artifacts
+    uses: ./.github/workflows/ci.yml
+
   publish:
     name: Release artifacts
     needs: prepare
@@ -47,12 +28,13 @@ jobs:
           merge-multiple: true
       - env:
           GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           FLAGS=(--generate-notes)
-          ARTIFACTS=$(find ./artifacts -type f)
+          mapfile -t ARTIFACTS < <(find ./artifacts -type f)
 
-          if echo ${{ github.ref_name }} | grep -E 'v[0-9]+\.[0-9]+\.[0-9]+-.+'; then
+          if [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-.+ ]]; then
             FLAGS+=(--prerelease)
           fi
 
-          gh release create ${{ github.ref_name }} ${FLAGS[@]} $ARTIFACTS
+          gh release create "$TAG_NAME" "${FLAGS[@]}" "${ARTIFACTS[@]}"

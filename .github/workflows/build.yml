@@ -1,47 +1,50 @@
 on:
   workflow_call:
-    inputs:
-      os:
-        required: true
-        type: string
-      triplet:
-        required: true
-        type: string
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    runs-on: ${{ inputs.os }}
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+            triplet: x86_64-pc-windows-msvc
+            bin_name: redscript-ide.exe
+          - os: macos-15
+            name: MacOS Silicon
+            triplet: aarch64-apple-darwin
+            bin_name: redscript-ide-aarch64-apple-darwin
+          - os: macos-15-intel
+            name: MacOS Intel
+            triplet: x86_64-apple-darwin
+            bin_name: redscript-ide-x86_64-apple-darwin
+          - os: ubuntu-latest
+            name: Linux
+            triplet: x86_64-unknown-linux-gnu
+            bin_name: redscript-ide-x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
-
 
       - run: rustup toolchain install stable --profile minimal --no-self-update
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-${{ inputs.os }}
+          shared-key: release-${{ matrix.os }}
 
       - run: cargo +stable build --release --locked
 
       - name: Append system triplet to binary name
-        if: ${{ inputs.os != 'windows-latest' }}
-        run: mv ./target/release/redscript-ide ./target/release/redscript-ide-${{ inputs.triplet }}
+        if: ${{ matrix.bin_name != 'redscript-ide.exe' }}
+        run: mv ./target/release/redscript-ide ./target/release/${{ matrix.bin_name }}
 
       - uses: actions/upload-artifact@v4
-        name: Upload Windows artifact
-        if: ${{ inputs.os == 'windows-latest' }}
         with:
-          path: target/release/redscript-ide.exe
-          name: artifact-${{ inputs.os }}
-          if-no-files-found: error
-
-      - uses: actions/upload-artifact@v4
-        name: Upload non-Windows artifact
-        if: ${{ inputs.os != 'windows-latest' }}
-        with:
-          path: target/release/redscript-ide-${{ inputs.triplet }}
-          name: artifact-${{ inputs.os }}
+          name: artifact-${{ matrix.triplet }}
+          path: target/release/${{ matrix.bin_name }}
+          retention-days: 7
           if-no-files-found: error
