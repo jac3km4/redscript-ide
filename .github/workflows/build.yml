@@ -42,7 +42,7 @@ jobs:
         if: ${{ matrix.bin_name != 'redscript-ide.exe' }}
         run: mv ./target/release/redscript-ide ./target/release/${{ matrix.bin_name }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: artifact-${{ matrix.triplet }}
           path: target/release/${{ matrix.bin_name }}
