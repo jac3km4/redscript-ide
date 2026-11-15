@@ -74,9 +74,9 @@ impl LspServer<'_> {
         connection.initialize_finish(id, initialize_data)?;
 
         let server = create_server(&props, &context).inspect_err(|err| {
-            context
-                .logger()
-                .error(format!("Language server startup failed: {err:#}"));
+            let message = format!("Language server startup failed: {err:#}");
+            context.logger().error(&message);
+            context.show_message(lsp::MessageType::ERROR, message);
         })?;
         let mut this = LspServer {
             connection,
@@ -136,7 +136,9 @@ impl LspServer<'_> {
                         self.update_watchers()
                     })();
                     if let Err(err) = result {
-                        self.context.logger().error(err);
+                        let message = format!("{err:#}");
+                        self.context.logger().error(&message);
+                        self.context.show_message(lsp::MessageType::ERROR, message);
                     }
                 }
                 continue;
@@ -149,7 +151,9 @@ impl LspServer<'_> {
                 return Ok(());
             }
             if let Err(err) = self.handle(message) {
-                self.context.logger().error(err);
+                let message = format!("{err:#}");
+                self.context.logger().error(&message);
+                self.context.show_message(lsp::MessageType::ERROR, message);
             }
         }
         Ok(())
@@ -559,11 +563,13 @@ impl LspServer<'_> {
                 Ok(None)
             }
             Err(ChangeError::InvalidRange(range)) => {
-                self.context.logger().error(format!(
+                let message = format!(
                     "Document change rejected (invalid range {range:?}) uri={} version={} current_version={current_version:?}; reopen or save the document to resynchronize",
                     doc.uri.as_str(),
                     doc.version,
-                ));
+                );
+                self.context.logger().error(&message);
+                self.context.show_message(lsp::MessageType::ERROR, message);
                 Ok(None)
             }
         }
@@ -1775,6 +1781,20 @@ mod tests {
         params.message
     }
 
+    fn receive_show_message(client: &Connection, typ: lsp::MessageType) -> String {
+        let Message::Notification(notification) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+        else {
+            panic!("expected showMessage notification");
+        };
+        assert_eq!(notification.method, lsp::notification::ShowMessage::METHOD);
+        let params: lsp::ShowMessageParams = serde_json::from_value(notification.params).unwrap();
+        assert_eq!(params.typ, typ);
+        params.message
+    }
+
     fn record_changes(server: &mut LspServer<'_>) -> Rc<RefCell<Vec<String>>> {
         let events = Rc::new(RefCell::new(Vec::new()));
         server.server = Box::new(StubServer {
@@ -2237,6 +2257,9 @@ mod tests {
         let log = receive_log(&client, lsp::MessageType::ERROR);
         assert!(log.contains("Document change rejected (invalid range"), "{log}");
         assert!(log.contains("reopen or save"), "{log}");
+        let popup = receive_show_message(&client, lsp::MessageType::ERROR);
+        assert!(popup.contains("Document change rejected (invalid range"), "{popup}");
+        assert!(popup.contains("reopen or save"), "{popup}");
         assert!(events.borrow().is_empty());
         let buffer = server.buffers.get(&uri.parse().unwrap()).unwrap();
         assert_eq!(buffer.contents().to_string(), "é😀test");
