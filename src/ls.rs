@@ -639,7 +639,7 @@ impl RedscriptLanguageServer {
                         });
                     }
                 };
-                push(id.as_str(), kind, def.span(), None);
+                push(&id.as_str(), kind, def.span(), None);
                 if let TypeSchema::Aggregate(agg) = def.schema() {
                     for method in agg.methods().iter() {
                         push(
@@ -1444,7 +1444,7 @@ fn generate_fix<'ctx>(
         .or_else(|| private_import_code_edit(diag, diag_file, symbols))?;
     let target_name = match &code_edit {
         CodeEdit::FixStructNewConstructor(type_id, _) | CodeEdit::MakeTypePublic(type_id) => {
-            Some(type_id.simple_name().to_owned())
+            Some(type_id.simple_name().into_owned())
         }
         CodeEdit::MakeMethodPublic(method_id) => symbols
             .get_method(*method_id)
@@ -1542,7 +1542,7 @@ fn generate_ide_fix<'ctx>(
             let in_scope = if let Some(unit) = unit {
                 unit.scopes
                     .get(&span.file)
-                    .and_then(|scope| scope.get(base_name))
+                    .and_then(|scope| scope.get(&*base_name))
                     .is_some_and(|type_ref| type_ref.id() == Some(*type_id))
             } else {
                 type_id.as_str() == base_name
@@ -1575,7 +1575,7 @@ fn generate_ide_fix<'ctx>(
                 FixKind::QualifyBaseStaticMethod,
                 Some(format!("{base_name}.{name}")),
                 receiver_span,
-                base_name.to_owned(),
+                base_name.into_owned(),
             )
         }
         _ => return None,
@@ -3219,7 +3219,7 @@ mod tests {
             .patched_expr_at(
                 loc,
                 |at| {
-                    assert_eq!(at.type_().map(|typ| typ.as_str()), Some("Int32"));
+                    assert_eq!(at.type_().map(|typ| typ.as_str()).as_deref(), Some("Int32"));
                     Ok(())
                 },
                 &ctx,
