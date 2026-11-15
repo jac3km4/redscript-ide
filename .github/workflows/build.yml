@@ -28,7 +28,7 @@ jobs:
             triplet: x86_64-unknown-linux-gnu
             bin_name: redscript-ide-x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - run: rustup toolchain install stable --profile minimal --no-self-update
 
