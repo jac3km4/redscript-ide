@@ -214,9 +214,11 @@ impl LspServer<'_> {
                 let doc = self
                     .document_location(&params.text_document.uri, params.position)
                     .map_err(invalid_params)?;
-                response_value(self.server.hover(doc, &self.context).map(|mut hover| {
-                    self.context.adapt_hover(&mut hover);
-                    hover
+                response_value(self.server.hover(doc, &self.context).map(|hover| {
+                    hover.map(|mut hover| {
+                        self.context.adapt_hover(&mut hover);
+                        hover
+                    })
                 }))
             }
             lsp::request::Completion::METHOD => {
@@ -622,7 +624,7 @@ pub trait LanguageServer {
         removed: Vec<PathBuf>,
         ctx: &LspContext,
     ) -> anyhow::Result<()>;
-    fn hover(&self, doc: CodeLocation<'_>, ctx: &LspContext) -> anyhow::Result<lsp::Hover>;
+    fn hover(&self, doc: CodeLocation<'_>, ctx: &LspContext) -> anyhow::Result<Option<lsp::Hover>>;
     fn completion(
         &self,
         doc: CodeLocation<'_>,
@@ -1080,7 +1082,7 @@ mod tests {
 
     #[derive(Default)]
     struct StubServer {
-        hover: Option<lsp::Hover>,
+        hover: Option<Option<lsp::Hover>>,
         completion: Option<lsp::CompletionResponse>,
         document_symbols: Option<lsp::DocumentSymbolResponse>,
         allow_document_changes: bool,
@@ -1134,7 +1136,11 @@ mod tests {
             panic!("unexpected workspace change");
         }
 
-        fn hover(&self, doc: CodeLocation<'_>, _ctx: &LspContext) -> anyhow::Result<lsp::Hover> {
+        fn hover(
+            &self,
+            doc: CodeLocation<'_>,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<Option<lsp::Hover>> {
             if let Some(events) = &self.events {
                 events
                     .borrow_mut()
@@ -1404,7 +1410,7 @@ mod tests {
             };
             let (mut server, _client) = memory_server();
             server.server = Box::new(StubServer {
-                hover: Some(serde_json::from_value(hover.clone()).unwrap()),
+                hover: Some(Some(serde_json::from_value(hover.clone()).unwrap())),
                 completion: Some(serde_json::from_value(source.clone()).unwrap()),
                 ..Default::default()
             });
@@ -1901,34 +1907,36 @@ mod tests {
             (
                 0,
                 lsp::request::HoverRequest::METHOD,
-                json!(""),
+                None,
                 json!([]),
                 "hover=empty",
             ),
             (
                 1,
                 lsp::request::HoverRequest::METHOD,
-                json!({ "kind": "markdown", "value": "PRIVATE_HOVER" }),
+                Some(json!({ "kind": "markdown", "value": "PRIVATE_HOVER" })),
                 json!([]),
                 "hover=nonempty",
             ),
             (
                 2,
                 lsp::request::Completion::METHOD,
-                json!(""),
+                None,
                 json!([{ "label": "PRIVATE_COMPLETION" }]),
                 "completion_count=1",
             ),
             (
                 3,
                 lsp::request::Completion::METHOD,
-                json!(""),
+                None,
                 json!({ "isIncomplete": false, "items": [] }),
                 "completion_count=0",
             ),
         ] {
             server.server = Box::new(StubServer {
-                hover: Some(serde_json::from_value(json!({ "contents": hover_contents })).unwrap()),
+                hover: Some(hover_contents.map(|contents| {
+                    serde_json::from_value(json!({ "contents": contents })).unwrap()
+                })),
                 completion: Some(serde_json::from_value(completion).unwrap()),
                 ..Default::default()
             });
@@ -1970,7 +1978,10 @@ mod tests {
                 assert!(summary.contains(expected), "{summary}");
             }
             assert!(!summary.contains("PRIVATE"));
-            receive_response(&client, id);
+            let response = receive_response(&client, id);
+            if id == 0 {
+                assert_eq!(response.result, Some(Value::Null));
+            }
             assert!(client.receiver.try_recv().is_err());
         }
     }

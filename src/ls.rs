@@ -348,7 +348,11 @@ impl RedscriptLanguageServer {
         }
     }
 
-    fn hover_at(&self, loc: CodeLocation<'_>, ctx: &LspContext) -> anyhow::Result<lsp::Hover> {
+    fn hover_at(
+        &self,
+        loc: CodeLocation<'_>,
+        ctx: &LspContext,
+    ) -> anyhow::Result<Option<lsp::Hover>> {
         let requested_pos = loc.pos();
         self.expr_at(
             loc,
@@ -364,13 +368,16 @@ impl RedscriptLanguageServer {
                     value.len(),
                     span.map(|span| span.contains(requested_pos)),
                 ));
-                Ok(lsp::Hover {
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(lsp::Hover {
                     contents: lsp::HoverContents::Markup(lsp::MarkupContent {
                         kind: lsp::MarkupKind::Markdown,
                         value,
                     }),
                     range,
-                })
+                }))
             },
             ctx,
         )
@@ -1345,7 +1352,11 @@ impl LanguageServer for RedscriptLanguageServer {
         self.rebuild(ctx)
     }
 
-    fn hover(&self, loc: CodeLocation<'_>, _ctx: &LspContext) -> anyhow::Result<lsp_types::Hover> {
+    fn hover(
+        &self,
+        loc: CodeLocation<'_>,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<Option<lsp_types::Hover>> {
         self.hover_at(loc, _ctx)
     }
 
@@ -2021,7 +2032,7 @@ mod tests {
         let buffers = open(&mut server, &ctx, &path, "", 7);
         let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
         let loc = CodeLocation::new(Document::new(path, buffer), 0);
-        server.hover_at(loc.clone(), &ctx).unwrap();
+        assert!(server.hover_at(loc.clone(), &ctx).unwrap().is_none());
         server.completion_at(loc, &ctx).unwrap();
         let logs: Vec<lsp::LogMessageParams> = receiver
             .try_iter()
@@ -2080,7 +2091,7 @@ mod tests {
                 .compilation_cache
                 .with(|cache| &cache.analysis.unit as *const _ as usize);
             for _ in 0..2 {
-                let hover = server.hover_at(loc.clone(), &ctx).unwrap();
+                let hover = server.hover_at(loc.clone(), &ctx).unwrap().unwrap();
                 let lsp::HoverContents::Markup(contents) = hover.contents else {
                     panic!("expected markup hover");
                 };
@@ -2622,7 +2633,7 @@ mod tests {
                     .filter(|byte| *byte == b'\n')
                     .count() as u32
             );
-            let hover = server.hover_at(loc.clone(), &ctx).unwrap();
+            let hover = server.hover_at(loc.clone(), &ctx).unwrap().unwrap();
             let lsp::HoverContents::Markup(contents) = hover.contents else {
                 panic!("expected markup hover for {name}");
             };
