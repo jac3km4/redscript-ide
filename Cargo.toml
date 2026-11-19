@@ -33,7 +33,7 @@ publish = false
 
 [package]
 name = "redscript-ide"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 
 [dependencies]
