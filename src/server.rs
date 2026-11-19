@@ -349,19 +349,18 @@ impl LspServer<'_> {
                         ));
                     }
                 }
-                let result = self.dispatch(&request.method, request.params);
-                let (result, error) = match result {
+                let response_result = self.dispatch(&request.method, request.params);
+                match &response_result {
                     Ok(value) => {
                         if log_summary {
                             self.context.logger().info(format!(
                                 "Response method={} id={} {} elapsed_ms={:.3}",
                                 request.method,
                                 request.id,
-                                response_summary(&request.method, &value),
+                                response_summary(&request.method, value),
                                 started.elapsed().as_secs_f64() * 1000.0,
                             ));
                         }
-                        (Some(value), None)
                     }
                     Err(error) => {
                         self.context.logger().error(format!(
@@ -372,13 +371,11 @@ impl LspServer<'_> {
                             error.message,
                             started.elapsed().as_secs_f64() * 1000.0,
                         ));
-                        (None, Some(error))
                     }
-                };
+                }
                 self.connection.sender.send(Message::Response(Response {
                     id: request.id,
-                    result,
-                    error,
+                    response_result,
                 }))?;
             }
             Message::Notification(_) if self.shutdown => return Ok(()),
@@ -507,7 +504,7 @@ impl LspServer<'_> {
                 if response.id == RequestId::from("source-watchers".to_owned())
                     || response.id == RequestId::from("remove-source-watchers".to_owned()) =>
             {
-                if let Some(error) = response.error {
+                if let Err(error) = response.response_result {
                     self.context.logger().error(format!(
                         "Could not register source watchers: {}",
                         error.message
@@ -1769,7 +1766,6 @@ mod tests {
             }
         };
         assert_eq!(response.id, RequestId::from(id));
-        assert_ne!(response.result.is_some(), response.error.is_some());
         response
     }
 
@@ -2092,7 +2088,7 @@ mod tests {
             assert!(!summary.contains("PRIVATE"));
             let response = receive_response(&client, id);
             if id == 0 {
-                assert_eq!(response.result, Some(Value::Null));
+                assert_eq!(response.response_result.unwrap(), Value::Null);
             }
             assert!(client.receiver.try_recv().is_err());
         }
@@ -2394,7 +2390,9 @@ mod tests {
                 }
             }
             let log = receive_log(&client, lsp::MessageType::ERROR);
-            let error = receive_response(&client, id as i32).error.unwrap();
+            let error = receive_response(&client, id as i32)
+                .response_result
+                .unwrap_err();
             for expected in [
                 format!("method={method}"),
                 format!("id={id}"),
@@ -2407,12 +2405,16 @@ mod tests {
             assert!(!error.message.is_empty());
         }
         assert_eq!(
-            receive_response(&client, success_id).result,
-            Some(json!([]))
+            receive_response(&client, success_id)
+                .response_result
+                .unwrap(),
+            json!([])
         );
         assert_eq!(
-            receive_response(&client, success_id + 1).result,
-            Some(Value::Null)
+            receive_response(&client, success_id + 1)
+                .response_result
+                .unwrap(),
+            Value::Null
         );
         assert!(client.receiver.try_recv().is_err(), "duplicate response");
     }
@@ -2452,7 +2454,10 @@ mod tests {
         }
         send_exit(&client);
         server.run().unwrap();
-        assert_eq!(receive_response(&client, 0).result, Some(Value::Null));
+        assert_eq!(
+            receive_response(&client, 0).response_result.unwrap(),
+            Value::Null
+        );
         for id in 1..=3 {
             if id == 2 {
                 receive_log(&client, lsp::MessageType::INFO);
@@ -2461,7 +2466,10 @@ mod tests {
             assert!(log.contains(&format!("id={id}")));
             assert!(log.contains("code=-32600 message=Server is shut down"));
             assert_eq!(
-                receive_response(&client, id).error.unwrap().code,
+                receive_response(&client, id)
+                    .response_result
+                    .unwrap_err()
+                    .code,
                 ErrorCode::InvalidRequest as i32
             );
         }
