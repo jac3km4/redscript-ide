@@ -7,13 +7,30 @@
 //! there is exactly one place responsible for emitting `publishDiagnostics`
 //! and for clearing files that no longer have any diagnostics.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use lsp_types as lsp;
 use redscript_compiler_api::{Diagnostic, LowerError, ast};
 
 use crate::server::LspContext;
+
+/// A fully computed set of diagnostics ready to be applied to a
+/// [`DiagnosticTracker`].
+///
+/// Computation happens on the analysis worker thread, which has no access to
+/// the protocol thread's tracker or connection. Separating computation from
+/// publication lets the protocol thread reject batches produced for a state
+/// that has since been superseded, so stale results never mutate the tracker
+/// or reach the client.
+pub(crate) struct DiagnosticBatch {
+    pub(crate) compiler: BTreeMap<PathBuf, Vec<lsp::Diagnostic>>,
+    pub(crate) reads: BTreeMap<PathBuf, lsp::Diagnostic>,
+    pub(crate) configs: BTreeMap<PathBuf, lsp::Diagnostic>,
+    /// Overlay document versions captured at the analyzed snapshot, used as the
+    /// `version` field of each published notification.
+    pub(crate) versions: HashMap<PathBuf, i32>,
+}
 
 /// Tracks active diagnostics per file, split by their source, together with
 /// the files whose diagnostics are currently published.
@@ -113,6 +130,50 @@ impl DiagnosticTracker {
         }
         self.published = active;
         Ok(())
+    }
+
+    /// Applies a precomputed [`DiagnosticBatch`] and publishes the diff.
+    ///
+    /// This is the worker-thread-friendly entry point: the batch is produced
+    /// elsewhere and only committed here, so rejecting a stale batch leaves the
+    /// tracker untouched.
+    pub(crate) fn apply_and_flush(
+        &mut self,
+        batch: DiagnosticBatch,
+        ctx: &LspContext,
+    ) -> anyhow::Result<()> {
+        let DiagnosticBatch {
+            compiler,
+            reads,
+            configs,
+            versions,
+        } = batch;
+        self.set_compiler(compiler);
+        self.set_reads(reads);
+        self.set_configs(configs);
+        self.flush(ctx, |path| versions.get(path).copied())
+    }
+
+    /// Builds a [`DiagnosticBatch`] that carries the current source read and
+    /// configuration partitions together with freshly computed compiler
+    /// diagnostics and overlay `versions`.
+    ///
+    /// The analysis worker keeps its own tracker updated while rebuilding, so
+    /// snapshotting here captures the exact partitions that must be committed
+    /// atomically by [`apply_and_flush`] on the protocol thread.
+    ///
+    /// [`apply_and_flush`]: DiagnosticTracker::apply_and_flush
+    pub(crate) fn snapshot(
+        &self,
+        compiler: BTreeMap<PathBuf, Vec<lsp::Diagnostic>>,
+        versions: HashMap<PathBuf, i32>,
+    ) -> DiagnosticBatch {
+        DiagnosticBatch {
+            compiler,
+            reads: self.reads.clone(),
+            configs: self.configs.clone(),
+            versions,
+        }
     }
 
     /// Whether `path` currently has published diagnostics.

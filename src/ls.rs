@@ -18,7 +18,7 @@ use crate::code_actions::{Fix, FixMap, FixRequest, FixScope, generate_fix};
 use crate::completions::{
     generate_completions, member_completion_range, repair_completion_terminator,
 };
-use crate::diagnostics::{DiagnosticTracker, diagnostic_tags, location, range};
+use crate::diagnostics::{DiagnosticBatch, DiagnosticTracker, diagnostic_tags, location, range};
 use crate::dialect::{self, Dialect};
 use crate::query::ExprAt;
 use crate::server::{CodeLocation, Document, LanguageServer, LspContext};
@@ -335,7 +335,28 @@ impl RedscriptLanguageServer {
     }
 
     pub fn publish_all_diagnostics(&mut self, ctx: &LspContext) -> anyhow::Result<()> {
-        let mut batch = CompilerDiagnostics {
+        if let Some(batch) = self.collect_diagnostic_batch(ctx, || false)? {
+            self.diagnostics.apply_and_flush(batch, ctx)?;
+        }
+        Ok(())
+    }
+
+    /// Computes every diagnostic the server would publish without mutating the
+    /// client-visible publication state.
+    ///
+    /// `should_abort` is consulted between expensive phases so a superseded
+    /// computation can stop early and return `Ok(None)`; in that case the
+    /// quick-fix cache is still refreshed for whatever was analyzed, but no
+    /// batch is produced and nothing is published.
+    pub(crate) fn collect_diagnostic_batch(
+        &mut self,
+        ctx: &LspContext,
+        should_abort: impl Fn() -> bool,
+    ) -> anyhow::Result<Option<DiagnosticBatch>> {
+        if should_abort() {
+            return Ok(None);
+        }
+        let mut collected = CompilerDiagnostics {
             by_file: BTreeMap::new(),
             fixes: std::mem::take(&mut self.cached_fixes),
         };
@@ -345,10 +366,14 @@ impl RedscriptLanguageServer {
                 diagnostics,
                 symbols,
                 sources,
-                &mut batch,
+                &mut collected,
                 ctx,
             )
         })?;
+        if should_abort() {
+            self.cached_fixes = collected.fixes;
+            return Ok(None);
+        }
         for cache in self.standalone.values() {
             cache.analyze(|unit, symbols, diagnostics, sources| {
                 self.collect_compiler_diagnostics(
@@ -356,17 +381,22 @@ impl RedscriptLanguageServer {
                     diagnostics,
                     symbols,
                     sources,
-                    &mut batch,
+                    &mut collected,
                     ctx,
                 )
             })?;
+            if should_abort() {
+                self.cached_fixes = collected.fixes;
+                return Ok(None);
+            }
         }
-        self.cached_fixes = batch.fixes;
-        self.diagnostics.set_compiler(batch.by_file);
-        let overlays = &self.overlays;
-        self.diagnostics.flush(ctx, |path| {
-            overlays.get(path).map(|overlay| overlay.version)
-        })
+        self.cached_fixes = collected.fixes;
+        let versions = self
+            .overlays
+            .iter()
+            .map(|(path, overlay)| (path.clone(), overlay.version))
+            .collect();
+        Ok(Some(self.diagnostics.snapshot(collected.by_file, versions)))
     }
 
     fn resolve_file(&self, path: &Path) -> FileResolution<'_> {
@@ -1313,10 +1343,10 @@ impl LanguageServer for RedscriptLanguageServer {
         self.rebuild(ctx)
     }
 
-    fn check(&mut self, path: PathBuf, ctx: &LspContext) -> anyhow::Result<()> {
+    fn check(&mut self, path: PathBuf, ctx: &LspContext) -> anyhow::Result<Option<DiagnosticBatch>> {
         if path.file_name().is_some_and(|name| name == ".redscript") {
             self.files_changed(vec![path], ctx)?;
-            return self.publish_all_diagnostics(ctx);
+            return self.collect_diagnostic_batch(ctx, || false);
         }
 
         let path = dialect::identity(&path);
@@ -1327,7 +1357,7 @@ impl LanguageServer for RedscriptLanguageServer {
             self.standalone_paths.insert(path);
         }
         self.rebuild(ctx)?;
-        self.publish_all_diagnostics(ctx)
+        self.collect_diagnostic_batch(ctx, || false)
     }
 
     fn change_workspace_folders(
@@ -1462,6 +1492,14 @@ mod tests {
             .document_changed(path.to_owned(), buffers.get(&uri), ctx)
             .unwrap();
         buffers
+    }
+
+    /// Runs a save exactly as the protocol thread does: the server computes a
+    /// batch off the loop and the loop commits it, publishing the diff.
+    fn check_and_publish(server: &mut RedscriptLanguageServer, path: PathBuf, ctx: &LspContext) {
+        if let Some(batch) = server.check(path, ctx).unwrap() {
+            server.diagnostics.apply_and_flush(batch, ctx).unwrap();
+        }
     }
 
     #[test]
@@ -1649,6 +1687,42 @@ mod tests {
     }
 
     #[test]
+    fn collect_diagnostic_batch_returns_a_batch_without_publishing() {
+        let (temp, _server, ctx, receiver) = fixture();
+        let path = temp.path().join("broken.reds");
+        fs::write(&path, "public class {").unwrap();
+        let mut server =
+            RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
+        server.log_missing_roots(&ctx);
+
+        let batch = server.collect_diagnostic_batch(&ctx, || false).unwrap().unwrap();
+        assert!(batch.compiler.contains_key(&dialect::identity(&path)));
+
+        // Neither the produced batch nor an aborted collection may publish.
+        let published = |receiver: &crossbeam_channel::Receiver<lsp_server::Message>| {
+            receiver
+                .try_iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        lsp_server::Message::Notification(notification)
+                            if notification.method == "textDocument/publishDiagnostics"
+                    )
+                })
+                .count()
+        };
+        assert_eq!(published(&receiver), 0);
+
+        assert!(
+            server
+                .collect_diagnostic_batch(&ctx, || true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(published(&receiver), 0);
+    }
+
+    #[test]
     fn member_results_are_reused_only_for_prefix_changes() {
         let (temp, mut server, ctx, _receiver) = fixture();
         let path = temp.path().join("completion.reds");
@@ -1724,7 +1798,7 @@ mod tests {
             let _buffers = open(&mut server, &ctx, &path, "class {", 1);
             assert!(publications().is_empty());
 
-            server.check(path.clone(), &ctx).unwrap();
+            check_and_publish(&mut server, path.clone(), &ctx);
             let saved = publications();
             assert_eq!(saved.len(), 1);
             assert_eq!(saved[0].uri, ctx.uri(&path).unwrap());
@@ -1737,21 +1811,21 @@ mod tests {
             assert!(publications().is_empty());
             assert!(server.diagnostics.is_published(&dialect::identity(&path)));
 
-            server.check(path.clone(), &ctx).unwrap();
+            check_and_publish(&mut server, path.clone(), &ctx);
             let saved = publications();
             assert_eq!(saved.len(), 1);
             assert_eq!(saved[0].version, Some(2));
             assert!(saved[0].diagnostics.is_empty());
 
             let _buffers = open(&mut server, &ctx, &path, "class {", 3);
-            server.check(path.clone(), &ctx).unwrap();
+            check_and_publish(&mut server, path.clone(), &ctx);
             assert!(!publications()[0].diagnostics.is_empty());
             server.document_changed(path.clone(), None, &ctx).unwrap();
             server
                 .change_workspace_folders(vec![], vec![], &ctx)
                 .unwrap();
             assert!(publications().is_empty());
-            server.check(path, &ctx).unwrap();
+            check_and_publish(&mut server, path, &ctx);
             assert!(publications()[0].diagnostics.is_empty());
         }
     }
@@ -2010,7 +2084,7 @@ mod tests {
         let external = tempdir();
         let standalone = external.path().join("solo.script");
         fs::write(&standalone, "class Standalone {}").unwrap();
-        server.check(standalone.clone(), &ctx).unwrap();
+        check_and_publish(&mut server, standalone.clone(), &ctx);
         assert_eq!(server.compilation_cache.borrow_file_ids().len(), 2);
         assert_eq!(
             server.standalone[&dialect::identity(&standalone)]
@@ -2019,7 +2093,7 @@ mod tests {
             1
         );
         let _buffers = open(&mut server, &ctx, &redmod, "class {", 6);
-        server.check(redmod.clone(), &ctx).unwrap();
+        check_and_publish(&mut server, redmod.clone(), &ctx);
         let params: Vec<lsp::PublishDiagnosticsParams> = receiver
             .try_iter()
             .filter_map(|message| {
@@ -2169,7 +2243,7 @@ mod tests {
         receiver.try_iter().for_each(drop);
         let text = "// é😀\r\nclass User { function Test() { var value : ; } }";
         let _buffers = open(&mut server, &ctx, &path, text, 3);
-        server.check(path.clone(), &ctx).unwrap();
+        check_and_publish(&mut server, path.clone(), &ctx);
         let params: Vec<lsp::PublishDiagnosticsParams> = receiver
             .try_iter()
             .filter_map(|message| {
@@ -2318,7 +2392,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        server.check(path.clone(), &ctx).unwrap();
+        check_and_publish(&mut server, path.clone(), &ctx);
         let publications: Vec<lsp::PublishDiagnosticsParams> = receiver
             .try_iter()
             .filter_map(|message| {
@@ -2608,7 +2682,7 @@ mod tests {
             }),
             initially_missing
         );
-        server.check(standalone.clone(), &ctx).unwrap();
+        check_and_publish(&mut server, standalone.clone(), &ctx);
         let initial: Vec<lsp::PublishDiagnosticsParams> = startup
             .into_iter()
             .chain(receiver.try_iter())
@@ -2665,7 +2739,7 @@ mod tests {
             matches!(message, lsp_server::Message::Notification(notification)
                 if notification.method == "textDocument/publishDiagnostics")
         }));
-        server.check(healthy.clone(), &ctx).unwrap();
+        check_and_publish(&mut server, healthy.clone(), &ctx);
         let publications: Vec<lsp::PublishDiagnosticsParams> = receiver
             .try_iter()
             .filter_map(|message| {
@@ -2695,7 +2769,7 @@ mod tests {
         for path in [&healthy, &standalone] {
             let _buffer = open(&mut server, &ctx, path, "class {", 7);
         }
-        server.check(healthy.clone(), &ctx).unwrap();
+        check_and_publish(&mut server, healthy.clone(), &ctx);
         let publications: Vec<lsp::PublishDiagnosticsParams> = receiver
             .try_iter()
             .filter_map(|message| {
@@ -4324,7 +4398,7 @@ mod tests {
             ),
         )
         .unwrap();
-        server.check(dotfile.clone(), &ctx).unwrap();
+        check_and_publish(&mut server, dotfile.clone(), &ctx);
         let fixed_messages: Vec<_> = receiver.try_iter().collect();
         assert!(fixed_messages.iter().any(|msg| {
             matches!(msg, lsp_server::Message::Notification(notif)
@@ -4355,7 +4429,7 @@ mod tests {
 
         // Breaking .redscript mid-session preserves the previous valid roots while reporting the error.
         fs::write(&dotfile, "source_roots = 123\n").unwrap();
-        server.check(dotfile, &ctx).unwrap();
+        check_and_publish(&mut server, dotfile, &ctx);
         server
             .check_workspace(|_, symbols, _, _| {
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "ExternalType"));
@@ -4428,7 +4502,7 @@ mod tests {
 
         // Re-saving as valid UTF-8 with a syntax error replaces INVALID_UTF8 with SYNTAX_ERR cleanly.
         fs::write(&bad_utf8, "public class {").unwrap();
-        server.check(bad_utf8.clone(), &ctx).unwrap();
+        check_and_publish(&mut server, bad_utf8.clone(), &ctx);
         let bad_pubs: Vec<lsp::PublishDiagnosticsParams> = receiver
             .try_iter()
             .filter_map(|msg| match msg {
@@ -4450,7 +4524,7 @@ mod tests {
 
         // Fixing the file clears diagnostics and exposes its symbols.
         fs::write(&bad_utf8, "public class Recovered {}").unwrap();
-        server.check(bad_utf8, &ctx).unwrap();
+        check_and_publish(&mut server, bad_utf8, &ctx);
         let cleared: Vec<lsp::PublishDiagnosticsParams> = receiver
             .try_iter()
             .filter_map(|msg| match msg {
@@ -4485,7 +4559,7 @@ mod tests {
             "class Example { var first, second: Int32 = 1; }",
             1,
         );
-        server.check(path.clone(), &ctx).unwrap();
+        check_and_publish(&mut server, path.clone(), &ctx);
         let uri = ctx.uri(&dialect::identity(&path)).unwrap();
         let published: Vec<lsp::PublishDiagnosticsParams> = receiver
             .try_iter()
@@ -4532,7 +4606,7 @@ mod tests {
         .unwrap();
         let caller_source = "import Other.*\nfunc Use(v: ref<Vault>) -> Int32 {\n  v.Secret();\n  let r = new Record(1);\n  v.first;\n  v.second;\n  return r.x;\n}\n";
         fs::write(&caller, caller_source).unwrap();
-        server.check(caller.clone(), &ctx).unwrap();
+        check_and_publish(&mut server, caller.clone(), &ctx);
 
         let caller_uri = ctx.uri(&dialect::identity(&caller)).unwrap();
         let published = receiver
@@ -4618,7 +4692,7 @@ mod tests {
         let caller_source = "import Other.{Hidden, Base, Child}\nfunc Use() -> Int32 {\n  let _n = NameOf(Child);\n  return Child.Create();\n}\n";
         fs::write(&owner, owner_source).unwrap();
         fs::write(&caller, caller_source).unwrap();
-        server.check(caller.clone(), &ctx).unwrap();
+        check_and_publish(&mut server, caller.clone(), &ctx);
 
         let actions = literal_actions(
             server

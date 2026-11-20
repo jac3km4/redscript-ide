@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::buffers::{Buffer, Buffers, ChangeError};
+use crate::diagnostics::DiagnosticBatch;
 
 pub struct LspServer<'a> {
     connection: Connection,
@@ -687,7 +688,11 @@ pub trait LanguageServer: Send {
         Ok(())
     }
     fn files_changed(&mut self, paths: Vec<PathBuf>, ctx: &LspContext) -> anyhow::Result<()>;
-    fn check(&mut self, path: PathBuf, ctx: &LspContext) -> anyhow::Result<()>;
+    fn check(
+        &mut self,
+        path: PathBuf,
+        ctx: &LspContext,
+    ) -> anyhow::Result<Option<DiagnosticBatch>>;
     fn change_workspace_folders(
         &mut self,
         added: Vec<PathBuf>,
@@ -1234,12 +1239,12 @@ mod tests {
             Ok(())
         }
 
-        fn check(&mut self, _path: PathBuf, _ctx: &LspContext) -> anyhow::Result<()> {
+        fn check(&mut self, _path: PathBuf, _ctx: &LspContext) -> anyhow::Result<Option<DiagnosticBatch>> {
             assert!(self.allow_document_changes, "unexpected check");
             if let Some(events) = &self.events {
                 events.lock().unwrap().push("save".into());
             }
-            Ok(())
+            Ok(None)
         }
 
         fn change_workspace_folders(
