@@ -123,7 +123,6 @@ enum WorkerRequest {
 /// travels through this channel in protocol order.
 enum WorkerCmd {
     DocumentsChanged {
-        state_rev: u64,
         documents: Vec<(PathBuf, Option<Buffer>)>,
     },
     FilesChanged {
@@ -621,12 +620,7 @@ impl LspServer<'_> {
                         .store(self.state_rev, Ordering::Release);
                     self.startup_edited = true;
                     let documents = self.owned_documents(&pending);
-                    cmd_tx
-                        .send(WorkerCmd::DocumentsChanged {
-                            state_rev: self.state_rev,
-                            documents,
-                        })
-                        .ok();
+                    cmd_tx.send(WorkerCmd::DocumentsChanged { documents }).ok();
                 }
             }
             lsp::notification::DidOpenTextDocument::METHOD => {
@@ -652,12 +646,7 @@ impl LspServer<'_> {
                 self.latest_state_rev
                     .store(self.state_rev, Ordering::Release);
                 let documents = vec![(path, self.buffers.get(&uri).cloned())];
-                cmd_tx
-                    .send(WorkerCmd::DocumentsChanged {
-                        state_rev: self.state_rev,
-                        documents,
-                    })
-                    .ok();
+                cmd_tx.send(WorkerCmd::DocumentsChanged { documents }).ok();
             }
             lsp::notification::DidCloseTextDocument::METHOD => {
                 let lsp::DidCloseTextDocumentParams { text_document: doc } =
@@ -681,7 +670,6 @@ impl LspServer<'_> {
                     .store(self.state_rev, Ordering::Release);
                 cmd_tx
                     .send(WorkerCmd::DocumentsChanged {
-                        state_rev: self.state_rev,
                         documents: vec![(path, None)],
                     })
                     .ok();
@@ -702,6 +690,9 @@ impl LspServer<'_> {
                     doc.uri.as_str(),
                     self.buffers.get(&doc.uri).and_then(Buffer::version),
                 ));
+                // Resolve the path before advancing revisions so a malformed
+                // URI cannot request a check that is never queued.
+                let path = path_from_uri(&doc.uri)?;
                 self.diag_rev += 1;
                 self.latest_diag_rev.store(self.diag_rev, Ordering::Release);
                 self.startup_edited = true;
@@ -709,7 +700,7 @@ impl LspServer<'_> {
                     .send(WorkerCmd::Check {
                         state_rev: self.state_rev,
                         diag_rev: self.diag_rev,
-                        path: path_from_uri(&doc.uri)?,
+                        path,
                     })
                     .ok();
             }
@@ -1656,20 +1647,15 @@ fn worker_main<'a>(
             },
         };
         match cmd {
-            WorkerCmd::DocumentsChanged {
-                mut state_rev,
-                mut documents,
-            } => {
+            WorkerCmd::DocumentsChanged { mut documents, .. } => {
                 // The protocol thread coalesces edits already buffered in the
                 // connection, but edits arriving while the worker is busy enqueue
                 // separate commands. Merge them so a burst triggers one rebuild.
                 while let Ok(next) = cmd_rx.try_recv() {
                     match next {
                         WorkerCmd::DocumentsChanged {
-                            state_rev: next_rev,
-                            documents: more,
+                            documents: more, ..
                         } => {
-                            state_rev = next_rev;
                             documents.extend(more);
                         }
                         // The protocol thread already answered the cancellation.
@@ -1687,7 +1673,8 @@ fn worker_main<'a>(
                 if let Err(err) = server.documents_changed(&borrowed, &context) {
                     event_tx.send(WorkerEvent::Error(format!("{err:#}"))).ok();
                 }
-                publish_roots(state_rev, &*server, &event_tx);
+                // Overlays never change the watched roots, so unlike the other
+                // state commands this one does not re-publish them.
             }
             WorkerCmd::FilesChanged { state_rev, paths } => {
                 if let Err(err) = server.files_changed(paths, &context) {
@@ -3337,8 +3324,7 @@ mod tests {
             [
                 "change:éAC!est:Some(3)",
                 "change:second:Some(2)",
-                // The whole batch produces a single watcher refresh.
-                "watchers",
+                // Edits only change overlays, never the watched roots.
             ]
         );
         for version in [2, 2, 3] {

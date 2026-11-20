@@ -661,6 +661,7 @@ impl RedscriptLanguageServer {
         doc: Document<'_>,
         _ctx: &LspContext,
     ) -> anyhow::Result<lsp::DocumentSymbolResponse> {
+        cancelled()?;
         Ok(lsp::DocumentSymbolResponse::Nested(
             document_symbols::document_symbols(doc.path(), doc.buffer().contents().to_string()),
         ))
