@@ -304,6 +304,9 @@ pub(crate) fn generate_completions(
         let symbols = at.symbols();
         let envs = ReceiverTypeEnvs::new(typ, symbols);
 
+        // A receiver can expose hundreds of inherited members; let a cancelled
+        // request stop formatting them instead of blocking newer work.
+        crate::ls::cancelled()?;
         let methods = symbols
             .query_methods(typ.id())
             .filter(|m| !m.func().flags().is_static())
@@ -318,6 +321,7 @@ pub(crate) fn generate_completions(
             });
         completions.extend(methods);
 
+        crate::ls::cancelled()?;
         let fields = symbols
             .base_iter_with_self(typ.id())
             .flat_map(|(declaring_type, agg)| {

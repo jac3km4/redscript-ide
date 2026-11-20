@@ -316,21 +316,39 @@ fn specialize_function_type_with_env<'ctx>(
     declaring_env: &[(&'ctx str, PolyType<'ctx>)],
     symbols: &Symbols<'ctx>,
 ) -> Option<SpecializedFunctionType<'ctx>> {
-    let mut env = declaring_env.to_vec();
+    // A non-generic declaration at a call site without explicit type arguments
+    // has nothing to substitute; its members are already concrete. Skipping the
+    // environment entirely keeps the common case allocation free.
+    if declaring_env.is_empty() && call_type_args.is_empty() {
+        return None;
+    }
     // A method's own type parameters shadow the declaring type's parameters.
-    env.retain(|(name, _)| !func_type.type_vars().any(|var| var == *name));
-    env.extend(
-        func_type
-            .type_vars()
-            .zip(call_type_args.iter())
-            .map(|(name, typ)| (name, PolyType::from_type(typ))),
-    );
+    let shadowed: Vec<&str> = func_type.type_vars().collect();
+    let env = declaring_env
+        .iter()
+        .filter(|(name, _)| !shadowed.contains(name))
+        .map(|(name, poly)| (*name, poly.clone()))
+        .chain(
+            func_type
+                .type_vars()
+                .zip(call_type_args.iter())
+                .map(|(name, typ)| (name, PolyType::from_type(typ))),
+        )
+        .collect();
+    // Reuse one environment across every parameter and the return type instead
+    // of rebuilding it per substitution.
+    let substitute = |typ: &Type<'ctx>| -> Option<Type<'ctx>> {
+        PolyType::from_type_with_env(typ, &env)
+            .ok()?
+            .coalesce(symbols)
+            .ok()
+    };
     let params = func_type
         .params()
         .iter()
-        .map(|param| substitute(param.type_(), &env, symbols))
+        .map(|param| substitute(param.type_()))
         .collect::<Option<Vec<_>>>()?;
-    let return_type = substitute(func_type.return_type(), &env, symbols)?;
+    let return_type = substitute(func_type.return_type())?;
     Some(SpecializedFunctionType {
         params,
         return_type,
@@ -390,6 +408,11 @@ impl<'ctx, 'a> ReceiverTypeEnvs<'ctx, 'a> {
         field_type: &Type<'ctx>,
     ) -> Option<Type<'ctx>> {
         let env = self.env(declaring_type)?;
+        // A non-generic declaring type contributes nothing; the declared field
+        // type is already concrete.
+        if env.is_empty() {
+            return None;
+        }
         substitute(field_type, &env, self.symbols)
     }
 }
@@ -401,6 +424,13 @@ fn receiver_type_env<'ctx>(
     declaring_type: TypeId<'ctx>,
     symbols: &Symbols<'ctx>,
 ) -> Option<ReceiverEnv<'ctx>> {
+    let declaring = symbols.get_type(declaring_type)?;
+    // A declaring type without type parameters has an empty environment, so
+    // there is nothing to map onto its members. This is the overwhelmingly
+    // common case and it avoids walking the receiver's base chain per member.
+    if declaring.vars().next().is_none() {
+        return Some(Vec::new());
+    }
     let mut current = receiver.clone();
     for _ in 0..MAX_BASE_DEPTH {
         let def = symbols.get_type(current.id())?;

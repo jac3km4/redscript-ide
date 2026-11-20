@@ -151,14 +151,45 @@ pub(crate) struct AnalyzedSources<'ctx> {
     pub(crate) diagnostics: Vec<Diagnostic<'ctx>>,
 }
 
+/// Narrows the work a [`CompilationCache`] performs when its analysis is first
+/// forced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnalysisMode {
+    /// Full lowering plus the diagnostic passes; required when the snapshot's
+    /// diagnostics are read.
+    Diagnostics,
+    /// Lowering only. Speculative query snapshots never read diagnostics, so the
+    /// `UnusedLocals` pass (which visits every function in the workspace) is
+    /// skipped.
+    Query,
+}
+
+impl AnalysisMode {
+    fn run_diagnostics(self) -> bool {
+        matches!(self, Self::Diagnostics)
+    }
+}
+
 impl<'ctx> AnalyzedSources<'ctx> {
     fn deferred(
+        bytes: &'ctx [u8],
         sources: &'ctx ast::SourceMap,
-        symbols: Symbols<'ctx>,
         interner: &'ctx TypeInterner,
+        mode: AnalysisMode,
     ) -> DeferredAnalysis<'ctx> {
+        // Loading the base-game bundle and interning its ~30k symbols is only
+        // paid when this snapshot is actually analyzed. Snapshots that are
+        // replaced by a newer edit before they are forced stay free.
         LazyLock::new(Box::new(move || {
-            Self::new(dialect::parse(sources), symbols, interner)
+            let bundle = ScriptBundle::from_bytes(bytes)
+                .expect("cache bytes were validated before analysis");
+            let symbols = CompilationInputs::load_without_mapping(
+                &bundle,
+                interner,
+                &TypeFlagRegistry::default(),
+            )
+            .expect("cache bytes were validated before analysis");
+            Self::new(dialect::parse(sources), symbols, interner, mode)
         }))
     }
 
@@ -166,16 +197,37 @@ impl<'ctx> AnalyzedSources<'ctx> {
         parsed: ParsedSources<'ctx>,
         symbols: Symbols<'ctx>,
         interner: &'ctx TypeInterner,
+        mode: AnalysisMode,
     ) -> Self {
         let mut reporter = CompileErrorReporter::default();
         let (unit, symbols) = parsed.process(symbols, &mut reporter, interner);
-        unit.run_diagnostics(DIAGNOSTIC_PASSES, &mut reporter);
+        if mode.run_diagnostics() {
+            unit.run_diagnostics(DIAGNOSTIC_PASSES, &mut reporter);
+        }
         Self {
             parsed,
             unit,
             symbols,
             diagnostics: reporter.into_reported(),
         }
+    }
+}
+
+impl CompilationCache {
+    /// Decodes the cache and interns its symbols once, discarding the result.
+    ///
+    /// [`CompilationCache::from_sources`] defers that work so a snapshot that is
+    /// never analyzed stays cheap, but a corrupt configured cache must still be
+    /// detected when the language server starts. Callers validate once per byte
+    /// source, then rely on every later snapshot failing the same way.
+    pub(crate) fn validate_cache_bytes(bytes: &[u8]) -> anyhow::Result<()> {
+        let bundle = ScriptBundle::from_bytes(bytes)?;
+        CompilationInputs::load_without_mapping(
+            &bundle,
+            &TypeInterner::default(),
+            &TypeFlagRegistry::default(),
+        )?;
+        Ok(())
     }
 }
 
@@ -213,6 +265,17 @@ impl CompilationCache {
         sources: ast::SourceMap,
         interner: TypeInterner,
     ) -> anyhow::Result<Self> {
+        Self::from_sources_with(cache_bytes, sources, interner, AnalysisMode::Diagnostics)
+    }
+
+    /// Like [`CompilationCache::from_sources`], choosing whether the snapshot
+    /// runs the diagnostic passes. Query snapshots use [`AnalysisMode::Query`].
+    pub(crate) fn from_sources_with(
+        cache_bytes: CacheBytes,
+        sources: ast::SourceMap,
+        interner: TypeInterner,
+        mode: AnalysisMode,
+    ) -> anyhow::Result<Self> {
         let file_ids = sources
             .files()
             .map(|(id, file)| (file.path().to_owned(), id))
@@ -224,14 +287,8 @@ impl CompilationCache {
             interner,
             sources,
             file_ids,
-            |bytes, interner, sources| {
-                let bundle = ScriptBundle::from_bytes(bytes)?;
-                let symbols = CompilationInputs::load_without_mapping(
-                    &bundle,
-                    interner,
-                    &TypeFlagRegistry::default(),
-                )?;
-                Ok(AnalyzedSources::deferred(sources, symbols, interner))
+            move |bytes, interner, sources| {
+                Ok(AnalyzedSources::deferred(&bytes[..], sources, interner, mode))
             },
         )
     }
@@ -253,6 +310,7 @@ impl Default for CompilationCache {
                         },
                         Symbols::with_default_types(),
                         interner,
+                        AnalysisMode::Diagnostics,
                     )
                 }))
             },
@@ -273,5 +331,45 @@ mod tests {
     fn compilation_cache_and_analysis_are_send_and_sync() {
         assert_send_sync::<CompilationCache>();
         assert_send_sync::<AnalyzedSources<'static>>();
+    }
+
+    /// Building a snapshot must not deserialize the cache; validating the bytes
+    /// is the only eager step, so a corrupt configured cache is still reported
+    /// at startup while an unforced snapshot stays free.
+    #[test]
+    fn cache_loading_is_deferred_but_validation_is_eager() {
+        let corrupt: Vec<u8> = vec![0, 1, 2, 3];
+        let snapshot = CompilationCache::from_sources(
+            CacheBytes::Owned(Arc::from(corrupt.clone())),
+            ast::SourceMap::new(),
+            TypeInterner::default(),
+        );
+        assert!(snapshot.is_ok());
+        assert!(CompilationCache::validate_cache_bytes(&corrupt).is_err());
+        let valid = ScriptBundle::default().into_writeable().to_bytes().unwrap();
+        assert!(CompilationCache::validate_cache_bytes(&valid).is_ok());
+    }
+
+    /// Speculative query snapshots never read diagnostics, so they skip the
+    /// `UnusedLocals` pass that full snapshots run.
+    #[test]
+    fn query_mode_skips_diagnostic_passes() {
+        let bytes = ScriptBundle::default().into_writeable().to_bytes().unwrap();
+        let report = |mode| {
+            let sources = ast::SourceMap::new();
+            sources.push_back("unused.reds", "public func Test() -> Void { let unused = 1; }");
+            let cache = CompilationCache::from_sources_with(
+                CacheBytes::Owned(Arc::from(bytes.clone())),
+                sources,
+                TypeInterner::default(),
+                mode,
+            )
+            .unwrap();
+            cache
+                .analyze(|_, _, diagnostics, _| Ok(diagnostics.len()))
+                .unwrap()
+        };
+        assert!(report(AnalysisMode::Diagnostics) > 0);
+        assert_eq!(report(AnalysisMode::Query), 0);
     }
 }

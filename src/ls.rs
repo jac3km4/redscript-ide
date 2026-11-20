@@ -13,7 +13,7 @@ use redscript_compiler_api::{
     Diagnostic, LoweredCompilationUnit, Symbols, TypeInterner, TypeSchema, ast,
 };
 
-use crate::analysis::{CacheBytes, CompilationCache};
+use crate::analysis::{AnalysisMode, CacheBytes, CompilationCache};
 use crate::code_actions::{Fix, FixMap, FixRequest, FixScope, generate_fix};
 use crate::completions::{
     generate_completions, member_completion_range, repair_completion_terminator,
@@ -39,7 +39,7 @@ const REDMOD_SUBSET_DOCS_URL: &str =
 /// Query entry points call this so a `$/cancelRequest` that arrives before the
 /// expensive analysis phase aborts the work instead of computing a result the
 /// worker would discard anyway.
-fn cancelled() -> anyhow::Result<()> {
+pub(crate) fn cancelled() -> anyhow::Result<()> {
     if crate::server::is_cancelled() {
         anyhow::bail!("request cancelled");
     }
@@ -129,6 +129,10 @@ impl RedscriptLanguageServer {
         let mut diagnostics = DiagnosticTracker::default();
         diagnostics.set_reads(read_diagnostics);
         diagnostics.set_configs(config_diagnostics);
+        // Loading the deferred snapshot now checks the configured cache once, so
+        // a corrupt file is reported at startup (and `main` can fall back to the
+        // embedded cache) instead of on the first analysis.
+        CompilationCache::validate_cache_bytes(&cache_bytes)?;
         Ok(Self {
             compilation_cache: CompilationCache::from_sources(
                 cache_bytes,
@@ -1280,10 +1284,11 @@ impl RedscriptLanguageServer {
 
         let id = sources.push_back(&path, contents);
         cancelled()?;
-        let query_cache = CompilationCache::from_sources(
+        let query_cache = CompilationCache::from_sources_with(
             base.borrow_cache_bytes().clone(),
             sources,
             TypeInterner::default(),
+            AnalysisMode::Query,
         )?;
         cancelled()?;
         query_cache.query_at(id, loc.pos(), cb, ctx)
@@ -3249,6 +3254,35 @@ mod tests {
                 .expect("value completion");
             assert_eq!(value.detail.as_deref(), Some(expected), "{receiver}");
         }
+    }
+
+    #[test]
+    fn member_completions_specialize_non_generic_subclass_of_generic_base() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let path = temp.path().join("generic_base.reds");
+        let text = "public class Box<T> { public let value: T; public func Get() -> T { return this.value; } } public class IntBox extends Box<Int32> {} public func Test(box: IntBox) { box.; }";
+        let buffers = open(&mut server, &ctx, &path, text, 1);
+        let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+        let pos = (text.rfind("box.").unwrap() + "box.".len()) as u32;
+        let response = server
+            .completion_at(
+                CodeLocation::new(Document::new(path.clone(), buffer), pos),
+                &ctx,
+            )
+            .unwrap();
+        let lsp::CompletionResponse::Array(items) = &*response else {
+            panic!("expected completion items");
+        };
+        let value = items
+            .iter()
+            .find(|item| item.label == "value")
+            .expect("value completion");
+        assert_eq!(value.detail.as_deref(), Some(": Int32"), "{:?}", value.detail);
+        let get = items
+            .iter()
+            .find(|item| item.label == "Get")
+            .expect("Get completion");
+        assert_eq!(get.detail.as_deref(), Some("() -> Int32"), "{:?}", get.detail);
     }
 
     #[test]
