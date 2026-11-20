@@ -16,8 +16,9 @@ Prioritized follow-ups from the LSP/code review. Keep fixes focused and add regr
 - Negotiate remaining client-dependent response features (for example, workspace edit document
   changes and disabled code actions).
 - Preserve generic specialization in full hover/completion signatures. Receiver-bound instance
-  methods and static methods with derivable type arguments are specialized; static-method
-  completions and generic field completion types still fall back to the declared signature.
+  methods, static methods with derivable type arguments, and generic field types are
+  specialized; static-method completions without derivable type arguments still fall back to
+  the declared signature.
 
 ## Architecture and quality
 

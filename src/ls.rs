@@ -3102,6 +3102,32 @@ mod tests {
     }
 
     #[test]
+    fn member_completions_specialize_generic_receiver_fields() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let path = temp.path().join("generic_fields.reds");
+        let text = "public class Box<T> { public let value: T; } public class Derived<T> extends Box<array<T>> {} public func Test(box: Box<Int32>, derived: Derived<Int32>) { box.; derived.; }";
+        let buffers = open(&mut server, &ctx, &path, text, 1);
+        let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+        for (receiver, expected) in [("box.", ": Int32"), ("derived.", ": array<Int32>")] {
+            let pos = (text.rfind(receiver).unwrap() + receiver.len()) as u32;
+            let response = server
+                .completion_at(
+                    CodeLocation::new(Document::new(path.clone(), buffer), pos),
+                    &ctx,
+                )
+                .unwrap();
+            let lsp::CompletionResponse::Array(items) = &*response else {
+                panic!("expected completion items");
+            };
+            let value = items
+                .iter()
+                .find(|item| item.label == "value")
+                .expect("value completion");
+            assert_eq!(value.detail.as_deref(), Some(expected), "{receiver}");
+        }
+    }
+
+    #[test]
     fn local_and_field_bindings_shadow_type_names_in_hover_and_definition() {
         let (temp, mut server, ctx, _receiver) = fixture();
         let path = temp.path().join("shadow.script");

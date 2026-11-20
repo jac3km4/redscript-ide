@@ -6,7 +6,7 @@ use redscript_compiler_api::{Field, FunctionType, PolyType, Symbols, TypeId, Typ
 
 use crate::dialect::Dialect;
 use crate::display::{DocDisplay, FunctionTypeDisplay, SnippetDisplay};
-use crate::query::{AtContext, ExprAt, specialize_function_type};
+use crate::query::{AtContext, ExprAt, specialize_field_type, specialize_function_type};
 
 pub fn method<'ctx>(
     name: &'ctx str,
@@ -116,8 +116,17 @@ pub fn array_method<'ctx>(
     ))
 }
 
-pub fn field(name: &str, field: &Field<'_>) -> lsp_types::CompletionItem {
-    let detail = format!(": {}", field.type_());
+/// Present a field with its declared type instantiated at the receiver when the
+/// specialization is available.
+pub fn field(
+    name: &str,
+    field: &Field<'_>,
+    specialized: Option<&Type<'_>>,
+) -> lsp_types::CompletionItem {
+    let detail = match specialized {
+        Some(typ) => format!(": {typ}"),
+        None => format!(": {}", field.type_()),
+    };
     lsp::CompletionItem {
         label: name.to_owned(),
         label_details: Some(lsp::CompletionItemLabelDetails {
@@ -257,8 +266,9 @@ pub(crate) fn generate_completions(
 
     if let Some(typ) = at.type_()
         && matches!(at.context(), Some(AtContext::Expr))
+        && let Some(def) = at.symbols().get_type(typ)
     {
-        match at.symbols()[typ].schema() {
+        match def.schema() {
             TypeSchema::Aggregate(_) => {
                 let methods = at
                     .symbols()
@@ -308,11 +318,22 @@ pub(crate) fn generate_completions(
             });
         completions.extend(methods);
 
-        let fields = at
-            .symbols()
-            .base_iter_with_self(typ.id())
-            .flat_map(|(_, agg)| agg.fields().iter())
-            .map(|e| field(e.name(), e.field()));
+        let symbols = at.symbols();
+        let receiver = &typ;
+        let fields =
+            symbols
+                .base_iter_with_self(typ.id())
+                .flat_map(move |(declaring_type, agg)| {
+                    agg.fields().iter().map(move |e| {
+                        let specialized = specialize_field_type(
+                            declaring_type,
+                            e.field().type_(),
+                            receiver,
+                            symbols,
+                        );
+                        field(e.name(), e.field(), specialized.as_ref())
+                    })
+                });
         completions.extend(fields);
     };
 

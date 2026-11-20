@@ -321,6 +321,22 @@ pub fn specialize_function_type<'ctx>(
     })
 }
 
+/// Instantiate a field's declared type in the rigid type environment of a
+/// receiver type, walking generic bases when the field is inherited.
+///
+/// Returns `None` when the receiver cannot be related to the declaring type or
+/// a type argument cannot be resolved, so callers can fall back to the declared
+/// field type.
+pub fn specialize_field_type<'ctx>(
+    declaring_type: TypeId<'ctx>,
+    field_type: &Type<'ctx>,
+    receiver: &TypeApp<'ctx>,
+    symbols: &Symbols<'ctx>,
+) -> Option<Type<'ctx>> {
+    let env = receiver_type_env(receiver, declaring_type, symbols)?;
+    substitute(field_type, &env, symbols)
+}
+
 /// Map `declaring_type`'s parameters onto the concrete arguments supplied by
 /// `receiver`, walking the base chain when the receiver is a subtype.
 fn receiver_type_env<'ctx>(
