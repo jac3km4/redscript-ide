@@ -1,12 +1,12 @@
 use std::ops::Range;
 
 use lsp_types as lsp;
-use redscript_compiler_api::types::{Type, TypeApp, predef};
+use redscript_compiler_api::types::{Type, predef};
 use redscript_compiler_api::{Field, FunctionType, PolyType, Symbols, TypeId, TypeSchema, ast, ir};
 
 use crate::dialect::Dialect;
 use crate::display::{DocDisplay, FunctionTypeDisplay, SnippetDisplay};
-use crate::query::{AtContext, ExprAt, specialize_field_type, specialize_function_type};
+use crate::query::{AtContext, ExprAt, ReceiverTypeEnvs};
 
 pub fn method<'ctx>(
     name: &'ctx str,
@@ -24,12 +24,11 @@ pub fn method<'ctx>(
 pub fn instance_method<'ctx>(
     name: &'ctx str,
     declaring_type: TypeId<'ctx>,
-    receiver: &TypeApp<'ctx>,
     typ: &FunctionType<'ctx>,
-    symbols: &Symbols<'ctx>,
+    envs: &ReceiverTypeEnvs<'ctx, '_>,
     doc: &[&'ctx str],
 ) -> lsp_types::CompletionItem {
-    let specialized = specialize_function_type(declaring_type, typ, receiver, &[], symbols);
+    let specialized = envs.function_type(declaring_type, typ, &[]);
     let detail = FunctionTypeDisplay::maybe_specialized(typ, specialized.as_ref()).to_string();
     let snippet_display = SnippetDisplay::new(name, typ).to_string();
     method_with_signature(name, detail, snippet_display, doc)
@@ -302,38 +301,32 @@ pub(crate) fn generate_completions(
             );
         }
 
-        let methods = at
-            .symbols()
+        let symbols = at.symbols();
+        let envs = ReceiverTypeEnvs::new(typ, symbols);
+
+        let methods = symbols
             .query_methods(typ.id())
             .filter(|m| !m.func().flags().is_static())
             .map(|e| {
                 instance_method(
                     e.name(),
                     e.key().parent(),
-                    typ,
                     e.func().type_(),
-                    at.symbols(),
+                    &envs,
                     e.func().doc(),
                 )
             });
         completions.extend(methods);
 
-        let symbols = at.symbols();
-        let receiver = &typ;
-        let fields =
-            symbols
-                .base_iter_with_self(typ.id())
-                .flat_map(move |(declaring_type, agg)| {
-                    agg.fields().iter().map(move |e| {
-                        let specialized = specialize_field_type(
-                            declaring_type,
-                            e.field().type_(),
-                            receiver,
-                            symbols,
-                        );
-                        field(e.name(), e.field(), specialized.as_ref())
-                    })
-                });
+        let fields = symbols
+            .base_iter_with_self(typ.id())
+            .flat_map(|(declaring_type, agg)| {
+                let envs = &envs;
+                agg.fields().iter().map(move |e| {
+                    let specialized = envs.field_type(declaring_type, e.field().type_());
+                    field(e.name(), e.field(), specialized.as_ref())
+                })
+            });
         completions.extend(fields);
     };
 

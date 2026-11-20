@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt::Display;
 
 use redscript_compiler_api::ast::{SourceMap, Span};
@@ -302,7 +304,19 @@ pub fn specialize_function_type<'ctx>(
     call_type_args: &[Type<'ctx>],
     symbols: &Symbols<'ctx>,
 ) -> Option<SpecializedFunctionType<'ctx>> {
-    let mut env = receiver_type_env(receiver, declaring_type, symbols)?;
+    let env = receiver_type_env(receiver, declaring_type, symbols)?;
+    specialize_function_type_with_env(func_type, call_type_args, &env, symbols)
+}
+
+/// Instantiate a declared [`FunctionType`] using an already resolved receiver
+/// environment, as supplied by [`ReceiverTypeEnvs`].
+fn specialize_function_type_with_env<'ctx>(
+    func_type: &FunctionType<'ctx>,
+    call_type_args: &[Type<'ctx>],
+    declaring_env: &[(&'ctx str, PolyType<'ctx>)],
+    symbols: &Symbols<'ctx>,
+) -> Option<SpecializedFunctionType<'ctx>> {
+    let mut env = declaring_env.to_vec();
     // A method's own type parameters shadow the declaring type's parameters.
     env.retain(|(name, _)| !func_type.type_vars().any(|var| var == *name));
     env.extend(
@@ -323,20 +337,61 @@ pub fn specialize_function_type<'ctx>(
     })
 }
 
-/// Instantiate a field's declared type in the rigid type environment of a
-/// receiver type, walking generic bases when the field is inherited.
+/// Receiver arguments for one declaring type, keyed by parameter name.
+type ReceiverEnv<'ctx> = Vec<(&'ctx str, PolyType<'ctx>)>;
+
+/// Memoizes receiver environments for one receiver type.
 ///
-/// Returns `None` when the receiver cannot be related to the declaring type or
-/// a type argument cannot be resolved, so callers can fall back to the declared
-/// field type.
-pub fn specialize_field_type<'ctx>(
-    declaring_type: TypeId<'ctx>,
-    field_type: &Type<'ctx>,
-    receiver: &TypeApp<'ctx>,
-    symbols: &Symbols<'ctx>,
-) -> Option<Type<'ctx>> {
-    let env = receiver_type_env(receiver, declaring_type, symbols)?;
-    substitute(field_type, &env, symbols)
+/// Completions specialize every visible field and method; without a cache each
+/// member re-walks the generic base chain to map its declaring type's
+/// parameters onto the receiver's arguments.
+pub struct ReceiverTypeEnvs<'ctx, 'a> {
+    receiver: &'a TypeApp<'ctx>,
+    symbols: &'a Symbols<'ctx>,
+    envs: RefCell<HashMap<TypeId<'ctx>, Option<ReceiverEnv<'ctx>>>>,
+}
+
+impl<'ctx, 'a> ReceiverTypeEnvs<'ctx, 'a> {
+    pub fn new(receiver: &'a TypeApp<'ctx>, symbols: &'a Symbols<'ctx>) -> Self {
+        Self {
+            receiver,
+            symbols,
+            envs: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn env(&self, declaring_type: TypeId<'ctx>) -> Option<ReceiverEnv<'ctx>> {
+        self.envs
+            .borrow_mut()
+            .entry(declaring_type)
+            .or_insert_with(|| receiver_type_env(self.receiver, declaring_type, self.symbols))
+            .clone()
+    }
+
+    /// Instantiate a method declaration at the cached receiver.
+    pub fn function_type(
+        &self,
+        declaring_type: TypeId<'ctx>,
+        func_type: &FunctionType<'ctx>,
+        call_type_args: &[Type<'ctx>],
+    ) -> Option<SpecializedFunctionType<'ctx>> {
+        specialize_function_type_with_env(
+            func_type,
+            call_type_args,
+            &self.env(declaring_type)?,
+            self.symbols,
+        )
+    }
+
+    /// Instantiate a field declaration at the cached receiver.
+    pub fn field_type(
+        &self,
+        declaring_type: TypeId<'ctx>,
+        field_type: &Type<'ctx>,
+    ) -> Option<Type<'ctx>> {
+        let env = self.env(declaring_type)?;
+        substitute(field_type, &env, self.symbols)
+    }
 }
 
 /// Map `declaring_type`'s parameters onto the concrete arguments supplied by
@@ -345,7 +400,7 @@ fn receiver_type_env<'ctx>(
     receiver: &TypeApp<'ctx>,
     declaring_type: TypeId<'ctx>,
     symbols: &Symbols<'ctx>,
-) -> Option<Vec<(&'ctx str, PolyType<'ctx>)>> {
+) -> Option<ReceiverEnv<'ctx>> {
     let mut current = receiver.clone();
     for _ in 0..MAX_BASE_DEPTH {
         let def = symbols.get_type(current.id())?;
