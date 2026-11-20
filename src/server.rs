@@ -304,6 +304,13 @@ pub struct LspServer<'a> {
     /// Monotonic revision of save-triggered checks, independent of `state_rev`
     /// so back-to-back saves only publish the latest batch.
     diag_rev: u64,
+    /// The most recent saved file whose check has not yet been published. A
+    /// save check can be superseded by a non-edit state change (for example a
+    /// `.redscript` or dependency watcher event) while it is in flight; unlike
+    /// startup diagnostics it has no other trigger, so the protocol thread
+    /// retries it at the current revision. Cleared on a successful publication
+    /// and on any unsaved edit, which must keep the in-flight check rejected.
+    pending_check: Option<PathBuf>,
     latest_state_rev: Arc<AtomicU64>,
     latest_diag_rev: Arc<AtomicU64>,
     /// Authoritative diagnostic publication state, owned by the protocol
@@ -379,6 +386,7 @@ impl LspServer<'_> {
             in_flight: HashMap::new(),
             state_rev: 0,
             diag_rev: 0,
+            pending_check: None,
             latest_state_rev: Arc::new(AtomicU64::new(0)),
             latest_diag_rev: Arc::new(AtomicU64::new(0)),
             diagnostics: DiagnosticTracker::default(),
@@ -413,6 +421,7 @@ impl LspServer<'_> {
                 in_flight: HashMap::new(),
                 state_rev: 0,
                 diag_rev: 0,
+                pending_check: None,
                 latest_state_rev: Arc::new(AtomicU64::new(0)),
                 latest_diag_rev: Arc::new(AtomicU64::new(0)),
                 diagnostics: DiagnosticTracker::default(),
@@ -652,6 +661,9 @@ impl LspServer<'_> {
                     self.latest_state_rev
                         .store(self.state_rev, Ordering::Release);
                     self.startup_edited = true;
+                    // An unsaved edit supersedes any pending save check: the
+                    // resulting batch must stay rejected until the next save.
+                    self.pending_check = None;
                     let documents = self.owned_documents(&pending);
                     cmd_tx.send(WorkerCmd::DocumentsChanged { documents }).ok();
                 }
@@ -729,6 +741,7 @@ impl LspServer<'_> {
                 self.diag_rev += 1;
                 self.latest_diag_rev.store(self.diag_rev, Ordering::Release);
                 self.startup_edited = true;
+                self.pending_check = Some(path.clone());
                 cmd_tx
                     .send(WorkerCmd::Check {
                         state_rev: self.state_rev,
@@ -744,6 +757,7 @@ impl LspServer<'_> {
                     .changes
                     .into_iter()
                     .filter(|event| is_file_uri(&event.uri))
+                    .filter(|event| !self.is_redundant_watcher_event(event))
                     .map(|event| path_from_uri(&event.uri))
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 if !paths.is_empty() {
@@ -883,6 +897,9 @@ impl LspServer<'_> {
                 match batch {
                     Some(batch) if current => {
                         self.startup_pending = false;
+                        if !is_startup {
+                            self.pending_check = None;
+                        }
                         self.diagnostics.apply_and_flush(batch, &self.context)?;
                         return Ok(());
                     }
@@ -916,6 +933,25 @@ impl LspServer<'_> {
                         })
                         .ok();
                 }
+                // A save check can be superseded by a non-edit state change (for
+                // example a `.redscript` or dependency watcher event) while it is
+                // in flight. Unlike startup diagnostics nothing else recomputes
+                // it, so retry at the current revision. An unsaved edit clears
+                // `pending_check`, and a newer save advances `diag_rev`; either
+                // way this cannot loop.
+                if !is_startup
+                    && diag_rev == self.diag_rev
+                    && let Some(path) = self.pending_check.clone()
+                    && let Some(cmd_tx) = cmd_tx
+                {
+                    cmd_tx
+                        .send(WorkerCmd::Check {
+                            state_rev: self.state_rev,
+                            diag_rev: self.diag_rev,
+                            path,
+                        })
+                        .ok();
+                }
             }
             WorkerEvent::WatchRoots { state_rev, roots } => {
                 if state_rev == self.state_rev {
@@ -945,6 +981,27 @@ impl LspServer<'_> {
                 .logger()
                 .info(format!("Received an unexpected response: {}", response.id));
         }
+    }
+
+    /// Whether a watched-file event cannot alter the analyzed sources.
+    ///
+    /// Open buffers always override on-disk content, so a `CHANGED` or
+    /// `CREATED` event for a source file that is currently open is a no-op for
+    /// the analysis `SourceMap`. Dropping it avoids a spurious `state_rev` bump
+    /// (which would reject an in-flight save check) and a redundant full
+    /// workspace rebuild. `.redscript` files are always read from disk, and a
+    /// deletion may drop a file that is still open, so both are always kept.
+    fn is_redundant_watcher_event(&self, event: &lsp::FileEvent) -> bool {
+        if event.typ == lsp::FileChangeType::DELETED {
+            return false;
+        }
+        let Ok(path) = path_from_uri(&event.uri) else {
+            return false;
+        };
+        if path.file_name().is_some_and(|name| name == ".redscript") {
+            return false;
+        }
+        self.buffers.get(&event.uri).is_some()
     }
 
     fn owned_document(&self, uri: &lsp::Uri) -> anyhow::Result<OwnedDocument> {
@@ -2634,6 +2691,7 @@ mod tests {
                 in_flight: HashMap::new(),
                 state_rev: 0,
                 diag_rev: 0,
+                pending_check: None,
                 latest_state_rev: Arc::new(AtomicU64::new(0)),
                 latest_diag_rev: Arc::new(AtomicU64::new(0)),
                 diagnostics: DiagnosticTracker::default(),
@@ -4280,7 +4338,7 @@ mod tests {
                 return Ok(None);
             }
             self.events.lock().unwrap().push("check:end".into());
-            Ok(self.check_batch.take())
+            Ok(self.check_batch.clone())
         }
 
         fn change_workspace_folders(
@@ -4817,6 +4875,103 @@ mod tests {
     }
 
     #[test]
+    fn save_check_superseded_by_watcher_event_is_retried() {
+        let (mut server, client) = memory_server();
+        let path = PathBuf::from("C:/test.reds");
+        let batch = DiagnosticBatch {
+            compiler: BTreeMap::from([(
+                path.clone(),
+                vec![lsp::Diagnostic {
+                    range: lsp::Range::default(),
+                    message: "retried".into(),
+                    ..Default::default()
+                }],
+            )]),
+            reads: BTreeMap::new(),
+            configs: BTreeMap::new(),
+            versions: HashMap::from([(path.clone(), 1)]),
+        };
+        let (entered, release, events) = blocking_server(&mut server, Some(batch));
+        let uri = "file:///C:/test.reds";
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidSaveTextDocument::METHOD.into(),
+                json!({ "textDocument": { "uri": uri } }),
+            )))
+            .unwrap();
+        let handle = std::thread::spawn(move || server.run());
+
+        // The save check is in flight; a `.redscript` watcher event bumps
+        // `state_rev` without touching `diag_rev`, so it must be retried.
+        entered.wait();
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidChangeWatchedFiles::METHOD.into(),
+                json!({ "changes": [{ "uri": "file:///C:/ws/.redscript", "type": 2 }] }),
+            )))
+            .unwrap();
+        // The protocol thread handles messages in order, so once it logs this
+        // unknown cancellation the watcher event above has advanced the state.
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::Cancel::METHOD.into(),
+                json!({ "id": 999 }),
+            )))
+            .unwrap();
+        loop {
+            let log = receive_log(&client, lsp::MessageType::INFO);
+            if log.contains("Cancellation received id=999") {
+                break;
+            }
+        }
+        release.wait();
+        // The superseded batch is rejected, then retried at the new revision.
+        entered.wait();
+        release.wait();
+        queue_shutdown(&client);
+        handle.join().unwrap().unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.iter().filter(|event| *event == "check:end").count(),
+            2,
+            "{events:?}"
+        );
+        let published = publish_notifications(&client.receiver);
+        assert_eq!(published.len(), 1, "{published:?}");
+        assert_eq!(published[0].diagnostics[0].message, "retried");
+    }
+
+    #[test]
+    fn watcher_events_for_open_sources_are_ignored_but_config_and_deletes_are_kept() {
+        let (mut server, client) = memory_server();
+        let events = record_changes(&mut server);
+        let open = "file:///C:/test.reds";
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidChangeWatchedFiles::METHOD.into(),
+                json!({ "changes": [
+                    // Open source files already override on-disk content.
+                    { "uri": open, "type": 2 },
+                    { "uri": open, "type": 1 },
+                    // A closed source file, the workspace config, and a
+                    // deletion of an open file all still refresh the workspace.
+                    { "uri": "file:///C:/closed.reds", "type": 2 },
+                    { "uri": "file:///C:/ws/.redscript", "type": 2 },
+                    { "uri": open, "type": 3 },
+                ]}),
+            )))
+            .unwrap();
+        queue_shutdown(&client);
+        server.run().unwrap();
+        assert_eq!(*events.lock().unwrap(), ["files:3"]);
+    }
+
+    #[test]
     fn end_to_end_protocol_serves_real_analysis() {
         use redscript_compiler_api::ScriptBundle;
 
@@ -4898,6 +5053,16 @@ mod tests {
             .send(Message::Notification(lsp_server::Notification::new(
                 lsp::notification::DidSaveTextDocument::METHOD.into(),
                 json!({ "textDocument": { "uri": broken_uri.as_str() } }),
+            )))
+            .unwrap();
+        // Saving writes the file to disk, so a client with dynamic watcher
+        // registration also sends a watched-file event for the same open file
+        // while the save check is in flight. It must not suppress the batch.
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidChangeWatchedFiles::METHOD.into(),
+                json!({ "changes": [{ "uri": broken_uri.as_str(), "type": 2 }] }),
             )))
             .unwrap();
         let published = loop {
