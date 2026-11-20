@@ -1,7 +1,10 @@
 //! IDE-only discovery and parser dispatch. Community tools keep their `.reds` loader.
-use std::collections::{BTreeSet, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
+
+use ignore::IncrementalIgnore;
 
 use redscript_compiler_api::{
     CompileErrorReporter, Diagnostic, DiagnosticLevel, LoweredCompilationUnit, Symbols,
@@ -25,7 +28,37 @@ impl Dialect {
     }
 }
 
+// Memoized `raw path -> canonical identity` results, plus the compiled ignore
+// matchers used by [`is_ignored`]. The language server is single-threaded, so
+// these live in thread-local storage; each test thread therefore gets a fresh
+// cache.
+thread_local! {
+    static IDENTITY_CACHE: RefCell<HashMap<PathBuf, PathBuf>> = RefCell::new(HashMap::new());
+    static IGNORE_MATCHERS: RefCell<HashMap<PathBuf, Option<IncrementalIgnore>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Upper bound on memoized identities before the cache is reset. The cache is a
+/// pure memoization of the filesystem layout, so clearing it only costs the
+/// next batch of `fs::canonicalize` calls.
+const IDENTITY_CACHE_CAPACITY: usize = 4096;
+
 pub fn identity(path: &Path) -> PathBuf {
+    IDENTITY_CACHE.with(|cache| {
+        if let Some(identity) = cache.borrow().get(path) {
+            return identity.clone();
+        }
+        let identity = resolve_identity(path);
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= IDENTITY_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(path.to_owned(), identity.clone());
+        identity
+    })
+}
+
+fn resolve_identity(path: &Path) -> PathBuf {
     // Resolve the existing prefix even when several parent directories are missing.
     // This does not preserve identity across symlink creation or retargeting.
     let (base, suffix) = path
@@ -50,6 +83,44 @@ pub fn identity(path: &Path) -> PathBuf {
             component => result.push(component.as_os_str()),
         }
         result
+    })
+}
+
+/// Drops memoized path identities and compiled ignore matchers.
+///
+/// Call this whenever the filesystem state may have changed (files added or
+/// removed, symlinks created or retargeted, ignore files edited) so that
+/// subsequent [`identity`] and [`is_ignored`] calls observe the new layout.
+pub fn clear_identity_cache() {
+    IDENTITY_CACHE.with(|cache| cache.borrow_mut().clear());
+    IGNORE_MATCHERS.with(|matchers| matchers.borrow_mut().clear());
+}
+
+/// Returns whether `path` would be skipped by [`discover`]'s walk of `root`.
+///
+/// This reuses the same [`ignore::WalkBuilder`] configuration as [`discover`],
+/// so `.ignore` files, `.gitignore` files (when a Git repository is present),
+/// the global Git ignore file and `.git/info/exclude` are honored, along with
+/// hidden-file filtering. Compiled matchers are cached per root until
+/// [`clear_identity_cache`] is called.
+pub fn is_ignored(path: &Path, root: &Path) -> bool {
+    IGNORE_MATCHERS.with(|matchers| {
+        let mut matchers = matchers.borrow_mut();
+        let matcher = matchers.entry(root.to_owned()).or_insert_with(|| {
+            ignore::WalkBuilder::new(root)
+                .follow_links(true)
+                .build_matchers()
+                .into_iter()
+                .next()
+        });
+        let Some(matcher) = matcher.as_mut() else {
+            return false;
+        };
+        // `matched` expects a path relative to the matcher's root.
+        let Ok(relative) = path.strip_prefix(root) else {
+            return false;
+        };
+        matcher.matched(relative, false).is_ignore()
     })
 }
 
@@ -291,6 +362,72 @@ mod tests {
         assert_eq!(identity(&path), expected);
         fs::remove_dir_all(temp.path().join("nested")).unwrap();
         assert_eq!(identity(&path), expected);
+    }
+
+    #[test]
+    fn identity_is_memoized_and_can_be_cleared() {
+        clear_identity_cache();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested/deeper/file.script");
+        let first = identity(&path);
+        assert_eq!(identity(&path), first);
+        clear_identity_cache();
+        assert_eq!(identity(&path), first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_cache_follows_symlink_retargeting_after_clear() {
+        use std::os::unix::fs::symlink;
+
+        clear_identity_cache();
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("file.script"), "").unwrap();
+        fs::write(second.join("file.script"), "").unwrap();
+        let link = temp.path().join("link");
+        symlink(&first, &link).unwrap();
+
+        let linked = link.join("file.script");
+        let from_first = fs::canonicalize(&first).unwrap().join("file.script");
+        let from_second = fs::canonicalize(&second).unwrap().join("file.script");
+        assert_eq!(identity(&linked), from_first);
+
+        // Retargeting the link is not observed while the memoized identity is
+        // still cached.
+        fs::remove_file(&link).unwrap();
+        symlink(&second, &link).unwrap();
+        assert_eq!(identity(&linked), from_first);
+
+        clear_identity_cache();
+        assert_eq!(identity(&linked), from_second);
+    }
+
+    #[test]
+    fn is_ignored_matches_discovery_rules() {
+        clear_identity_cache();
+        let temp = tempfile::tempdir().unwrap();
+        let ignored = temp.path().join("ignored.script");
+        let kept = temp.path().join("kept.script");
+        fs::write(&ignored, "").unwrap();
+        fs::write(&kept, "").unwrap();
+        fs::write(temp.path().join(".ignore"), "ignored.script\n").unwrap();
+
+        assert!(is_ignored(&ignored, temp.path()));
+        assert!(!is_ignored(&kept, temp.path()));
+        // `is_ignored` agrees with what `discover` actually yields.
+        assert_eq!(
+            discover([temp.path()], |issue| panic!("unexpected issue: {issue:?}")),
+            [identity(&kept)]
+        );
+
+        // `.gitignore` requires a Git repository, matching `WalkBuilder`.
+        fs::write(temp.path().join(".gitignore"), "kept.script\n").unwrap();
+        clear_identity_cache();
+        assert!(!is_ignored(&kept, temp.path()));
     }
 
     #[test]

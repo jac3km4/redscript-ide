@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::{fmt, fs};
 
 use anyhow::Context;
@@ -90,7 +91,7 @@ struct CachedCompletion {
     path: PathBuf,
     receiver_end: usize,
     source_without_member: String,
-    other_overlays: BTreeMap<PathBuf, String>,
+    other_overlays: BTreeMap<PathBuf, Arc<str>>,
     response: Rc<lsp::CompletionResponse>,
 }
 
@@ -177,7 +178,7 @@ impl RedscriptLanguageServer {
 
     fn make_edit_snapshot(&self) -> anyhow::Result<CompilationCache> {
         let sources = ast::SourceMap::new();
-        let mut files = BTreeMap::new();
+        let mut files: BTreeMap<PathBuf, Arc<str>> = BTreeMap::new();
         self.compilation_cache.with_sources(|active| {
             for (_, file) in active.files() {
                 if self
@@ -188,7 +189,7 @@ impl RedscriptLanguageServer {
                     let text = self
                         .overlays
                         .get(file.path())
-                        .map_or_else(|| file.source().to_owned(), |overlay| overlay.text.clone());
+                        .map_or_else(|| Arc::from(file.source()), |overlay| overlay.text.clone());
                     files.insert(file.path().to_owned(), text);
                 }
             }
@@ -199,7 +200,7 @@ impl RedscriptLanguageServer {
             }
         }
         for (path, text) in files {
-            sources.push_back(path, text);
+            sources.push_back(path, text.to_string());
         }
         CompilationCache::from_sources(
             self.compilation_cache.borrow_cache_bytes().clone(),
@@ -318,12 +319,12 @@ impl RedscriptLanguageServer {
                 .overlays
                 .get(&path)
                 .map(|overlay| Ok(overlay.text.clone()))
-                .unwrap_or_else(|| fs::read_to_string(&path));
+                .unwrap_or_else(|| fs::read_to_string(&path).map(Arc::from));
             match text {
                 Ok(text) => {
                     active_standalone_paths.insert(path.clone());
                     let sources = ast::SourceMap::new();
-                    sources.push_back(&path, text);
+                    sources.push_back(&path, text.to_string());
                     standalone.insert(
                         path,
                         CompilationCache::from_sources(
@@ -458,7 +459,7 @@ impl RedscriptLanguageServer {
 
     fn resolve_file(&self, path: &Path) -> FileResolution<'_> {
         let path = dialect::identity(path);
-        if let Some((_, _, workspace)) = self
+        if let Some((root, _, workspace)) = self
             .workspaces
             .iter()
             .flat_map(|(owner, workspace)| {
@@ -475,7 +476,14 @@ impl RedscriptLanguageServer {
                     .then_with(|| owner_b.cmp(owner_a))
             })
         {
-            FileResolution::Workspace(workspace)
+            // An open buffer that the workspace walk would skip is treated as
+            // if it had never been discovered, so it cannot be injected into
+            // workspace compilation.
+            if dialect::is_ignored(&path, root) {
+                FileResolution::NonWorkspace
+            } else {
+                FileResolution::Workspace(workspace)
+            }
         } else {
             FileResolution::NonWorkspace
         }
@@ -485,7 +493,8 @@ impl RedscriptLanguageServer {
     /// `path`, or `None` when the path is not part of any workspace.
     fn workspace_root_for(&self, path: &Path) -> Option<PathBuf> {
         let path = dialect::identity(path);
-        self.workspaces
+        let (root, owner) = self
+            .workspaces
             .iter()
             .flat_map(|(owner, workspace)| workspace.roots.iter().map(move |root| (root, owner)))
             .filter(|(root, _)| path.starts_with(root))
@@ -494,8 +503,8 @@ impl RedscriptLanguageServer {
                     .count()
                     .cmp(&b.components().count())
                     .then_with(|| owner_b.cmp(owner_a))
-            })
-            .map(|(_, owner)| owner.clone())
+            })?;
+        (!dialect::is_ignored(&path, root)).then(|| owner.clone())
     }
 
     fn hover_at(
@@ -982,7 +991,7 @@ impl RedscriptLanguageServer {
         }
         let path = dialect::identity(&path);
         if let Some(overlay) = self.overlays.get(&path) {
-            overlay.text == fix.expected_source
+            overlay.text.as_ref() == fix.expected_source
         } else {
             fs::read_to_string(&path).is_ok_and(|text| text == fix.expected_source)
         }
@@ -1038,6 +1047,7 @@ impl RedscriptLanguageServer {
     }
 
     fn reload_workspaces(&mut self) {
+        dialect::clear_identity_cache();
         let mut workspaces = HashMap::with_capacity(self.workspaces.len());
         let mut config_diagnostics = BTreeMap::new();
         let mut config_warnings = BTreeSet::new();
@@ -1801,7 +1811,7 @@ impl LanguageServer for RedscriptLanguageServer {
             self.overlays.insert(
                 path.clone(),
                 Overlay {
-                    text: buffer.contents().to_string(),
+                    text: Arc::from(buffer.contents().to_string()),
                     version: buffer.version().unwrap_or(0),
                 },
             );
@@ -1816,6 +1826,7 @@ impl LanguageServer for RedscriptLanguageServer {
     }
 
     fn files_changed(&mut self, _paths: Vec<PathBuf>, ctx: &LspContext) -> anyhow::Result<()> {
+        dialect::clear_identity_cache();
         self.reload_workspaces();
         self.rebuild(ctx)
     }
@@ -1843,6 +1854,7 @@ impl LanguageServer for RedscriptLanguageServer {
         removed: Vec<PathBuf>,
         ctx: &LspContext,
     ) -> anyhow::Result<()> {
+        dialect::clear_identity_cache();
         for folder in removed {
             self.workspaces.remove(&folder);
         }
@@ -2086,7 +2098,7 @@ impl Default for CompilationCache {
 }
 
 struct Overlay {
-    text: String,
+    text: Arc<str>,
     version: i32,
 }
 
@@ -2221,7 +2233,7 @@ fn collect_workspace_sources(
     io_warnings: &mut BTreeSet<String>,
 ) -> ast::SourceMap {
     let sources = ast::SourceMap::new();
-    let mut files = BTreeMap::new();
+    let mut files: BTreeMap<PathBuf, Arc<str>> = BTreeMap::new();
     let discovered = dialect::discover(roots, |issue| match issue {
         dialect::DiscoveryIssue::MissingRoot(root) => {
             missing_roots.insert(root);
@@ -2245,7 +2257,7 @@ fn collect_workspace_sources(
         } else {
             match fs::read_to_string(&path) {
                 Ok(text) => {
-                    files.insert(path, text);
+                    files.insert(path, Arc::from(text));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -2262,7 +2274,7 @@ fn collect_workspace_sources(
         }
     }
     for (path, text) in files {
-        sources.push_back(path, text);
+        sources.push_back(path, text.to_string());
     }
     sources
 }
@@ -3825,6 +3837,41 @@ mod tests {
         assert!(server.workspaces.is_empty());
     }
 
+    #[test]
+    fn ignored_overlay_is_excluded_from_workspace_compilation() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let text = "class Ignored { var value : Int32; }";
+        let ignored = temp.path().join("ignored.script");
+        fs::write(&ignored, text).unwrap();
+        fs::write(temp.path().join(".ignore"), "ignored.script\n").unwrap();
+        dialect::clear_identity_cache();
+
+        // The workspace walk skips the ignored file, and an open buffer for it
+        // is treated as standalone instead of being injected into the workspace.
+        let _buffers = open(&mut server, &ctx, &ignored, text, 1);
+        assert!(server.resolve_file(&ignored).as_workspace().is_none());
+        assert!(
+            !server
+                .compilation_cache
+                .borrow_file_ids()
+                .contains_key(&ignored)
+        );
+        assert!(server.standalone.contains_key(&ignored));
+
+        // Removing the ignore rule and refreshing restores workspace membership.
+        fs::remove_file(temp.path().join(".ignore")).unwrap();
+        server
+            .files_changed(vec![temp.path().to_owned()], &ctx)
+            .unwrap();
+        assert!(server.resolve_file(&ignored).as_workspace().is_some());
+        assert!(
+            server
+                .compilation_cache
+                .borrow_file_ids()
+                .contains_key(&ignored)
+        );
+    }
+
     fn dot_completions(
         server: &mut RedscriptLanguageServer,
         ctx: &LspContext,
@@ -4960,7 +5007,7 @@ mod tests {
         server.overlays.insert(
             dialect::identity(&crate::server::path_from_uri(&uri).unwrap()),
             Overlay {
-                text: String::new(),
+                text: Arc::from(""),
                 version: 1,
             },
         );
