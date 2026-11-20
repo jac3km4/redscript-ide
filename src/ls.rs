@@ -15,7 +15,7 @@ use redscript_compiler_api::ast::Span;
 use redscript_compiler_api::pass::{DiagnosticPass, UnusedLocals};
 use redscript_compiler_api::{
     CompilationInputs, CompileErrorReporter, Diagnostic, LowerError, LoweredCompilationUnit,
-    ScriptBundle, SourceMapExt, Symbols, TypeFlagRegistry, TypeInterner, TypeSchema, ast,
+    ScriptBundle, SourceMapExt, Symbols, TypeFlagRegistry, TypeInterner, TypeSchema, ast, ir,
 };
 use redscript_dotfile::Dotfile;
 use serde::{Deserialize, Serialize};
@@ -1348,12 +1348,14 @@ impl CompilationCache {
                 .iter()
                 .find(|(file, _)| *file == id)
                 .and_then(|(_, module)| module.module().find_at(preceding_pos));
-            let (query_context, typ) = match match_ {
-                Some(ast::QueryResult::Type(&ast::Type::Named { name, .. })) => (None, Some(name)),
-                Some(ast::QueryResult::Expr(&ast::Expr::Ident(name))) => {
-                    (Some(AtContext::Expr), Some(name))
+            let (query_context, definite_name, fallback_name) = match match_ {
+                Some(ast::QueryResult::Type(&ast::Type::Named { name, .. })) => {
+                    (None, Some(name), None)
                 }
-                _ => (None, None),
+                Some(ast::QueryResult::Expr(&ast::Expr::Ident(name))) => {
+                    (Some(AtContext::Expr), None, Some(name))
+                }
+                _ => (None, None, None),
             };
 
             let analysis = cache.analysis;
@@ -1362,17 +1364,31 @@ impl CompilationCache {
             let func = unit
                 .all_functions()
                 .find(|f| f.span.file == id && f.span.contains(preceding_pos));
-            let typ = typ
-                .and_then(|t| unit.scopes.get(&id)?.get(t)?.id())
-                .or_else(|| cache.interner.get_index(cache.interner.get_index_of(typ?)?));
-            ExprAt::new(None, func, typ, syms, cache.sources, query_context).with_expr_at(preceding_pos, |at| {
+            let resolve = |name: &str| {
+                let from_scopes = match unit.scopes.get(&id).and_then(|scope| scope.get(name)) {
+                    Some(type_ref) => type_ref.id(),
+                    None => None,
+                };
+                from_scopes
+                    .or_else(|| cache.interner.get_index(cache.interner.get_index_of(name)?))
+            };
+            // Type names in type positions always resolve. An identifier resolves
+            // to a type only when no expression binding claims it, so a local,
+            // parameter or field that shadows a type name takes precedence.
+            let definite_type = definite_name.and_then(resolve);
+            let fallback_type = fallback_name.and_then(resolve);
+            ExprAt::new(None, func, definite_type, syms, cache.sources, query_context).with_expr_at(preceding_pos, |at| {
+                let at = match fallback_type {
+                    Some(typ) if is_type_receiver(at.expr()) => at.with_type(Some(typ)),
+                    _ => at,
+                };
                 ctx.logger().info(format!(
                 "Query result lookup_byte_offset={preceding_pos} parsed_module={} ast_match={} function={} expression={} named_type={} receiver_type={} context={query_context:?} parse_diagnostics={} semantic_diagnostics={}",
                 analysis.parsed.modules.iter().any(|(file, _)| *file == id),
                 match_.is_some(),
                 func.is_some(),
                 at.expr().is_some(),
-                typ.is_some(),
+                at.type_().is_some(),
                 at.expr_type().is_some(),
                 analysis.parsed.diagnostics.len(),
                 analysis.diagnostics.len(),
@@ -1380,6 +1396,17 @@ impl CompilationCache {
                 cb(at)
             })
         })
+    }
+}
+
+/// Whether the expression at an identifier is a static type receiver that a
+/// type-name binding should describe. Value bindings (locals, captures, fields,
+/// ...) return `false` so they take precedence over a shadowed type.
+fn is_type_receiver(expr: Option<&ir::Expr<'_>>) -> bool {
+    match expr {
+        Some(ir::Expr::Call { call, .. }) => matches!(**call, ir::Call::Static { .. }),
+        None | Some(ir::Expr::Construct { .. } | ir::Expr::NewInstance { .. }) => true,
+        _ => false,
     }
 }
 
@@ -1708,7 +1735,16 @@ fn generate_completions(
             .symbols()
             .query_methods(typ.id())
             .filter(|m| !m.func().flags().is_static())
-            .map(|e| completions::method(e.name(), e.func().type_(), e.func().doc()));
+            .map(|e| {
+                completions::instance_method(
+                    e.name(),
+                    e.key().parent(),
+                    typ,
+                    e.func().type_(),
+                    at.symbols(),
+                    e.func().doc(),
+                )
+            });
         completions.extend(methods);
 
         let fields = at
@@ -3895,6 +3931,93 @@ mod tests {
                     );
                 });
             }
+        }
+    }
+
+    #[test]
+    fn member_completions_specialize_generic_receiver_methods() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let path = temp.path().join("generic_members.reds");
+        let text = "public class Box<T> { public let value: T; public func Get() -> T { return this.value; } public func Replace(replacement: T) -> T { return replacement; } } public func Test(box: Box<Int32>) { box.; }";
+        let buffers = open(&mut server, &ctx, &path, text, 1);
+        let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+        let pos = (text.rfind("box.").unwrap() + "box.".len()) as u32;
+        let response = server
+            .completion_at(
+                CodeLocation::new(Document::new(path.clone(), buffer), pos),
+                &ctx,
+            )
+            .unwrap();
+        let lsp::CompletionResponse::Array(items) = &*response else {
+            panic!("expected completion items");
+        };
+        let get = items
+            .iter()
+            .find(|item| item.label == "Get")
+            .expect("Get completion");
+        assert_eq!(
+            get.detail.as_deref(),
+            Some("() -> Int32"),
+            "{:?}",
+            get.detail
+        );
+        let replace = items
+            .iter()
+            .find(|item| item.label == "Replace")
+            .expect("Replace completion");
+        assert_eq!(
+            replace.detail.as_deref(),
+            Some("(replacement: Int32) -> Int32"),
+            "{:?}",
+            replace.detail
+        );
+        assert!(
+            items
+                .iter()
+                .all(|item| !item.detail.as_deref().unwrap_or("").contains("-> T")),
+            "{:?}",
+            items.iter().map(|item| &item.detail).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn local_and_field_bindings_shadow_type_names_in_hover_and_definition() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let path = temp.path().join("shadow.script");
+        let text = "class Value {}\nclass Owner {\n    var Value: Int32;\n    function Read(): Int32 { return Value; }\n    function Test(): Int32 {\n        let Value: Int32 = 1;\n        return Value;\n    }\n}\n";
+        let buffers = open(&mut server, &ctx, &path, text, 1);
+        let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+        let line_of =
+            |index: usize| text[..index].bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let values: Vec<usize> = text
+            .match_indices("Value")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(values.len(), 5, "unexpected Value occurrences");
+        // Occurrences: class name, field declaration, field usage, local
+        // declaration, local usage.
+        for (usage, declaration) in [(values[2], values[1]), (values[4], values[3])] {
+            let loc = CodeLocation::new(Document::new(path.clone(), buffer), (usage + 1) as u32);
+            let hover = server.hover_at(loc.clone(), &ctx).unwrap().unwrap();
+            let lsp::HoverContents::Markup(contents) = hover.contents else {
+                panic!("expected markup hover");
+            };
+            assert!(
+                !contents.value.contains("### Symbol"),
+                "shadowed type leaked into hover: {}",
+                contents.value
+            );
+            let lsp::GotoDefinitionResponse::Array(locations) =
+                server.definition_at(loc, &ctx).unwrap()
+            else {
+                panic!("expected definition locations");
+            };
+            assert_eq!(locations.len(), 1);
+            assert_eq!(
+                locations[0].range.start.line,
+                line_of(declaration),
+                "definition for usage at {usage}"
+            );
         }
     }
 

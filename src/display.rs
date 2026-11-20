@@ -1,8 +1,9 @@
 use std::fmt;
 
+use redscript_compiler_api::types::{Type, TypeApp};
 use redscript_compiler_api::{FunctionType, Symbols, ir};
 
-use crate::query::{ExprAt, type_of};
+use crate::query::{ExprAt, SpecializedFunctionType, specialize_function_type, type_of};
 
 pub struct ExprAtDisplay<'ctx, 'a> {
     inner: ExprAt<'ctx, 'a>,
@@ -74,23 +75,59 @@ impl fmt::Display for CallDisplay<'_, '_> {
                 writeln!(f, "{name}{}", FunctionTypeDisplay::new(func.type_()))?;
                 func.doc()
             }
-            &ir::Call::Static { method, .. } => {
-                let (name, func) = self.symbols.get_method(method).ok_or(fmt::Error)?;
+            ir::Call::Static {
+                parent_id,
+                parent_type_args,
+                method,
+                type_args,
+                ..
+            } => {
+                let (name, func) = self.symbols.get_method(*method).ok_or(fmt::Error)?;
+                let specialized = coalesce_types(parent_type_args, self.symbols)
+                    .zip(coalesce_types(type_args, self.symbols))
+                    .and_then(|(args, call_args)| {
+                        let receiver = TypeApp::new(*parent_id, args);
+                        specialize_function_type(
+                            method.parent(),
+                            func.type_(),
+                            &receiver,
+                            &call_args,
+                            self.symbols,
+                        )
+                    });
                 writeln!(
                     f,
                     "{}::{name}{}",
                     method.parent(),
-                    FunctionTypeDisplay::new(func.type_())
+                    FunctionTypeDisplay::maybe_specialized(func.type_(), specialized.as_ref())
                 )?;
                 func.doc()
             }
-            ir::Call::Instance { method, .. } => {
+            ir::Call::Instance {
+                method,
+                receiver_type,
+                type_args,
+                ..
+            } => {
                 let (name, func) = self.symbols.get_method(*method).ok_or(fmt::Error)?;
+                let specialized = receiver_type
+                    .coalesced(self.symbols)
+                    .ok()
+                    .zip(coalesce_types(type_args, self.symbols))
+                    .and_then(|(receiver, args)| {
+                        specialize_function_type(
+                            method.parent(),
+                            func.type_(),
+                            &receiver,
+                            &args,
+                            self.symbols,
+                        )
+                    });
                 writeln!(
                     f,
                     "{}::{name}{}",
                     method.parent(),
-                    FunctionTypeDisplay::new(func.type_())
+                    FunctionTypeDisplay::maybe_specialized(func.type_(), specialized.as_ref())
                 )?;
                 func.doc()
             }
@@ -107,14 +144,37 @@ impl fmt::Display for CallDisplay<'_, '_> {
     }
 }
 
+fn coalesce_types<'ctx>(
+    types: &[ir::Type<'ctx>],
+    symbols: &Symbols<'ctx>,
+) -> Option<Vec<Type<'ctx>>> {
+    types
+        .iter()
+        .map(|typ| typ.coalesced(symbols).ok())
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct FunctionTypeDisplay<'ctx, 'a> {
     func: &'a FunctionType<'ctx>,
+    specialized: Option<&'a SpecializedFunctionType<'ctx>>,
 }
 
 impl<'ctx, 'a> FunctionTypeDisplay<'ctx, 'a> {
     pub fn new(func: &'a FunctionType<'ctx>) -> Self {
-        Self { func }
+        Self {
+            func,
+            specialized: None,
+        }
+    }
+
+    /// Render a declaration with concrete parameter and return types in place of
+    /// its generic parameters, falling back to the declared signature.
+    pub fn maybe_specialized(
+        func: &'a FunctionType<'ctx>,
+        specialized: Option<&'a SpecializedFunctionType<'ctx>>,
+    ) -> Self {
+        Self { func, specialized }
     }
 }
 
@@ -125,9 +185,31 @@ impl fmt::Display for FunctionTypeDisplay<'_, '_> {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{param}")?;
+            match self.specialized.and_then(|spec| spec.params.get(i)) {
+                Some(typ) => {
+                    let flags = param.flags();
+                    if flags.is_optional() {
+                        write!(f, "opt ")?;
+                    }
+                    if flags.is_const() {
+                        write!(f, "const ")?;
+                    }
+                    if flags.is_out() {
+                        write!(f, "out ")?;
+                    }
+                    if flags.is_short_circuit() {
+                        write!(f, "skip ")?;
+                    }
+                    write!(f, "{}: {}", param.name(), typ)?;
+                }
+                None => write!(f, "{param}")?,
+            }
         }
-        write!(f, ") -> {}", self.func.return_type())?;
+        let return_type = match self.specialized {
+            Some(specialized) => specialized.return_type.to_string(),
+            None => self.func.return_type().to_string(),
+        };
+        write!(f, ") -> {return_type}")?;
         Ok(())
     }
 }
@@ -264,6 +346,85 @@ mod tests {
     #[test]
     fn field_hover_falls_back_to_declaration_type_and_retains_docs() {
         field_hover("Box<Int32>", "Int32", true);
+    }
+
+    fn call_hover(receiver: &str, call: &str, expected: &str) {
+        let sources = SourceMap::new();
+        sources.populate_boot_lib();
+        sources.push_back(
+            "display.reds",
+            format!(
+                r#"
+                class Box<T> {{
+                    /// The stored value.
+                    public let value: T;
+                    /// Reads the value.
+                    public func Get() -> T {{ return this.value; }}
+                    /// Replaces the value.
+                    public func Replace(replacement: T) -> T {{ return replacement; }}
+                }}
+                class Derived<T> extends Box<array<T>> {{}}
+                func Test(value: {receiver}) {{ value.{call}; }}
+                "#
+            ),
+        );
+        let interner = TypeInterner::default();
+        let mut reporter = CompileErrorReporter::default();
+        let (unit, symbols) = infer_from_sources(
+            &sources,
+            Symbols::with_default_types(),
+            &mut reporter,
+            &interner,
+        );
+        let diagnostics = reporter.into_reported();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let entry = symbols
+            .free_functions()
+            .find(|entry| entry.name().to_string() == "Test")
+            .unwrap();
+        let function = &unit.functions[entry.key()];
+        let ir::Stmt::Expr(expr) = function.block.stmts.back().unwrap() else {
+            panic!("expected call expression statement")
+        };
+        let at = ExprAt::new(
+            Some(&**expr),
+            Some(function),
+            None,
+            &symbols,
+            &sources,
+            None,
+        );
+        let display = at.display().to_string();
+        assert!(display.contains(expected), "{display}");
+        assert!(!display.contains("-> T"), "{display}");
+    }
+
+    #[test]
+    fn call_hover_specializes_generic_receiver_return_type() {
+        call_hover("Box<Int32>", "Get()", "Box::Get() -> Int32");
+    }
+
+    #[test]
+    fn call_hover_specializes_inherited_generic_return_type() {
+        call_hover("Derived<Int32>", "Get()", "Box::Get() -> array<Int32>");
+    }
+
+    #[test]
+    fn call_hover_specializes_generic_receiver_parameters_and_return() {
+        call_hover(
+            "Box<Int32>",
+            "Replace(value.Get())",
+            "Box::Replace(replacement: Int32) -> Int32",
+        );
+    }
+
+    #[test]
+    fn call_hover_specializes_inherited_generic_parameters_and_return() {
+        call_hover(
+            "Derived<Int32>",
+            "Replace(value.Get())",
+            "Box::Replace(replacement: array<Int32>) -> array<Int32>",
+        );
     }
 
     #[test]

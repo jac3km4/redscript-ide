@@ -1,8 +1,9 @@
 use lsp_types as lsp;
-use redscript_compiler_api::types::{Type, predef};
-use redscript_compiler_api::{Field, FunctionType, PolyType, Symbols, ir};
+use redscript_compiler_api::types::{Type, TypeApp, predef};
+use redscript_compiler_api::{Field, FunctionType, PolyType, Symbols, TypeId, ir};
 
 use crate::display::{DocDisplay, FunctionTypeDisplay, SnippetDisplay};
+use crate::query::specialize_function_type;
 
 pub fn method<'ctx>(
     name: &'ctx str,
@@ -10,6 +11,23 @@ pub fn method<'ctx>(
     doc: &[&'ctx str],
 ) -> lsp_types::CompletionItem {
     let detail = FunctionTypeDisplay::new(typ).to_string();
+    let snippet_display = SnippetDisplay::new(name, typ).to_string();
+    method_with_signature(name, detail, snippet_display, doc)
+}
+
+/// Present an instance method with its declaration instantiated at `receiver`.
+/// Falls back to the declared signature when the type arguments cannot be
+/// resolved.
+pub fn instance_method<'ctx>(
+    name: &'ctx str,
+    declaring_type: TypeId<'ctx>,
+    receiver: &TypeApp<'ctx>,
+    typ: &FunctionType<'ctx>,
+    symbols: &Symbols<'ctx>,
+    doc: &[&'ctx str],
+) -> lsp_types::CompletionItem {
+    let specialized = specialize_function_type(declaring_type, typ, receiver, &[], symbols);
+    let detail = FunctionTypeDisplay::maybe_specialized(typ, specialized.as_ref()).to_string();
     let snippet_display = SnippetDisplay::new(name, typ).to_string();
     method_with_signature(name, detail, snippet_display, doc)
 }

@@ -1,10 +1,14 @@
 use std::fmt::Display;
 
 use redscript_compiler_api::ast::{SourceMap, Span};
-use redscript_compiler_api::types::Type;
-use redscript_compiler_api::{LoweredFunction, Symbols, TypeId, ir};
+use redscript_compiler_api::types::{Type, TypeApp};
+use redscript_compiler_api::{FunctionType, LoweredFunction, PolyType, Symbols, TypeId, ir};
 
 use crate::display::ExprAtDisplay;
+
+/// Generic base chains are acyclic in valid code; a bound keeps malformed input
+/// from looping while still covering every realistic inheritance depth.
+const MAX_BASE_DEPTH: usize = 64;
 
 #[derive(Clone)]
 pub struct ExprAt<'ctx, 'a> {
@@ -63,6 +67,13 @@ impl<'ctx, 'a> ExprAt<'ctx, 'a> {
 
     pub fn type_(&self) -> Option<TypeId<'ctx>> {
         self.type_
+    }
+
+    /// Attach or clear the resolved type binding used for symbol rendering and
+    /// fallback navigation.
+    pub fn with_type(mut self, type_: Option<TypeId<'ctx>>) -> Self {
+        self.type_ = type_;
+        self
     }
 
     pub fn symbols(&self) -> &'a Symbols<'ctx> {
@@ -261,6 +272,101 @@ pub fn type_of<'ctx>(
     symbols: &Symbols<'ctx>,
 ) -> Option<Type<'ctx>> {
     redscript_compiler_api::expr_type(expr, func, symbols).ok()
+}
+
+/// Concrete parameter and return types for a method declaration instantiated at
+/// a concrete receiver type.
+#[derive(Debug, Clone)]
+pub struct SpecializedFunctionType<'ctx> {
+    pub params: Vec<Type<'ctx>>,
+    pub return_type: Type<'ctx>,
+}
+
+/// Instantiate a declared [`FunctionType`] in the rigid type environment of a
+/// receiver type.
+///
+/// The receiver's type arguments are mapped onto the declaring type's
+/// parameters, walking generic bases when the method is inherited (mirroring the
+/// compiler's own call resolution). Call-site type arguments map the method's
+/// own type parameters, which shadow the declaring type's parameters by name.
+///
+/// Returns `None` when the receiver cannot be related to the declaring type or a
+/// type argument cannot be resolved, so callers can fall back to the declared
+/// signature.
+pub fn specialize_function_type<'ctx>(
+    declaring_type: TypeId<'ctx>,
+    func_type: &FunctionType<'ctx>,
+    receiver: &TypeApp<'ctx>,
+    call_type_args: &[Type<'ctx>],
+    symbols: &Symbols<'ctx>,
+) -> Option<SpecializedFunctionType<'ctx>> {
+    let mut env = receiver_type_env(receiver, declaring_type, symbols)?;
+    // A method's own type parameters shadow the declaring type's parameters.
+    env.retain(|(name, _)| !func_type.type_vars().any(|var| var == *name));
+    env.extend(
+        func_type
+            .type_vars()
+            .zip(call_type_args.iter())
+            .map(|(name, typ)| (name, PolyType::from_type(typ))),
+    );
+    let params = func_type
+        .params()
+        .iter()
+        .map(|param| substitute(param.type_(), &env, symbols))
+        .collect::<Option<Vec<_>>>()?;
+    let return_type = substitute(func_type.return_type(), &env, symbols)?;
+    Some(SpecializedFunctionType {
+        params,
+        return_type,
+    })
+}
+
+/// Map `declaring_type`'s parameters onto the concrete arguments supplied by
+/// `receiver`, walking the base chain when the receiver is a subtype.
+fn receiver_type_env<'ctx>(
+    receiver: &TypeApp<'ctx>,
+    declaring_type: TypeId<'ctx>,
+    symbols: &Symbols<'ctx>,
+) -> Option<Vec<(&'ctx str, PolyType<'ctx>)>> {
+    let mut current = receiver.clone();
+    for _ in 0..MAX_BASE_DEPTH {
+        let def = symbols.get_type(current.id())?;
+        if current.id() == declaring_type {
+            return Some(
+                def.vars()
+                    .zip(current.args().iter())
+                    .map(|(name, arg)| (name, PolyType::from_type(arg)))
+                    .collect(),
+            );
+        }
+        let base = def.schema().as_aggregate()?.base()?;
+        let env = def
+            .vars()
+            .zip(current.args().iter())
+            .map(|(name, arg)| (name, PolyType::from_type(arg)))
+            .collect::<Vec<_>>();
+        let args = base
+            .args()
+            .iter()
+            .map(|arg| substitute(arg, &env, symbols))
+            .collect::<Option<Vec<_>>>()?;
+        current = TypeApp::new(base.id(), args);
+    }
+    None
+}
+
+/// Substitute a type's declaring-type parameters using `env`, coalescing the
+/// result to a concrete type.
+fn substitute<'ctx>(
+    typ: &Type<'ctx>,
+    env: &[(&'ctx str, PolyType<'ctx>)],
+    symbols: &Symbols<'ctx>,
+) -> Option<Type<'ctx>> {
+    let scoped = env.iter().map(|(name, poly)| (*name, poly.clone()));
+    PolyType::from_type_with_env(typ, &scoped.collect())
+        .ok()?
+        .coalesce(symbols)
+        .ok()
 }
 
 #[cfg(test)]
