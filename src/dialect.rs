@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use ignore::IncrementalIgnore;
+use rayon::prelude::*;
 use redscript_compiler_api::{
     CompileErrorReporter, Diagnostic, DiagnosticLevel, LoweredCompilationUnit, Symbols,
     TypeInterner, ast, parse_file,
@@ -274,27 +275,68 @@ fn redmod_diagnostic<'src>(error: redscript_redmod_adapter::Error) -> Diagnostic
     Diagnostic::Custom(Box::new(error), code, DiagnosticLevel::Error, span)
 }
 
-pub fn parse(sources: &ast::SourceMap) -> ParsedSources<'_> {
+/// Parses one source file with its own reporter, so files can be parsed
+/// independently.
+///
+/// The per-file diagnostics are returned rather than merged into a shared
+/// reporter, letting callers concatenate them in source order.
+fn parse_entry<'src>(
+    id: ast::FileId,
+    file: &'src ast::File,
+) -> (
+    ast::FileId,
+    Option<ParsedModule<'src>>,
+    Vec<Diagnostic<'src>>,
+) {
     let mut reporter = CompileErrorReporter::default();
-    let modules = sources
-        .files()
-        .filter_map(|(id, file)| {
-            let module = match Dialect::of(file.path()) {
-                Some(Dialect::Redmod) => {
-                    let (parsed, errors) =
-                        redscript_redmod_adapter::parse_file_with_metadata(file.source(), id);
-                    reporter.report_many(errors.into_iter().map(redmod_diagnostic));
-                    parsed.map(ParsedModule::Redmod)
-                }
-                // Includes the compiler's synthetic boot library.
-                _ => parse_file(id, file, &mut reporter).map(ParsedModule::Community),
-            };
-            module.map(|module| (id, module))
+    let module = match Dialect::of(file.path()) {
+        Some(Dialect::Redmod) => {
+            let (parsed, errors) =
+                redscript_redmod_adapter::parse_file_with_metadata(file.source(), id);
+            reporter.report_many(errors.into_iter().map(redmod_diagnostic));
+            parsed.map(ParsedModule::Redmod)
+        }
+        // Includes the compiler's synthetic boot library.
+        _ => parse_file(id, file, &mut reporter).map(ParsedModule::Community),
+    };
+    (id, module, reporter.into_reported())
+}
+
+/// Below this many files the shared parallel pool costs more than it saves, so
+/// parsing stays sequential.
+const PARALLEL_PARSE_THRESHOLD: usize = 4;
+
+pub fn parse(sources: &ast::SourceMap) -> ParsedSources<'_> {
+    let files: Vec<_> = sources.files().collect();
+    let entries: Vec<_> = if files.len() < PARALLEL_PARSE_THRESHOLD {
+        files
+            .into_iter()
+            .map(|(id, file)| parse_entry(id, file))
+            .collect()
+    } else {
+        // Reuse the compiler's parsing/lowering pool, whose workers carry the
+        // same 8 MiB stack budget, so a binary never spins up a second pool.
+        // `IndexedParallelIterator` keeps the results in source order.
+        redscript_community_parser::parallel_pool().install(|| {
+            files
+                .into_par_iter()
+                .map(|(id, file)| parse_entry(id, file))
+                .collect()
         })
-        .collect();
+    };
+    // Merging in source order reproduces a sequential parse exactly: each file's
+    // diagnostics stay adjacent and modules keep their `FileId` order.
+    let mut modules = Vec::new();
+    let mut diagnostics = Vec::new();
+    for (id, module, reported) in entries {
+        diagnostics.extend(reported);
+        if let Some(module) = module {
+            modules.push((id, module));
+        }
+    }
     ParsedSources {
         modules,
-        diagnostics: reporter.into_reported(),
+        diagnostics,
     }
 }
 
@@ -467,6 +509,55 @@ mod tests {
                 .iter()
                 .all(|issue| matches!(issue, DiscoveryIssue::InvalidRoot { .. }))
         );
+    }
+
+    #[test]
+    fn parallel_parse_matches_sequential_order_and_diagnostics() {
+        let sources = ast::SourceMap::new();
+        sources.push_back("a.reds", "public class A {}");
+        sources.push_back("b.Script", "class B { var value : Int32; }");
+        sources.push_back("c.reds", "public class C {");
+        sources.push_back("d.sCrIpT", "class {");
+        sources.push_back("e.reds", "public class E {}");
+        assert!(sources.files().count() >= PARALLEL_PARSE_THRESHOLD);
+
+        let parallel = parse(&sources);
+
+        // Same per-file entry point, concatenated in source order.
+        let entries: Vec<_> = sources
+            .files()
+            .map(|(id, file)| parse_entry(id, file))
+            .collect();
+        let mut modules = Vec::new();
+        let mut diagnostics = Vec::new();
+        for (id, module, reported) in entries {
+            diagnostics.extend(reported);
+            if let Some(module) = module {
+                modules.push((id, module));
+            }
+        }
+
+        assert_eq!(
+            parallel
+                .modules
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            modules.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            parallel
+                .diagnostics
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            diagnostics
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        );
+        assert!(!parallel.modules.is_empty());
+        assert!(!parallel.diagnostics.is_empty());
     }
 
     #[test]
