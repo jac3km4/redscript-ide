@@ -168,7 +168,9 @@ enum WorkerEvent {
         state_rev: u64,
         diag_rev: u64,
         is_startup: bool,
-        batch: DiagnosticBatch,
+        /// `None` when computation was aborted before producing a batch, so the
+        /// protocol thread can decide whether to retry.
+        batch: Option<DiagnosticBatch>,
     },
     WatchRoots {
         state_rev: u64,
@@ -526,13 +528,13 @@ impl LspServer<'_> {
                             // The worker emitted every prior event before
                             // acknowledging, so drain them before returning.
                             while let Ok(event) = event_rx.try_recv() {
-                                self.handle_worker_event(event, Some(cmd_tx))?;
+                                self.handle_worker_event(event, None)?;
                             }
                         }
                         break;
                     }
                     recv(event_rx) -> event => match event {
-                        Ok(event) => self.handle_worker_event(event, Some(cmd_tx))?,
+                        Ok(event) => self.handle_worker_event(event, None)?,
                         Err(_) => break,
                     },
                 }
@@ -853,29 +855,42 @@ impl LspServer<'_> {
                 is_startup,
                 batch,
             } => {
-                if state_rev == self.state_rev && diag_rev == self.diag_rev {
-                    self.startup_pending = false;
-                    self.diagnostics.apply_and_flush(batch, &self.context)?;
-                } else {
-                    self.context.logger().info(format!(
-                        "Rejected stale diagnostic publication state_rev={state_rev} current_state_rev={} diag_rev={diag_rev} current_diag_rev={}",
-                        self.state_rev, self.diag_rev,
-                    ));
-                    // A launch-time document open supersedes the initial
-                    // diagnostics; recompute them at the current revision so
-                    // workspace errors still surface.
-                    if is_startup
-                        && self.startup_pending
-                        && !self.startup_edited
-                        && let Some(cmd_tx) = cmd_tx
-                    {
-                        cmd_tx
-                            .send(WorkerCmd::StartupDiagnostics {
-                                state_rev: self.state_rev,
-                                diag_rev: self.diag_rev,
-                            })
-                            .ok();
+                let current = state_rev == self.state_rev && diag_rev == self.diag_rev;
+                match batch {
+                    Some(batch) if current => {
+                        self.startup_pending = false;
+                        self.diagnostics.apply_and_flush(batch, &self.context)?;
+                        return Ok(());
                     }
+                    Some(_) => {
+                        self.context.logger().info(format!(
+                            "Rejected stale diagnostic publication state_rev={state_rev} current_state_rev={} diag_rev={diag_rev} current_diag_rev={}",
+                            self.state_rev, self.diag_rev,
+                        ));
+                    }
+                    None => {
+                        self.context.logger().info(format!(
+                            "Diagnostic computation aborted state_rev={state_rev} current_state_rev={} diag_rev={diag_rev} current_diag_rev={}",
+                            self.state_rev, self.diag_rev,
+                        ));
+                    }
+                }
+                // A launch-time document open can supersede the initial batch
+                // before it starts computing, and an abort can leave no batch at
+                // all. Recompute at the current revision so workspace errors
+                // still surface, unless an edit or save has established a newer
+                // baseline.
+                if is_startup
+                    && self.startup_pending
+                    && !self.startup_edited
+                    && let Some(cmd_tx) = cmd_tx
+                {
+                    cmd_tx
+                        .send(WorkerCmd::StartupDiagnostics {
+                            state_rev: self.state_rev,
+                            diag_rev: self.diag_rev,
+                        })
+                        .ok();
                 }
             }
             WorkerEvent::WatchRoots { state_rev, roots } => {
@@ -1631,12 +1646,40 @@ fn worker_main<'a>(
             }
         };
 
-    while let Ok(cmd) = cmd_rx.recv() {
+    let mut deferred: Option<WorkerCmd> = None;
+    loop {
+        let cmd = match deferred.take() {
+            Some(cmd) => cmd,
+            None => match cmd_rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            },
+        };
         match cmd {
             WorkerCmd::DocumentsChanged {
-                state_rev,
-                documents,
+                mut state_rev,
+                mut documents,
             } => {
+                // The protocol thread coalesces edits already buffered in the
+                // connection, but edits arriving while the worker is busy enqueue
+                // separate commands. Merge them so a burst triggers one rebuild.
+                while let Ok(next) = cmd_rx.try_recv() {
+                    match next {
+                        WorkerCmd::DocumentsChanged {
+                            state_rev: next_rev,
+                            documents: more,
+                        } => {
+                            state_rev = next_rev;
+                            documents.extend(more);
+                        }
+                        // The protocol thread already answered the cancellation.
+                        WorkerCmd::Request { cancel, .. } if cancel.is_cancelled() => {}
+                        other => {
+                            deferred = Some(other);
+                            break;
+                        }
+                    }
+                }
                 let borrowed: Vec<(PathBuf, Option<&Buffer>)> = documents
                     .iter()
                     .map(|(path, buffer)| (path.clone(), buffer.as_ref()))
@@ -1667,11 +1710,13 @@ fn worker_main<'a>(
                 diag_rev,
                 path,
             } => {
-                // Always run the check so the server refreshes its state and
-                // quick fixes; the protocol thread rejects a superseded batch.
+                // Abort only when a save has already superseded this check; a
+                // plain edit in another file must still refresh this batch's
+                // cached quick fixes.
+                let stale = || latest_diag_rev.load(Ordering::Acquire) != diag_rev;
                 let cancel = CancelToken::default();
                 set_current_cancel(cancel);
-                let result = server.check(path, &context);
+                let result = server.check_cancellable(path, &context, &stale);
                 clear_current_cancel();
                 match result {
                     Ok(Some(batch)) => {
@@ -1680,7 +1725,7 @@ fn worker_main<'a>(
                                 state_rev,
                                 diag_rev,
                                 is_startup: false,
-                                batch,
+                                batch: Some(batch),
                             })
                             .ok();
                     }
@@ -1704,7 +1749,9 @@ fn worker_main<'a>(
                 let result = server.startup_diagnostics(&context, &stale);
                 clear_current_cancel();
                 match result {
-                    Ok(Some(batch)) => {
+                    // Report aborts too so the protocol thread can retry when a
+                    // launch-time document open superseded this computation.
+                    Ok(batch) => {
                         event_tx
                             .send(WorkerEvent::Diagnostics {
                                 state_rev,
@@ -1714,7 +1761,6 @@ fn worker_main<'a>(
                             })
                             .ok();
                     }
-                    Ok(None) => {}
                     Err(err) => {
                         event_tx.send(WorkerEvent::Error(format!("{err:#}"))).ok();
                     }
@@ -1778,6 +1824,17 @@ pub trait LanguageServer: Send {
     fn files_changed(&mut self, paths: Vec<PathBuf>, ctx: &LspContext) -> anyhow::Result<()>;
     fn check(&mut self, path: PathBuf, ctx: &LspContext)
     -> anyhow::Result<Option<DiagnosticBatch>>;
+    /// Like [`LanguageServer::check`], but lets `should_abort` stop work that a
+    /// newer save has superseded. The default ignores it and calls [`check`].
+    fn check_cancellable(
+        &mut self,
+        path: PathBuf,
+        ctx: &LspContext,
+        should_abort: &(dyn Fn() -> bool + Sync),
+    ) -> anyhow::Result<Option<DiagnosticBatch>> {
+        let _ = should_abort;
+        self.check(path, ctx)
+    }
     /// Computes the initial workspace diagnostics without publishing them.
     ///
     /// The default implementation reports nothing; servers with real analysis
@@ -2303,6 +2360,11 @@ mod tests {
         watch_roots: Vec<PathBuf>,
         code_actions: Vec<lsp::CodeAction>,
         startup_batch: Option<DiagnosticBatch>,
+        /// When set, the first startup call waits on these barriers before
+        /// deciding whether to abort, so tests can supersede it deterministically.
+        startup_entered: Option<Arc<Barrier>>,
+        startup_release: Option<Arc<Barrier>>,
+        abort_startup: bool,
     }
 
     impl LanguageServer for StubServer {
@@ -2357,8 +2419,21 @@ mod tests {
         fn startup_diagnostics(
             &mut self,
             _ctx: &LspContext,
-            _should_abort: &(dyn Fn() -> bool + Sync),
+            should_abort: &(dyn Fn() -> bool + Sync),
         ) -> anyhow::Result<Option<DiagnosticBatch>> {
+            if let Some(events) = &self.events {
+                events.lock().unwrap().push("startup".into());
+            }
+            // Only the first attempt blocks, so a retry can proceed unattended.
+            if let Some(entered) = self.startup_entered.take() {
+                entered.wait();
+            }
+            if let Some(release) = self.startup_release.take() {
+                release.wait();
+            }
+            if self.abort_startup && should_abort() {
+                return Ok(None);
+            }
             Ok(self.startup_batch.clone())
         }
 
@@ -4148,18 +4223,43 @@ mod tests {
             Ok(())
         }
 
+        fn documents_changed(
+            &mut self,
+            documents: &[(PathBuf, Option<&Buffer>)],
+            _ctx: &LspContext,
+        ) -> anyhow::Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("batch:{}", documents.len()));
+            Ok(())
+        }
+
         fn files_changed(&mut self, _paths: Vec<PathBuf>, _ctx: &LspContext) -> anyhow::Result<()> {
             Ok(())
         }
 
         fn check(
             &mut self,
+            path: PathBuf,
+            ctx: &LspContext,
+        ) -> anyhow::Result<Option<DiagnosticBatch>> {
+            self.check_cancellable(path, ctx, &|| false)
+        }
+
+        fn check_cancellable(
+            &mut self,
             _path: PathBuf,
             _ctx: &LspContext,
+            should_abort: &(dyn Fn() -> bool + Sync),
         ) -> anyhow::Result<Option<DiagnosticBatch>> {
             self.events.lock().unwrap().push("check:start".into());
             self.entered.wait();
             self.release.wait();
+            if should_abort() {
+                self.events.lock().unwrap().push("check:aborted".into());
+                return Ok(None);
+            }
             self.events.lock().unwrap().push("check:end".into());
             Ok(self.check_batch.take())
         }
@@ -4417,5 +4517,283 @@ mod tests {
         assert!(messages.iter().any(
             |message| matches!(message, Message::Response(response) if response.id == RequestId::from(99))
         ));
+    }
+
+    #[test]
+    fn startup_diagnostics_retry_after_launch_time_open() {
+        let (mut server, client) = memory_server();
+        server.startup_pending = true;
+        let path = PathBuf::from("C:/test.reds");
+        let batch = DiagnosticBatch {
+            compiler: BTreeMap::from([(
+                path.clone(),
+                vec![lsp::Diagnostic {
+                    range: lsp::Range::default(),
+                    message: "startup".into(),
+                    ..Default::default()
+                }],
+            )]),
+            reads: BTreeMap::new(),
+            configs: BTreeMap::new(),
+            versions: HashMap::from([(path.clone(), 1)]),
+        };
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        server.server = Box::new(StubServer {
+            startup_batch: Some(batch),
+            startup_entered: Some(entered.clone()),
+            startup_release: Some(release.clone()),
+            abort_startup: true,
+            allow_document_changes: true,
+            events: Some(events.clone()),
+            ..Default::default()
+        });
+
+        let handle = std::thread::spawn(move || server.run());
+        // The worker is computing the initial batch; supersede it with a
+        // launch-time open, which is not an edit.
+        entered.wait();
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidOpenTextDocument::METHOD.into(),
+                json!({
+                    "textDocument": {
+                        "uri": "file:///C:/test.reds",
+                        "languageId": "redscript",
+                        "version": 1,
+                        "text": "test"
+                    }
+                }),
+            )))
+            .unwrap();
+        loop {
+            let log = receive_log(&client, lsp::MessageType::INFO);
+            if log.contains("Document open") {
+                break;
+            }
+        }
+        release.wait();
+        // Wait until the aborted attempt has been observed and a retry queued.
+        loop {
+            let log = receive_log(&client, lsp::MessageType::INFO);
+            if log.contains("Diagnostic computation aborted") {
+                break;
+            }
+        }
+        queue_shutdown(&client);
+        handle.join().unwrap().unwrap();
+
+        let published = publish_notifications(&client.receiver);
+        assert_eq!(published.len(), 1, "{published:?}");
+        assert_eq!(published[0].uri, uri_from_path(&path).unwrap());
+        assert_eq!(published[0].diagnostics[0].message, "startup");
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| *event == "startup")
+                .count(),
+            2,
+            "the aborted initial computation must be retried once"
+        );
+    }
+
+    #[test]
+    fn worker_coalesces_queued_document_changes() {
+        let (mut server, client) = memory_server();
+        let (entered, release, events) = blocking_server(&mut server, None);
+        let uri = "file:///C:/test.reds";
+        send_request(
+            &client,
+            1,
+            lsp::request::HoverRequest::METHOD,
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 0, "character": 3 } }),
+        );
+        let handle = std::thread::spawn(move || server.run());
+
+        // Keep the worker busy while two change batches are enqueued. The
+        // cancellations in between stop the protocol thread from merging them,
+        // so the worker itself has to coalesce them.
+        entered.wait();
+        queue_change(&client, uri, 2, json!([{ "text": "one" }]));
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::Cancel::METHOD.into(),
+                json!({ "id": 999 }),
+            )))
+            .unwrap();
+        queue_change(&client, uri, 3, json!([{ "text": "two" }]));
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::Cancel::METHOD.into(),
+                json!({ "id": 998 }),
+            )))
+            .unwrap();
+        loop {
+            let log = receive_log(&client, lsp::MessageType::INFO);
+            if log.contains("Cancellation received id=998") {
+                break;
+            }
+        }
+        release.wait();
+        queue_shutdown(&client);
+        handle.join().unwrap().unwrap();
+        receive_response(&client, 1);
+        receive_response(&client, 99);
+
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("batch:"))
+                .count(),
+            1,
+            "queued changes must produce a single rebuild: {events:?}"
+        );
+        assert!(events.iter().any(|event| event == "batch:2"), "{events:?}");
+    }
+
+    #[test]
+    fn queued_cancelled_request_is_skipped_by_worker() {
+        let (mut server, client) = memory_server();
+        let (entered, release, events) = blocking_server(&mut server, None);
+        let uri = "file:///C:/test.reds";
+        send_request(
+            &client,
+            1,
+            lsp::request::HoverRequest::METHOD,
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 0, "character": 3 } }),
+        );
+        let handle = std::thread::spawn(move || server.run());
+
+        entered.wait();
+        send_request(
+            &client,
+            2,
+            lsp::request::HoverRequest::METHOD,
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 0, "character": 3 } }),
+        );
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::Cancel::METHOD.into(),
+                json!({ "id": 2 }),
+            )))
+            .unwrap();
+        loop {
+            let log = receive_log(&client, lsp::MessageType::INFO);
+            if log.contains("Request cancelled id=2") {
+                break;
+            }
+        }
+        release.wait();
+        queue_shutdown(&client);
+        handle.join().unwrap().unwrap();
+
+        let responses: Vec<Response> = client
+            .receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                Message::Response(response) => Some(response),
+                _ => None,
+            })
+            .collect();
+        let cancelled = responses
+            .iter()
+            .find(|response| response.id == RequestId::from(2))
+            .expect("cancelled request response");
+        assert_eq!(
+            cancelled.response_result.as_ref().unwrap_err().code,
+            ErrorCode::RequestCanceled as i32
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.id == RequestId::from(1)
+                    && response.response_result.is_ok())
+        );
+        // The cancelled queued request never reached the handler.
+        assert_eq!(*events.lock().unwrap(), ["hover:start", "hover:end"]);
+    }
+
+    #[test]
+    fn superseded_checks_abort_before_recomputing() {
+        let (mut server, client) = memory_server();
+        let path = PathBuf::from("C:/test.reds");
+        let batch = DiagnosticBatch {
+            compiler: BTreeMap::from([(
+                path.clone(),
+                vec![lsp::Diagnostic {
+                    range: lsp::Range::default(),
+                    message: "saved".into(),
+                    ..Default::default()
+                }],
+            )]),
+            reads: BTreeMap::new(),
+            configs: BTreeMap::new(),
+            versions: HashMap::from([(path.clone(), 1)]),
+        };
+        let (entered, release, events) = blocking_server(&mut server, Some(batch));
+        let uri = "file:///C:/test.reds";
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidSaveTextDocument::METHOD.into(),
+                json!({ "textDocument": { "uri": uri } }),
+            )))
+            .unwrap();
+        let handle = std::thread::spawn(move || server.run());
+
+        // The first check is blocked; a second save supersedes it.
+        entered.wait();
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidSaveTextDocument::METHOD.into(),
+                json!({ "textDocument": { "uri": uri } }),
+            )))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::Cancel::METHOD.into(),
+                json!({ "id": 999 }),
+            )))
+            .unwrap();
+        loop {
+            let log = receive_log(&client, lsp::MessageType::INFO);
+            if log.contains("Cancellation received id=999") {
+                break;
+            }
+        }
+        release.wait();
+        // Let the superseded check finish, then serve the latest save.
+        entered.wait();
+        release.wait();
+        queue_shutdown(&client);
+        handle.join().unwrap().unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "check:aborted")
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(
+            events.iter().filter(|event| *event == "check:end").count(),
+            1,
+            "{events:?}"
+        );
+        let published = publish_notifications(&client.receiver);
+        assert_eq!(published.len(), 1, "{published:?}");
+        assert_eq!(published[0].diagnostics[0].message, "saved");
     }
 }

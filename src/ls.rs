@@ -1235,16 +1235,17 @@ impl RedscriptLanguageServer {
         ctx.logger().info("Query analysis=speculative snapshot");
         // A query owns its storage; speculative sources never enter the active cache.
         let sources = ast::SourceMap::new();
-        base.with_sources(|active| {
-            for (_, file) in active.files() {
-                if dialect::identity(file.path()) != path
-                    && base.borrow_file_ids().contains_key(file.path())
-                    && workspace
-                {
-                    sources.push_back(file.path(), file.source());
+        if workspace {
+            base.with_sources(|active| {
+                for (_, file) in active.files() {
+                    if dialect::identity(file.path()) != path
+                        && base.borrow_file_ids().contains_key(file.path())
+                    {
+                        sources.push_back(file.path(), file.source());
+                    }
                 }
-            }
-        });
+            });
+        }
         let mut contents = loc.doc().buffer().contents().to_string();
         if let Some(range) = patch {
             contents.replace_range(range.clone(), &" ".repeat(range.len()));
@@ -1257,11 +1258,13 @@ impl RedscriptLanguageServer {
         }
 
         let id = sources.push_back(&path, contents);
+        cancelled()?;
         let query_cache = CompilationCache::from_sources(
             base.borrow_cache_bytes().clone(),
             sources,
             TypeInterner::default(),
         )?;
+        cancelled()?;
         query_cache.query_at(id, loc.pos(), cb, ctx)
     }
 
@@ -1372,9 +1375,18 @@ impl LanguageServer for RedscriptLanguageServer {
         path: PathBuf,
         ctx: &LspContext,
     ) -> anyhow::Result<Option<DiagnosticBatch>> {
+        self.check_cancellable(path, ctx, &|| false)
+    }
+
+    fn check_cancellable(
+        &mut self,
+        path: PathBuf,
+        ctx: &LspContext,
+        should_abort: &(dyn Fn() -> bool + Sync),
+    ) -> anyhow::Result<Option<DiagnosticBatch>> {
         if path.file_name().is_some_and(|name| name == ".redscript") {
             self.files_changed(vec![path], ctx)?;
-            return self.collect_diagnostic_batch(ctx, || false);
+            return self.collect_diagnostic_batch(ctx, should_abort);
         }
 
         let path = dialect::identity(&path);
@@ -1385,7 +1397,7 @@ impl LanguageServer for RedscriptLanguageServer {
             self.standalone_paths.insert(path);
         }
         self.rebuild(ctx)?;
-        self.collect_diagnostic_batch(ctx, || false)
+        self.collect_diagnostic_batch(ctx, should_abort)
     }
 
     fn startup_diagnostics(
