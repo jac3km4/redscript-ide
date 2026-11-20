@@ -279,10 +279,12 @@ impl LspServer<'_> {
                     ..
                 } = serde_json::from_value(params).map_err(invalid_params)?;
                 let doc = self.document(&text_document.uri).map_err(invalid_params)?;
-                response_value(
-                    self.server
-                        .format(doc, options.tab_size as u16, &self.context),
-                )
+                response_value(self.server.format(
+                    doc,
+                    // Guard the truncating cast; LSP `tabSize` is a `u32`.
+                    u16::try_from(options.tab_size).unwrap_or(4).max(1),
+                    &self.context,
+                ))
             }
             lsp::request::CodeActionRequest::METHOD => {
                 let lsp::CodeActionParams {

@@ -32,6 +32,11 @@ const DIAGNOSTIC_PASSES: &[&'static (dyn DiagnosticPass + 'static)] = &[&UnusedL
 const EMBEDDED_CACHE: &[u8] = include_bytes!("../assets/api.redscripts.zlib");
 const REDMOD_SUBSET_DOCS_URL: &str =
     "https://github.com/jac3km4/redscript/blob/v1.0.0/crates/compiler/redmod/adapter/README.md";
+/// The pinned REDmod adapter reports a missing statement terminator as a
+/// recovery *message* rather than a typed error kind. Keep the exact match in
+/// one place so a future adapter revision with structured errors only needs a
+/// single change.
+const REDMOD_MISSING_SEMICOLON: &str = "expected ';' after statement in statement";
 
 #[derive(Clone)]
 enum CacheBytes {
@@ -677,17 +682,25 @@ impl RedscriptLanguageServer {
     fn format_document(
         &self,
         doc: Document<'_>,
-        _tab_size: u16,
+        tab_size: u16,
         ctx: &LspContext,
     ) -> anyhow::Result<Vec<lsp::TextEdit>> {
         let Some(dialect) = Dialect::of(doc.path()) else {
             return Ok(vec![]);
         };
         let resolved = self.resolve_file(doc.path());
-        let settings = resolved
+        let mut settings = resolved
             .as_workspace()
-            .map(|ws| &ws.format_settings)
-            .unwrap_or(&FormatSettings::DEFAULT);
+            .map(|ws| ws.format_settings.clone())
+            .unwrap_or(FormatSettings::DEFAULT);
+        // Fall back to the indentation the client negotiated when `.redscript`
+        // does not explicitly configure `format.indent`.
+        if resolved
+            .as_workspace()
+            .is_none_or(|ws| ws.format_indent.is_none())
+        {
+            settings.indent = tab_size.max(1);
+        }
 
         let contents = doc.buffer().contents();
         let map = ast::SourceMap::new();
@@ -708,7 +721,7 @@ impl RedscriptLanguageServer {
                 }
             },
             Dialect::Community => {
-                let (module, errors) = format_document(file.source(), id, settings);
+                let (module, errors) = format_document(file.source(), id, &settings);
                 if let Some(first) = errors.first() {
                     ctx.logger().info(format!(
                         "Formatting skipped path={}: syntax error ({first})",
@@ -1340,7 +1353,7 @@ fn repair_completion_terminator(source: &mut String, member: Range<usize>) -> bo
             return false;
         };
         // The pinned parser exposes this recovery as a message, not a typed kind.
-        if error.to_string() != "expected ';' after statement in statement" {
+        if error.to_string() != REDMOD_MISSING_SEMICOLON {
             return false;
         }
         let span = error.span();
@@ -2005,6 +2018,8 @@ struct Overlay {
 struct WorkspaceDir {
     roots: Vec<PathBuf>,
     format_settings: FormatSettings,
+    /// Explicit `format.indent` from `.redscript`, if configured.
+    format_indent: Option<u16>,
 }
 
 struct LoadedWorkspace {
@@ -2045,6 +2060,7 @@ impl WorkspaceDir {
         Self {
             roots,
             format_settings: settings,
+            format_indent: dotfile.format.indent,
         }
     }
 
@@ -2337,8 +2353,8 @@ impl Fix {
                         (Some(lsp::NumberOrString::String(actual)), Some(expected)) => {
                             actual == expected
                         }
-                        (Some(_), Some(_)) => false,
-                        _ => true,
+                        (None, None) => true,
+                        _ => false,
                     }
             })
             .cloned()
@@ -4099,6 +4115,47 @@ mod tests {
     }
 
     #[test]
+    fn community_formatting_honors_client_tab_size() {
+        let (temp, server, ctx, _receiver) = fixture();
+        let path = temp.path().join("format.reds");
+        let source = "public class Test {\npublic func Act() {\nreturn;\n}\n}\n";
+        let buffer = crate::buffers::Buffer::new(source.into());
+        let format = |tab: u16| {
+            let edits = server
+                .format_document(Document::new(path.clone(), &buffer), tab, &ctx)
+                .unwrap();
+            assert_eq!(edits.len(), 1, "expected one formatting edit");
+            edits[0].new_text.clone()
+        };
+        assert!(format(2).contains("\n  public func Act"));
+        assert!(format(4).contains("\n    public func Act"));
+    }
+
+    #[test]
+    fn dotfile_format_indent_overrides_client_tab_size() {
+        let temp = tempdir();
+        let cache = temp.path().join("cache.bin");
+        fs::write(
+            &cache,
+            ScriptBundle::default().into_writeable().to_bytes().unwrap(),
+        )
+        .unwrap();
+        fs::write(temp.path().join(".redscript"), "[format]\nindent = 3\n").unwrap();
+        let server = RedscriptLanguageServer::new(&cache, [temp.path()]).unwrap();
+        let (sender, _) = crossbeam_channel::unbounded();
+        let ctx = LspContext::new(sender);
+        let path = temp.path().join("format.reds");
+        let buffer = crate::buffers::Buffer::new(
+            "public class Test {\npublic func Act() {\nreturn;\n}\n}\n".into(),
+        );
+        let edits = server
+            .format_document(Document::new(path, &buffer), 8, &ctx)
+            .unwrap();
+        assert_eq!(edits.len(), 1);
+        assert!(edits[0].new_text.contains("\n   public func Act"));
+    }
+
+    #[test]
     fn unchanged_formatting_and_fixes_reject_redmod_and_stale_targets() {
         let (temp, mut server, ctx, _receiver) = fixture();
         let path = temp.path().join("test.script");
@@ -4182,6 +4239,34 @@ mod tests {
         assert!(matches!(resolved.edit.unwrap().changes, Some(changes) if changes.is_empty()));
     }
 
+    #[test]
+    fn matching_diagnostics_require_identical_codes() {
+        let fix = Fix {
+            kind: FixKind::MakeFieldPublic,
+            target_name: None,
+            diagnostic_range: Some(lsp::Range::default()),
+            diagnostic_code: Some("INACCESSIBLE_FIELD".into()),
+            uri: "file:///C:/scripts/test.reds".parse().unwrap(),
+            edit: lsp::TextEdit::new(lsp::Range::default(), String::new()),
+            expected_source: String::new(),
+            generation: 0,
+        };
+        let coded = |code: &str| lsp::Diagnostic {
+            code: Some(lsp::NumberOrString::String(code.into())),
+            ..Default::default()
+        };
+        assert_eq!(
+            fix.matching_diagnostics(&[coded("INACCESSIBLE_FIELD")])
+                .len(),
+            1
+        );
+        assert!(fix.matching_diagnostics(&[coded("OTHER")]).is_empty());
+        assert!(
+            fix.matching_diagnostics(&[lsp::Diagnostic::default()])
+                .is_empty()
+        );
+    }
+
     fn server() -> RedscriptLanguageServer {
         RedscriptLanguageServer {
             workspaces: HashMap::new(),
@@ -4216,6 +4301,7 @@ mod tests {
             WorkspaceDir {
                 roots: vec![root.clone()],
                 format_settings: FormatSettings::default(),
+                format_indent: None,
             },
         );
         let sources = ast::SourceMap::new();
@@ -4364,6 +4450,7 @@ mod tests {
             WorkspaceDir {
                 roots: vec![root.clone()],
                 format_settings: FormatSettings::default(),
+                format_indent: None,
             },
         );
         let sources = ast::SourceMap::new();
@@ -4412,6 +4499,7 @@ mod tests {
             WorkspaceDir {
                 roots: vec![root.clone()],
                 format_settings: FormatSettings::default(),
+                format_indent: None,
             },
         );
         let sources = ast::SourceMap::new();
