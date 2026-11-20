@@ -22,6 +22,7 @@ use redscript_dotfile::Dotfile;
 use serde::{Deserialize, Serialize};
 
 use crate::completions;
+use crate::diagnostics::DiagnosticTracker;
 use crate::dialect::{self, Dialect, ParsedSources};
 use crate::query::{AtContext, ExprAt};
 use crate::server::{CodeLocation, Document, LanguageServer, LspContext};
@@ -64,26 +65,29 @@ impl From<Vec<u8>> for CacheBytes {
 
 type FixMap = HashMap<PathBuf, BTreeMap<(u32, u32), Vec<Fix>>>;
 
+/// Accumulates compiler diagnostics and refreshed quick fixes across the
+/// workspace and standalone analyses performed during one publish pass.
+struct CompilerDiagnostics {
+    by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>>,
+    fixes: FixMap,
+}
+
 pub struct RedscriptLanguageServer {
     workspaces: HashMap<PathBuf, WorkspaceDir>,
-    config_diagnostics: BTreeMap<PathBuf, lsp::Diagnostic>,
     config_warnings: BTreeSet<String>,
-    reported_config_warnings: RefCell<BTreeSet<String>>,
-    last_published_configs: RefCell<HashSet<PathBuf>>,
-    read_diagnostics: RefCell<BTreeMap<PathBuf, lsp::Diagnostic>>,
-    io_warnings: RefCell<BTreeSet<String>>,
-    reported_io_warnings: RefCell<BTreeSet<String>>,
-    last_published_reads: RefCell<HashSet<PathBuf>>,
+    reported_config_warnings: BTreeSet<String>,
+    io_warnings: BTreeSet<String>,
+    reported_io_warnings: BTreeSet<String>,
     standalone_paths: HashSet<PathBuf>,
     compilation_cache: CompilationCache,
-    cached_fixes: RefCell<FixMap>,
-    last_published_files: RefCell<HashSet<PathBuf>>,
+    cached_fixes: FixMap,
     overlays: HashMap<PathBuf, Overlay>,
     standalone: HashMap<PathBuf, CompilationCache>,
     generation: u64,
-    missing_roots: RefCell<BTreeSet<PathBuf>>,
-    reported_missing_roots: RefCell<BTreeSet<PathBuf>>,
+    missing_roots: BTreeSet<PathBuf>,
+    reported_missing_roots: BTreeSet<PathBuf>,
     warned_extensions: HashSet<PathBuf>,
+    diagnostics: DiagnosticTracker,
     completion_cache: RefCell<Option<CachedCompletion>>,
 }
 
@@ -140,6 +144,9 @@ impl RedscriptLanguageServer {
             &mut read_diagnostics,
             &mut io_warnings,
         );
+        let mut diagnostics = DiagnosticTracker::default();
+        diagnostics.set_reads(read_diagnostics);
+        diagnostics.set_configs(config_diagnostics);
         Ok(Self {
             compilation_cache: CompilationCache::from_sources(
                 cache_bytes,
@@ -147,23 +154,19 @@ impl RedscriptLanguageServer {
                 TypeInterner::default(),
             )?,
             workspaces,
-            config_diagnostics,
             config_warnings,
-            reported_config_warnings: RefCell::new(BTreeSet::new()),
-            last_published_configs: RefCell::new(HashSet::new()),
-            read_diagnostics: RefCell::new(read_diagnostics),
-            io_warnings: RefCell::new(io_warnings),
-            reported_io_warnings: RefCell::new(BTreeSet::new()),
-            last_published_reads: RefCell::new(HashSet::new()),
+            reported_config_warnings: BTreeSet::new(),
+            io_warnings,
+            reported_io_warnings: BTreeSet::new(),
             standalone_paths: HashSet::new(),
-            cached_fixes: RefCell::new(HashMap::new()),
-            last_published_files: RefCell::new(HashSet::new()),
+            cached_fixes: HashMap::new(),
             overlays: HashMap::new(),
             standalone: HashMap::new(),
             generation: 0,
-            missing_roots: RefCell::new(missing_roots),
-            reported_missing_roots: RefCell::new(BTreeSet::new()),
+            missing_roots,
+            reported_missing_roots: BTreeSet::new(),
             warned_extensions: HashSet::new(),
+            diagnostics,
             completion_cache: RefCell::new(None),
         })
     }
@@ -172,7 +175,7 @@ impl RedscriptLanguageServer {
         self.generation = self.generation.wrapping_add(1);
         // Cached fixes are validated per file against the current source
         // contents, so an unrelated edit must not discard fixes for untouched
-        // files. `publish_diagnostics_with_unit` refreshes each analyzed file's
+        // files. `collect_compiler_diagnostics` refreshes each analyzed file's
         // fixes on every save.
     }
 
@@ -212,19 +215,18 @@ impl RedscriptLanguageServer {
     fn make_snapshot(
         &self,
         roots: impl IntoIterator<Item = PathBuf>,
+        missing_roots: &mut BTreeSet<PathBuf>,
         read_diagnostics: &mut BTreeMap<PathBuf, lsp::Diagnostic>,
         io_warnings: &mut BTreeSet<String>,
     ) -> anyhow::Result<CompilationCache> {
-        let mut missing_roots = BTreeSet::new();
         let sources = collect_workspace_sources(
             roots,
             &self.overlays,
             |path| self.resolve_file(path).as_workspace().is_some(),
-            &mut missing_roots,
+            missing_roots,
             read_diagnostics,
             io_warnings,
         );
-        *self.missing_roots.borrow_mut() = missing_roots;
         CompilationCache::from_sources(
             self.compilation_cache.borrow_cache_bytes().clone(),
             sources,
@@ -269,8 +271,8 @@ impl RedscriptLanguageServer {
             self.completion_cache.borrow_mut().take();
             BTreeMap::new()
         } else {
-            self.read_diagnostics
-                .borrow()
+            self.diagnostics
+                .reads()
                 .iter()
                 .filter(|(path, _)| {
                     self.resolve_file(path).as_workspace().is_some()
@@ -282,8 +284,9 @@ impl RedscriptLanguageServer {
         let mut io_warnings = if reload {
             BTreeSet::new()
         } else {
-            self.io_warnings.borrow().clone()
+            self.io_warnings.clone()
         };
+        let mut missing_roots = BTreeSet::new();
         let workspace = if reload {
             ctx.logger()
                 .info("Rebuild phase=workspace discovery, parsing and analysis");
@@ -291,6 +294,7 @@ impl RedscriptLanguageServer {
                 self.workspaces
                     .values()
                     .flat_map(|workspace| workspace.roots.clone()),
+                &mut missing_roots,
                 &mut read_diagnostics,
                 &mut io_warnings,
             )?
@@ -349,8 +353,11 @@ impl RedscriptLanguageServer {
         self.compilation_cache = workspace;
         self.standalone = standalone;
         self.standalone_paths = active_standalone_paths;
-        *self.read_diagnostics.borrow_mut() = read_diagnostics;
-        *self.io_warnings.borrow_mut() = io_warnings;
+        if reload {
+            self.missing_roots = missing_roots;
+        }
+        self.diagnostics.set_reads(read_diagnostics);
+        self.io_warnings = io_warnings;
         if reload {
             self.log_missing_roots(ctx);
         } else {
@@ -359,102 +366,39 @@ impl RedscriptLanguageServer {
         Ok(())
     }
 
-    pub fn publish_all_diagnostics(&self, ctx: &LspContext) -> anyhow::Result<()> {
-        self.check_workspace_and_publish(ctx)?;
+    pub fn publish_all_diagnostics(&mut self, ctx: &LspContext) -> anyhow::Result<()> {
+        let mut batch = CompilerDiagnostics {
+            by_file: BTreeMap::new(),
+            fixes: std::mem::take(&mut self.cached_fixes),
+        };
+        self.check_workspace(|unit, symbols, diagnostics, sources| {
+            self.collect_compiler_diagnostics(
+                Some(unit),
+                diagnostics,
+                symbols,
+                sources,
+                &mut batch,
+                ctx,
+            )
+        })?;
         for cache in self.standalone.values() {
             cache.analyze(|unit, symbols, diagnostics, sources| {
-                self.publish_diagnostics_with_unit(Some(unit), diagnostics, symbols, sources, ctx)
+                self.collect_compiler_diagnostics(
+                    Some(unit),
+                    diagnostics,
+                    symbols,
+                    sources,
+                    &mut batch,
+                    ctx,
+                )
             })?;
         }
-        // Also clear removed folders, deleted files and closed unsaved standalone files.
-        let active: HashSet<_> = self
-            .compilation_cache
-            .borrow_file_ids()
-            .keys()
-            .chain(self.standalone.keys())
-            .cloned()
-            .collect();
-        let stale: Vec<_> = self
-            .last_published_files
-            .borrow()
-            .difference(&active)
-            .filter(|path| !self.read_diagnostics.borrow().contains_key(*path))
-            .cloned()
-            .collect();
-        for path in stale {
-            ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
-                uri: ctx.uri(&path)?,
-                diagnostics: vec![],
-                version: None,
-            });
-            self.last_published_files.borrow_mut().remove(&path);
-        }
-        for path in self.read_diagnostics.borrow().keys() {
-            self.last_published_files.borrow_mut().remove(path);
-        }
-        self.publish_read_diagnostics(ctx)?;
-        self.publish_config_diagnostics(ctx)?;
-        Ok(())
-    }
-
-    fn publish_read_diagnostics(&self, ctx: &LspContext) -> anyhow::Result<()> {
-        let read_diagnostics = self.read_diagnostics.borrow();
-        let mut last_published = self.last_published_reads.borrow_mut();
-        for (path, diagnostic) in &*read_diagnostics {
-            ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
-                uri: ctx.uri(path)?,
-                diagnostics: vec![diagnostic.clone()],
-                version: None,
-            });
-            last_published.insert(path.clone());
-        }
-        let mut stale: Vec<_> = last_published
-            .iter()
-            .filter(|path| !read_diagnostics.contains_key(*path))
-            .cloned()
-            .collect();
-        stale.sort();
-        let published_files = self.last_published_files.borrow();
-        for path in stale {
-            if !published_files.contains(&path) {
-                ctx.notify::<lsp::notification::PublishDiagnostics>(
-                    lsp::PublishDiagnosticsParams {
-                        uri: ctx.uri(&path)?,
-                        diagnostics: vec![],
-                        version: self.overlays.get(&path).map(|overlay| overlay.version),
-                    },
-                );
-            }
-            last_published.remove(&path);
-        }
-        Ok(())
-    }
-
-    fn publish_config_diagnostics(&self, ctx: &LspContext) -> anyhow::Result<()> {
-        let mut last_published = self.last_published_configs.borrow_mut();
-        for (path, diagnostic) in &self.config_diagnostics {
-            ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
-                uri: ctx.uri(path)?,
-                diagnostics: vec![diagnostic.clone()],
-                version: None,
-            });
-            last_published.insert(path.clone());
-        }
-        let mut stale: Vec<_> = last_published
-            .iter()
-            .filter(|path| !self.config_diagnostics.contains_key(*path))
-            .cloned()
-            .collect();
-        stale.sort();
-        for path in stale {
-            ctx.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
-                uri: ctx.uri(&path)?,
-                diagnostics: vec![],
-                version: None,
-            });
-            last_published.remove(&path);
-        }
-        Ok(())
+        self.cached_fixes = batch.fixes;
+        self.diagnostics.set_compiler(batch.by_file);
+        let overlays = &self.overlays;
+        self.diagnostics.flush(ctx, |path| {
+            overlays.get(path).map(|overlay| overlay.version)
+        })
     }
 
     fn resolve_file(&self, path: &Path) -> FileResolution<'_> {
@@ -795,7 +739,7 @@ impl RedscriptLanguageServer {
             Some(ws_root) => FixScope::Workspace(ws_root),
             None => FixScope::Standalone(path.clone()),
         };
-        let fixes = self.cached_fixes.borrow();
+        let fixes = &self.cached_fixes;
 
         let mut actions = Vec::new();
         let mut fix_all_kinds = Vec::new();
@@ -853,7 +797,6 @@ impl RedscriptLanguageServer {
                 actions.push(fix_all);
             }
         }
-        drop(fixes);
         actions
             .into_iter()
             .map(|action| {
@@ -888,7 +831,7 @@ impl RedscriptLanguageServer {
 
                 #[allow(clippy::mutable_key_type)]
                 let mut edits = std::collections::HashMap::<lsp::Uri, Vec<lsp::TextEdit>>::new();
-                let fixes = self.cached_fixes.borrow();
+                let fixes = &self.cached_fixes;
                 let mut selected = Vec::new();
                 match &scope {
                     FixScope::Standalone(target) => {
@@ -897,7 +840,7 @@ impl RedscriptLanguageServer {
                         }
                     }
                     FixScope::Workspace(ws_root) => {
-                        for (path, slots) in fixes.iter() {
+                        for (path, slots) in fixes {
                             if self.workspace_root_for(path).as_ref() == Some(ws_root) {
                                 selected.extend(slots.values().flatten());
                             }
@@ -915,7 +858,6 @@ impl RedscriptLanguageServer {
                             .push(fix.edit.clone());
                     }
                 }
-                drop(fixes);
 
                 action.edit = Some(self.workspace_edit(edits.into_iter().collect(), ctx));
             }
@@ -997,15 +939,13 @@ impl RedscriptLanguageServer {
         }
     }
 
-    pub fn log_missing_roots(&self, ctx: &LspContext) {
-        let current = self.missing_roots.borrow();
-        let mut reported = self.reported_missing_roots.borrow_mut();
+    pub fn log_missing_roots(&mut self, ctx: &LspContext) {
         let configured: HashSet<_> = self
             .workspaces
             .values()
             .flat_map(|workspace| workspace.roots.iter())
             .collect();
-        for root in reported.difference(&current) {
+        for root in self.reported_missing_roots.difference(&self.missing_roots) {
             if configured.contains(root) {
                 ctx.logger().info(format!(
                     "Source root '{}' is available again.",
@@ -1013,7 +953,8 @@ impl RedscriptLanguageServer {
                 ));
             }
         }
-        for root in current.difference(&reported) {
+        drop(configured);
+        for root in self.missing_roots.difference(&self.reported_missing_roots) {
             let message = format!(
                 "Source root '{}' is missing; treating it as temporarily empty. Restore/create the directory or update source_roots in .redscript, then refresh the workspace.",
                 root.display()
@@ -1021,29 +962,29 @@ impl RedscriptLanguageServer {
             ctx.logger().warn(&message);
             ctx.show_message(lsp::MessageType::WARNING, message);
         }
-        *reported = current.clone();
-        drop(reported);
+        self.reported_missing_roots.clone_from(&self.missing_roots);
         self.log_config_warnings(ctx);
         self.log_io_warnings(ctx);
     }
 
-    fn log_io_warnings(&self, ctx: &LspContext) {
-        let current = self.io_warnings.borrow();
-        let mut reported = self.reported_io_warnings.borrow_mut();
-        for warning in current.difference(&reported) {
+    fn log_io_warnings(&mut self, ctx: &LspContext) {
+        for warning in self.io_warnings.difference(&self.reported_io_warnings) {
             ctx.logger().warn(warning);
             ctx.show_message(lsp::MessageType::WARNING, warning);
         }
-        *reported = current.clone();
+        self.reported_io_warnings.clone_from(&self.io_warnings);
     }
 
-    fn log_config_warnings(&self, ctx: &LspContext) {
-        let mut reported = self.reported_config_warnings.borrow_mut();
-        for warning in self.config_warnings.difference(&reported) {
+    fn log_config_warnings(&mut self, ctx: &LspContext) {
+        for warning in self
+            .config_warnings
+            .difference(&self.reported_config_warnings)
+        {
             ctx.logger().warn(warning);
             ctx.show_message(lsp::MessageType::WARNING, warning);
         }
-        *reported = self.config_warnings.clone();
+        self.reported_config_warnings
+            .clone_from(&self.config_warnings);
     }
 
     fn reload_workspaces(&mut self) {
@@ -1060,45 +1001,53 @@ impl RedscriptLanguageServer {
             workspaces.insert(dir.clone(), loaded.workspace);
         }
         self.workspaces = workspaces;
-        self.config_diagnostics = config_diagnostics;
+        self.diagnostics.set_configs(config_diagnostics);
         self.config_warnings = config_warnings;
-    }
-
-    fn check_workspace_and_publish(&self, ctx: &LspContext) -> anyhow::Result<()> {
-        self.check_workspace(|unit, symbols, diags, sources| {
-            self.publish_diagnostics_with_unit(Some(unit), diags, symbols, sources, ctx)
-        })
     }
 
     fn check_workspace<A>(
         &self,
-        cb: impl for<'ctx> Fn(
+        mut cb: impl for<'ctx> FnMut(
             &LoweredCompilationUnit<'ctx>,
             &Symbols<'ctx>,
             &[&Diagnostic<'ctx>],
             &'ctx ast::SourceMap,
         ) -> anyhow::Result<A>,
     ) -> anyhow::Result<A> {
-        self.compilation_cache.analyze(cb)
+        self.compilation_cache.analyze(&mut cb)
     }
 
     #[cfg(test)]
     fn publish_diagnostics<'ctx>(
-        &self,
+        &mut self,
         diags: &[&Diagnostic<'ctx>],
         symbols: &Symbols<'ctx>,
         sources: &'ctx ast::SourceMap,
         ctx: &LspContext,
     ) -> anyhow::Result<()> {
-        self.publish_diagnostics_with_unit(None, diags, symbols, sources, ctx)
+        let mut batch = CompilerDiagnostics {
+            by_file: BTreeMap::new(),
+            fixes: std::mem::take(&mut self.cached_fixes),
+        };
+        self.collect_compiler_diagnostics(None, diags, symbols, sources, &mut batch, ctx)?;
+        self.cached_fixes = batch.fixes;
+        self.diagnostics.set_compiler(batch.by_file);
+        let overlays = &self.overlays;
+        self.diagnostics.flush(ctx, |path| {
+            overlays.get(path).map(|overlay| overlay.version)
+        })
     }
 
-    fn publish_diagnostics_with_unit<'ctx>(
+    /// Converts the compiler diagnostics produced for `sources` into LSP
+    /// diagnostics, refreshing the quick-fix cache for every analyzed file,
+    /// and accumulates them into `batch` for a later `flush`.
+    fn collect_compiler_diagnostics<'ctx>(
         &self,
         unit: Option<&LoweredCompilationUnit<'ctx>>,
         diags: &[&Diagnostic<'ctx>],
         symbols: &Symbols<'ctx>,
         sources: &'ctx ast::SourceMap,
+        batch: &mut CompilerDiagnostics,
         ctx: &LspContext,
     ) -> anyhow::Result<()> {
         let mut file_diags = HashMap::new();
@@ -1112,21 +1061,15 @@ impl RedscriptLanguageServer {
             }
         }
 
-        let mut last_diagnostics = self.last_published_files.borrow_mut();
-        let mut fixes = self.cached_fixes.borrow_mut();
         for (_, file) in sources.files() {
-            fixes.remove(file.path());
+            batch.fixes.remove(file.path());
         }
 
-        let mut publications = Vec::new();
-        let mut current_files = HashSet::new();
         for (file, diags) in file_diags {
             let file = sources.get(file).context("missing source file")?;
             let path = file.path();
 
-            current_files.insert(path.to_owned());
-
-            let slots = fixes.entry_ref(path).or_default();
+            let slots = batch.fixes.entry_ref(path).or_default();
             for diag in &diags {
                 if Dialect::of(path) == Some(Dialect::Community)
                     && let Some(fix) = generate_fix(diag, file, unit, symbols, sources, ctx)
@@ -1150,93 +1093,53 @@ impl RedscriptLanguageServer {
                     message_b,
                 ))
             });
-            publications.push((
-                path,
-                lsp::PublishDiagnosticsParams {
-                    uri: ctx.uri(path)?,
-                    diagnostics: diags
-                        .into_iter()
-                        .filter_map(|(diag, message)| {
-                            let is_redmod_capability = diag.code() == "REDMOD_CAPABILITY";
-                            let message = if is_redmod_capability {
-                                format!("unsupported by IDE REDmod analyzer: {message}")
-                            } else {
-                                message
-                            };
-                            let code_description = is_redmod_capability
-                                .then(|| REDMOD_SUBSET_DOCS_URL.parse().ok())
-                                .flatten()
-                                .map(|href| lsp::CodeDescription { href });
-                            Some(lsp::Diagnostic {
-                                range: range(diag.span(), file)?,
-                                severity: Some(if diag.is_error() {
-                                    lsp::DiagnosticSeverity::ERROR
-                                } else {
-                                    lsp::DiagnosticSeverity::WARNING
-                                }),
-                                code: Some(lsp::NumberOrString::String(diag.code().into())),
-                                code_description,
-                                source: Some("redscript".into()),
-                                message,
-                                related_information: {
-                                    let related: Vec<_> = diag
-                                        .related_locations()
-                                        .filter_map(|(span, message)| {
-                                            let file = sources.get(span.file)?;
-                                            Some(lsp::DiagnosticRelatedInformation {
-                                                location: lsp::Location {
-                                                    uri: ctx.uri(file.path()).ok()?,
-                                                    range: range(span, file)?,
-                                                },
-                                                message: message.into(),
-                                            })
-                                        })
-                                        .collect();
-                                    (!related.is_empty()).then_some(related)
-                                },
-                                tags: diagnostic_tags(diag, ctx),
-                                ..Default::default()
-                            })
-                        })
-                        .collect(),
-                    version: self.overlays.get(path).map(|overlay| overlay.version),
-                },
-            ));
+            let diagnostics = diags
+                .into_iter()
+                .filter_map(|(diag, message)| {
+                    let is_redmod_capability = diag.code() == "REDMOD_CAPABILITY";
+                    let message = if is_redmod_capability {
+                        format!("unsupported by IDE REDmod analyzer: {message}")
+                    } else {
+                        message
+                    };
+                    let code_description = is_redmod_capability
+                        .then(|| REDMOD_SUBSET_DOCS_URL.parse().ok())
+                        .flatten()
+                        .map(|href| lsp::CodeDescription { href });
+                    Some(lsp::Diagnostic {
+                        range: range(diag.span(), file)?,
+                        severity: Some(if diag.is_error() {
+                            lsp::DiagnosticSeverity::ERROR
+                        } else {
+                            lsp::DiagnosticSeverity::WARNING
+                        }),
+                        code: Some(lsp::NumberOrString::String(diag.code().into())),
+                        code_description,
+                        source: Some("redscript".into()),
+                        message,
+                        related_information: {
+                            let related: Vec<_> = diag
+                                .related_locations()
+                                .filter_map(|(span, message)| {
+                                    let file = sources.get(span.file)?;
+                                    Some(lsp::DiagnosticRelatedInformation {
+                                        location: lsp::Location {
+                                            uri: ctx.uri(file.path()).ok()?,
+                                            range: range(span, file)?,
+                                        },
+                                        message: message.into(),
+                                    })
+                                })
+                                .collect();
+                            (!related.is_empty()).then_some(related)
+                        },
+                        tags: diagnostic_tags(diag, ctx),
+                        ..Default::default()
+                    })
+                })
+                .collect();
+            batch.by_file.insert(path.to_owned(), diagnostics);
         }
-        let analyzed_paths: HashSet<_> = sources
-            .files()
-            .map(|(_, file)| file.path().to_owned())
-            .collect();
-        let is_workspace = sources
-            .files()
-            .any(|(_, file)| self.resolve_file(file.path()).as_workspace().is_some());
-        let read_diagnostics = self.read_diagnostics.borrow();
-        for path in last_diagnostics.difference(&current_files).filter(|path| {
-            !read_diagnostics.contains_key(*path)
-                && (analyzed_paths.contains(*path)
-                    || (is_workspace && self.resolve_file(path).as_workspace().is_some())
-                    || (!self.overlays.contains_key(*path) && !path.exists()))
-        }) {
-            publications.push((
-                path.as_path(),
-                lsp::PublishDiagnosticsParams {
-                    uri: ctx.uri(path)?,
-                    diagnostics: vec![],
-                    version: self.overlays.get(path).map(|overlay| overlay.version),
-                },
-            ));
-        }
-        publications.sort_by_key(|(path, _)| *path);
-        for (_, params) in publications {
-            ctx.notify::<lsp::notification::PublishDiagnostics>(params);
-        }
-
-        last_diagnostics.retain(|path| {
-            !analyzed_paths.contains(path)
-                && !(is_workspace && self.resolve_file(path).as_workspace().is_some())
-                && (path.exists() || self.overlays.contains_key(path))
-        });
-        last_diagnostics.extend(current_files);
         Ok(())
     }
 
@@ -2019,7 +1922,7 @@ impl<'ctx> AnalyzedSources<'ctx> {
 impl CompilationCache {
     fn analyze<A>(
         &self,
-        cb: impl for<'ctx> Fn(
+        mut cb: impl for<'ctx> FnMut(
             &LoweredCompilationUnit<'ctx>,
             &Symbols<'ctx>,
             &[&Diagnostic<'ctx>],
@@ -2704,7 +2607,7 @@ mod tests {
         let (temp, _server, ctx, receiver) = fixture();
         let path = temp.path().join("broken.reds");
         fs::write(&path, "public class {").unwrap();
-        let server =
+        let mut server =
             RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
         server.log_missing_roots(&ctx);
         server.publish_all_diagnostics(&ctx).unwrap();
@@ -2807,12 +2710,7 @@ mod tests {
             fs::write(&path, "class Fixed {}").unwrap();
             server.files_changed(vec![path.clone()], &ctx).unwrap();
             assert!(publications().is_empty());
-            assert!(
-                server
-                    .last_published_files
-                    .borrow()
-                    .contains(&dialect::identity(&path))
-            );
+            assert!(server.diagnostics.is_published(&dialect::identity(&path)));
 
             server.check(path.clone(), &ctx).unwrap();
             let saved = publications();
@@ -3616,10 +3514,7 @@ mod tests {
         // Exercise startup discovery too, before an LspContext is available.
         let mut server =
             RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
-        assert_eq!(
-            server.missing_roots.borrow().len(),
-            usize::from(initially_missing)
-        );
+        assert_eq!(server.missing_roots.len(), usize::from(initially_missing));
         server.log_missing_roots(&ctx);
         let startup: Vec<_> = receiver.try_iter().collect();
         assert_eq!(
@@ -4432,7 +4327,6 @@ mod tests {
         };
         server
             .cached_fixes
-            .borrow_mut()
             .entry(community)
             .or_default()
             .insert((0, 1), vec![redmod_fix]);
@@ -4482,24 +4376,20 @@ mod tests {
     fn server() -> RedscriptLanguageServer {
         RedscriptLanguageServer {
             workspaces: HashMap::new(),
-            config_diagnostics: BTreeMap::new(),
             config_warnings: BTreeSet::new(),
-            reported_config_warnings: RefCell::new(BTreeSet::new()),
-            last_published_configs: RefCell::new(HashSet::new()),
-            read_diagnostics: RefCell::new(BTreeMap::new()),
-            io_warnings: RefCell::new(BTreeSet::new()),
-            reported_io_warnings: RefCell::new(BTreeSet::new()),
-            last_published_reads: RefCell::new(HashSet::new()),
+            reported_config_warnings: BTreeSet::new(),
+            io_warnings: BTreeSet::new(),
+            reported_io_warnings: BTreeSet::new(),
             standalone_paths: HashSet::new(),
             compilation_cache: CompilationCache::default(),
-            cached_fixes: RefCell::new(HashMap::new()),
-            last_published_files: RefCell::new(HashSet::new()),
+            cached_fixes: HashMap::new(),
             overlays: HashMap::new(),
             standalone: HashMap::new(),
             generation: 0,
-            missing_roots: RefCell::new(BTreeSet::new()),
-            reported_missing_roots: RefCell::new(BTreeSet::new()),
+            missing_roots: BTreeSet::new(),
+            reported_missing_roots: BTreeSet::new(),
             warned_extensions: HashSet::new(),
+            diagnostics: DiagnosticTracker::default(),
             completion_cache: RefCell::new(None),
         }
     }
@@ -4573,7 +4463,7 @@ mod tests {
 
     #[test]
     fn replacement_conflict_diagnostics_include_related_information() {
-        let server = server();
+        let mut server = server();
         let root = PathBuf::from("C:/scripts");
         let previous_path = root.join("z-first.reds");
         let primary_path = root.join("a-second.reds");
@@ -4732,9 +4622,8 @@ mod tests {
 
         for _ in 0..2 {
             server
-                .last_published_files
-                .borrow_mut()
-                .extend([root.join("0.reds"), root.join("zz.reds")]);
+                .diagnostics
+                .force_published([root.join("0.reds"), root.join("zz.reds")]);
             server
                 .publish_diagnostics(&diags.iter().collect::<Vec<_>>(), &symbols, &sources, &ctx)
                 .unwrap();
@@ -4831,7 +4720,7 @@ mod tests {
                 )
             })
             .collect();
-        server.cached_fixes.borrow_mut().insert(path.clone(), fixes);
+        server.cached_fixes.insert(path.clone(), fixes);
         (server, ctx, path)
     }
 
@@ -5039,7 +4928,6 @@ mod tests {
             .collect();
         server
             .cached_fixes
-            .borrow_mut()
             .insert(PathBuf::from("test.reds"), fixes);
         let scope = FixScope::Standalone(PathBuf::from("test.reds"));
 
@@ -5081,7 +4969,6 @@ mod tests {
                 assert_eq!(
                     server
                         .cached_fixes
-                        .borrow()
                         .values()
                         .map(BTreeMap::len)
                         .sum::<usize>(),
@@ -5116,7 +5003,7 @@ mod tests {
                 version: 1,
             },
         );
-        server.cached_fixes.borrow_mut().insert(
+        server.cached_fixes.insert(
             path,
             BTreeMap::from([((0, 1), vec![make_public_fix(uri, text)])]),
         );
@@ -5232,7 +5119,7 @@ mod tests {
         server.invalidate();
 
         assert!(server.valid_fix(&fix));
-        assert!(server.cached_fixes.borrow().contains_key(&path_a));
+        assert!(server.cached_fixes.contains_key(&path_a));
         let action = lsp::CodeAction {
             data: Some(serde_json::to_value(FixRequest::FixOne(Box::new(fix))).unwrap()),
             ..Default::default()
@@ -5635,13 +5522,14 @@ mod tests {
         );
 
         // Two fixes stored at the exact same span are both returned.
-        let mut slots = server.cached_fixes.borrow_mut();
-        let caller_fixes = slots.get_mut(&dialect::identity(&caller)).unwrap();
+        let caller_fixes = server
+            .cached_fixes
+            .get_mut(&dialect::identity(&caller))
+            .unwrap();
         let sample = caller_fixes.values().next().unwrap()[0].clone();
         let mut second_same_span = sample.clone();
         second_same_span.target_name = Some("otherSameSpan".into());
         caller_fixes.insert((0, 1), vec![sample, second_same_span]);
-        drop(slots);
 
         let same_span_actions = literal_actions(
             server

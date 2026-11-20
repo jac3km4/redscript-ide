@@ -9,6 +9,7 @@ use server::{LspContext, LspServer};
 
 mod buffers;
 mod completions;
+mod diagnostics;
 mod dialect;
 mod display;
 mod ls;
@@ -178,7 +179,7 @@ fn main() -> anyhow::Result<()> {
                 ctx.logger().warn(warning);
                 ctx.show_message(lsp::MessageType::WARNING, warning);
             }
-            let ls = load_language_server(dirs, source, ctx)?;
+            let mut ls = load_language_server(dirs, source, ctx)?;
             if matches!(source, CacheSource::Embedded) && !has_warnings {
                 ctx.show_message(
                     lsp::MessageType::INFO,
