@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use lsp_types as lsp;
+use redscript_compiler_api::{Diagnostic, LowerError, ast};
 
 use crate::server::LspContext;
 
@@ -125,6 +126,44 @@ impl DiagnosticTracker {
     pub(crate) fn force_published(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         self.published.extend(paths);
     }
+}
+
+pub(crate) fn diagnostic_tags(
+    diag: &Diagnostic<'_>,
+    ctx: &LspContext,
+) -> Option<Vec<lsp::DiagnosticTag>> {
+    let tag = match diag {
+        Diagnostic::UnusedLocal(_, _)
+        | Diagnostic::UnusedItemQualifiers(_, _)
+        | Diagnostic::AddFieldConflict(_)
+        | Diagnostic::LoweringError(LowerError::RedundantDynCast(_)) => {
+            lsp::DiagnosticTag::UNNECESSARY
+        }
+        Diagnostic::LoweringError(LowerError::DeprecatedNameOf(_)) => {
+            lsp::DiagnosticTag::DEPRECATED
+        }
+        _ => return None,
+    };
+    ctx.supports_diagnostic_tag(&tag).then(|| vec![tag])
+}
+
+pub(crate) fn location(
+    span: ast::Span,
+    sources: &ast::SourceMap,
+    ctx: &LspContext,
+) -> Option<lsp::Location> {
+    let file = sources.get(span.file)?;
+    Some(lsp::Location {
+        uri: ctx.uri(file.path()).ok()?,
+        range: range(span, file)?,
+    })
+}
+
+pub(crate) fn range(span: ast::Span, file: &ast::File) -> Option<lsp::Range> {
+    Some(lsp::Range {
+        start: crate::positions::file_position(file, span.start)?,
+        end: crate::positions::file_position(file, span.end)?,
+    })
 }
 
 #[cfg(test)]

@@ -107,8 +107,8 @@ fn symbol(
         kind,
         tags: None,
         deprecated: None,
-        range: super::range(span, file)?,
-        selection_range: super::range(name_span, file)?,
+        range: crate::diagnostics::range(span, file)?,
+        selection_range: crate::diagnostics::range(name_span, file)?,
         children,
     })
 }

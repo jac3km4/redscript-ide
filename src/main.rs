@@ -7,7 +7,9 @@ use mimalloc::MiMalloc;
 use serde_json::Value;
 use server::{LspContext, LspServer};
 
+mod analysis;
 mod buffers;
+mod code_actions;
 mod completions;
 mod diagnostics;
 mod dialect;
@@ -16,6 +18,7 @@ mod ls;
 mod positions;
 mod query;
 mod server;
+mod workspace;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
