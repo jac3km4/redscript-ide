@@ -390,6 +390,39 @@ impl LspServer<'_> {
         this.run()
     }
 
+    /// Builds a protocol server over an in-memory connection with a caller
+    /// supplied language server, so tests can drive the real protocol loop and
+    /// worker thread against actual analysis.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        server: Box<dyn LanguageServer + 'static>,
+        buffers: Buffers,
+        watch_files: bool,
+    ) -> (LspServer<'static>, Connection) {
+        let (connection, client) = Connection::memory();
+        let context = LspContext::new(connection.sender.clone());
+        (
+            LspServer {
+                connection,
+                server,
+                buffers,
+                context,
+                watch_files,
+                watched_roots: vec![],
+                shutdown: false,
+                in_flight: HashMap::new(),
+                state_rev: 0,
+                diag_rev: 0,
+                latest_state_rev: Arc::new(AtomicU64::new(0)),
+                latest_diag_rev: Arc::new(AtomicU64::new(0)),
+                diagnostics: DiagnosticTracker::default(),
+                startup_pending: false,
+                startup_edited: false,
+            },
+            client,
+        )
+    }
+
     fn run(&mut self) -> anyhow::Result<()> {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<WorkerCmd>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded::<WorkerEvent>();
@@ -4781,5 +4814,114 @@ mod tests {
         let published = publish_notifications(&client.receiver);
         assert_eq!(published.len(), 1, "{published:?}");
         assert_eq!(published[0].diagnostics[0].message, "saved");
+    }
+
+    #[test]
+    fn end_to_end_protocol_serves_real_analysis() {
+        use redscript_compiler_api::ScriptBundle;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache.bin");
+        std::fs::write(
+            &cache,
+            ScriptBundle::default().into_writeable().to_bytes().unwrap(),
+        )
+        .unwrap();
+        let hover_text = "public class E2E {\n    public let value: Int32;\n}\n\npublic func Make() -> E2E {\n    return new E2E();\n}\n";
+        let hover_path = temp.path().join("hover.reds");
+        std::fs::write(&hover_path, hover_text).unwrap();
+        let completion_text = "public func Use() {\n    let e = new E2E();\n    e.;\n}\n";
+        let completion_path = temp.path().join("completion.reds");
+        std::fs::write(&completion_path, completion_text).unwrap();
+        let broken_path = temp.path().join("broken.reds");
+        std::fs::write(&broken_path, "public class {").unwrap();
+
+        let real = crate::ls::RedscriptLanguageServer::new(&cache, [temp.path()]).unwrap();
+        let (mut server, client) = LspServer::for_test(Box::new(real), Buffers::default(), false);
+        let handle = std::thread::spawn(move || server.run());
+
+        let open = |path: &Path, text: &str| {
+            let uri = uri_from_path(path).unwrap();
+            client
+                .sender
+                .send(Message::Notification(lsp_server::Notification::new(
+                    lsp::notification::DidOpenTextDocument::METHOD.into(),
+                    json!({
+                        "textDocument": {
+                            "uri": uri.as_str(),
+                            "languageId": "redscript",
+                            "version": 1,
+                            "text": text,
+                        }
+                    }),
+                )))
+                .unwrap();
+            uri
+        };
+        let hover_uri = open(&hover_path, hover_text);
+        let completion_uri = open(&completion_path, completion_text);
+        let broken_uri = open(&broken_path, "public class {");
+
+        let offset = hover_text.find("-> E2E").unwrap() + 4;
+        let position = crate::positions::position(hover_text, offset as u32).unwrap();
+        send_request(
+            &client,
+            1,
+            lsp::request::HoverRequest::METHOD,
+            json!({ "textDocument": { "uri": hover_uri.as_str() }, "position": position }),
+        );
+        let hover = receive_response(&client, 1).response_result.unwrap();
+        assert!(
+            hover["contents"]["value"]
+                .as_str()
+                .is_some_and(|value| value.contains("E2E")),
+            "{hover}"
+        );
+
+        let offset = completion_text.rfind("e.;").unwrap() + 2;
+        let position = crate::positions::position(completion_text, offset as u32).unwrap();
+        send_request(
+            &client,
+            2,
+            lsp::request::Completion::METHOD,
+            json!({ "textDocument": { "uri": completion_uri.as_str() }, "position": position }),
+        );
+        let completion = receive_response(&client, 2).response_result.unwrap();
+        let items = completion.as_array().expect("completion array");
+        assert!(
+            items.iter().any(|item| item["label"] == "value"),
+            "{completion}"
+        );
+
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidSaveTextDocument::METHOD.into(),
+                json!({ "textDocument": { "uri": broken_uri.as_str() } }),
+            )))
+            .unwrap();
+        let published = loop {
+            match client
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+            {
+                Message::Notification(notification)
+                    if notification.method == lsp::notification::PublishDiagnostics::METHOD =>
+                {
+                    let params: lsp::PublishDiagnosticsParams =
+                        serde_json::from_value(notification.params).unwrap();
+                    if params.uri == broken_uri {
+                        break params;
+                    }
+                }
+                Message::Notification(_) => {}
+                message => panic!("expected diagnostics, got {message:?}"),
+            }
+        };
+        assert!(!published.diagnostics.is_empty(), "{published:?}");
+
+        queue_shutdown(&client);
+        handle.join().unwrap().unwrap();
     }
 }
