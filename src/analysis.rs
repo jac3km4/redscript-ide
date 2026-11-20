@@ -99,17 +99,19 @@ impl CompilationCache {
                     Some(typ) if is_type_receiver(at.expr()) => at.with_type(Some(typ)),
                     _ => at,
                 };
-                ctx.logger().info(format!(
-                "Query result lookup_byte_offset={preceding_pos} parsed_module={} ast_match={} function={} expression={} named_type={} receiver_type={} context={query_context:?} parse_diagnostics={} semantic_diagnostics={}",
-                analysis.parsed.modules.iter().any(|(file, _)| *file == id),
-                match_.is_some(),
-                func.is_some(),
-                at.expr().is_some(),
-                at.type_().is_some(),
-                at.expr_type().is_some(),
-                analysis.parsed.diagnostics.len(),
-                analysis.diagnostics.len(),
-            ));
+                ctx.logger().verbose(|| {
+                    format!(
+                        "Query result lookup_byte_offset={preceding_pos} parsed_module={} ast_match={} function={} expression={} named_type={} receiver_type={} context={query_context:?} parse_diagnostics={} semantic_diagnostics={}",
+                        analysis.parsed.modules.iter().any(|(file, _)| *file == id),
+                        match_.is_some(),
+                        func.is_some(),
+                        at.expr().is_some(),
+                        at.type_().is_some(),
+                        at.expr_type().is_some(),
+                        analysis.parsed.diagnostics.len(),
+                        analysis.diagnostics.len(),
+                    )
+                });
                 cb(at)
             })
         })
@@ -288,7 +290,12 @@ impl CompilationCache {
             sources,
             file_ids,
             move |bytes, interner, sources| {
-                Ok(AnalyzedSources::deferred(&bytes[..], sources, interner, mode))
+                Ok(AnalyzedSources::deferred(
+                    &bytes[..],
+                    sources,
+                    interner,
+                    mode,
+                ))
             },
         )
     }
@@ -357,7 +364,10 @@ mod tests {
         let bytes = ScriptBundle::default().into_writeable().to_bytes().unwrap();
         let report = |mode| {
             let sources = ast::SourceMap::new();
-            sources.push_back("unused.reds", "public func Test() -> Void { let unused = 1; }");
+            sources.push_back(
+                "unused.reds",
+                "public func Test() -> Void { let unused = 1; }",
+            );
             let cache = CompilationCache::from_sources_with(
                 CacheBytes::Owned(Arc::from(bytes.clone())),
                 sources,

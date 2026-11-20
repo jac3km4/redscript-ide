@@ -36,6 +36,12 @@ name = "redscript-ide"
 version = "1.0.3"
 edition = "2024"
 
+[features]
+# Emits high-volume per-edit/per-request/per-query `window/logMessage`
+# notifications. Disabled by default so release builds stay quiet; tests always
+# enable them.
+verbose-logs = []
+
 [dependencies]
 anyhow.workspace = true
 ignore.workspace = true

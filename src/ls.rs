@@ -226,21 +226,25 @@ impl RedscriptLanguageServer {
 
     fn rebuild_with_reload(&mut self, ctx: &LspContext, reload: bool) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
-        ctx.logger().info(format!(
-            "Rebuild started reload={reload} overlays={} versions={:?}",
-            self.overlays.len(),
-            self.overlays
-                .iter()
-                .map(|(path, overlay)| (path, overlay.version))
-                .collect::<Vec<_>>(),
-        ));
+        ctx.logger().verbose(|| {
+            format!(
+                "Rebuild started reload={reload} overlays={} versions={:?}",
+                self.overlays.len(),
+                self.overlays
+                    .iter()
+                    .map(|(path, overlay)| (path, overlay.version))
+                    .collect::<Vec<_>>(),
+            )
+        });
         let result = self.rebuild_inner(ctx, reload);
         match &result {
-            Ok(()) => ctx.logger().info(format!(
-                "Rebuild finished generation={} elapsed_ms={:.3}",
-                self.generation,
-                started.elapsed().as_secs_f64() * 1000.0,
-            )),
+            Ok(()) => ctx.logger().verbose(|| {
+                format!(
+                    "Rebuild finished generation={} elapsed_ms={:.3}",
+                    self.generation,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                )
+            }),
             Err(error) => ctx.logger().error(format!(
                 "Rebuild failed generation={} elapsed_ms={:.3}: {error:#}",
                 self.generation,
@@ -275,7 +279,7 @@ impl RedscriptLanguageServer {
         let mut missing_roots = BTreeSet::new();
         let workspace = if reload {
             ctx.logger()
-                .info("Rebuild phase=workspace discovery, parsing and analysis");
+                .verbose(|| "Rebuild phase=workspace discovery, parsing and analysis".to_owned());
             self.make_snapshot(
                 self.workspaces
                     .values()
@@ -285,15 +289,19 @@ impl RedscriptLanguageServer {
                 &mut io_warnings,
             )?
         } else {
-            ctx.logger()
-                .info("Rebuild phase=cached sources, overlays and analysis (no workspace scan)");
+            ctx.logger().verbose(|| {
+                "Rebuild phase=cached sources, overlays and analysis (no workspace scan)".to_owned()
+            });
             self.make_edit_snapshot()?
         };
-        ctx.logger().info(format!(
-            "Rebuild workspace ready elapsed_ms={:.3}",
-            started.elapsed().as_secs_f64() * 1000.0,
-        ));
-        ctx.logger().info("Rebuild phase=standalone analysis");
+        ctx.logger().verbose(|| {
+            format!(
+                "Rebuild workspace ready elapsed_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1000.0,
+            )
+        });
+        ctx.logger()
+            .verbose(|| "Rebuild phase=standalone analysis".to_owned());
         let paths: HashSet<_> = self
             .standalone
             .keys()
@@ -499,11 +507,13 @@ impl RedscriptLanguageServer {
                 });
                 let span = at.expr().map(redscript_compiler_api::ir::Expr::span);
                 let value = at.display().to_string();
-                ctx.logger().info(format!(
-                    "Hover payload content_bytes={} range={range:?} expression_span={span:?} contains_requested_byte={:?}",
-                    value.len(),
-                    span.map(|span| span.contains(requested_pos)),
-                ));
+                ctx.logger().verbose(|| {
+                    format!(
+                        "Hover payload content_bytes={} range={range:?} expression_span={span:?} contains_requested_byte={:?}",
+                        value.len(),
+                        span.map(|span| span.contains(requested_pos)),
+                    )
+                });
                 if value.is_empty() {
                     return Ok(None);
                 }
@@ -530,18 +540,22 @@ impl RedscriptLanguageServer {
         }
         let contents = loc.doc().buffer().contents().to_string();
         let Some(member) = member_completion_range(&contents, loc.pos()) else {
-            ctx.logger().info(format!(
-                "Completion empty path={} byte_offset={}: cursor is not after a member-access dot (only member completion is supported)",
-                loc.doc().path().display(),
-                loc.pos(),
-            ));
+            ctx.logger().verbose(|| {
+                format!(
+                    "Completion empty path={} byte_offset={}: cursor is not after a member-access dot (only member completion is supported)",
+                    loc.doc().path().display(),
+                    loc.pos(),
+                )
+            });
             return Ok(Arc::new(lsp::CompletionResponse::Array(vec![])));
         };
-        ctx.logger().info(format!(
-            "Completion receiver path={} byte_offset={} erased_member_range={member:?}",
-            loc.doc().path().display(),
-            loc.pos(),
-        ));
+        ctx.logger().verbose(|| {
+            format!(
+                "Completion receiver path={} byte_offset={} erased_member_range={member:?}",
+                loc.doc().path().display(),
+                loc.pos(),
+            )
+        });
         let path = dialect::identity(loc.doc().path());
         let mut source_without_member = contents;
         source_without_member.replace_range(member.clone(), "");
@@ -558,7 +572,7 @@ impl RedscriptLanguageServer {
             && cached.other_overlays == other_overlays
         {
             ctx.logger()
-                .info("Completion analysis=reused member results");
+                .verbose(|| "Completion analysis=reused member results".to_owned());
             return Ok(cached.response.clone());
         }
         let receiver_end = member.start;
@@ -720,10 +734,12 @@ impl RedscriptLanguageServer {
                 Ok(formatted) => Some(formatted),
                 Err(errors) => {
                     if let Some(first) = errors.first() {
-                        ctx.logger().info(format!(
-                            "Formatting skipped path={}: syntax error ({first})",
-                            doc.path().display(),
-                        ));
+                        ctx.logger().verbose(|| {
+                            format!(
+                                "Formatting skipped path={}: syntax error ({first})",
+                                doc.path().display(),
+                            )
+                        });
                     }
                     None
                 }
@@ -731,10 +747,12 @@ impl RedscriptLanguageServer {
             Dialect::Community => {
                 let (module, errors) = format_document(file.source(), id, &settings);
                 if let Some(first) = errors.first() {
-                    ctx.logger().info(format!(
-                        "Formatting skipped path={}: syntax error ({first})",
-                        doc.path().display(),
-                    ));
+                    ctx.logger().verbose(|| {
+                        format!(
+                            "Formatting skipped path={}: syntax error ({first})",
+                            doc.path().display(),
+                        )
+                    });
                     None
                 } else {
                     module.map(|module| module.to_string())
@@ -1235,17 +1253,19 @@ impl RedscriptLanguageServer {
                 .get(&path)
                 .unwrap_or(&self.compilation_cache)
         };
-        ctx.logger().info(format!(
-            "Query path={} dialect={:?} byte_offset={} version={:?} workspace={} generation={} source_files={} overlays={} speculative_patch={patch:?}",
-            path.display(),
-            Dialect::of(&path),
-            loc.pos(),
-            loc.doc().buffer().version(),
-            workspace,
-            self.generation,
-            base.borrow_file_ids().len(),
-            self.overlays.len(),
-        ));
+        ctx.logger().verbose(|| {
+            format!(
+                "Query path={} dialect={:?} byte_offset={} version={:?} workspace={} generation={} source_files={} overlays={} speculative_patch={patch:?}",
+                path.display(),
+                Dialect::of(&path),
+                loc.pos(),
+                loc.doc().buffer().version(),
+                workspace,
+                self.generation,
+                base.borrow_file_ids().len(),
+                self.overlays.len(),
+            )
+        });
         if patch.is_none()
             && let Some(&id) = base.borrow_file_ids().get(&path)
             && base.with_sources(|sources| {
@@ -1254,10 +1274,12 @@ impl RedscriptLanguageServer {
                     .is_some_and(|file| file.source() == loc.doc().buffer().contents())
             })
         {
-            ctx.logger().info("Query analysis=reused active snapshot");
+            ctx.logger()
+                .verbose(|| "Query analysis=reused active snapshot".to_owned());
             return base.query_at(id, loc.pos(), cb, ctx);
         }
-        ctx.logger().info("Query analysis=speculative snapshot");
+        ctx.logger()
+            .verbose(|| "Query analysis=speculative snapshot".to_owned());
         // A query owns its storage; speculative sources never enter the active cache.
         let sources = ast::SourceMap::new();
         if workspace {
@@ -1277,8 +1299,9 @@ impl RedscriptLanguageServer {
             if Dialect::of(&path) == Some(Dialect::Redmod)
                 && repair_completion_terminator(&mut contents, range)
             {
-                ctx.logger()
-                    .info("Query recovery=inserted speculative REDmod statement terminator");
+                ctx.logger().verbose(|| {
+                    "Query recovery=inserted speculative REDmod statement terminator".to_owned()
+                });
             }
         }
 
@@ -3277,12 +3300,22 @@ mod tests {
             .iter()
             .find(|item| item.label == "value")
             .expect("value completion");
-        assert_eq!(value.detail.as_deref(), Some(": Int32"), "{:?}", value.detail);
+        assert_eq!(
+            value.detail.as_deref(),
+            Some(": Int32"),
+            "{:?}",
+            value.detail
+        );
         let get = items
             .iter()
             .find(|item| item.label == "Get")
             .expect("Get completion");
-        assert_eq!(get.detail.as_deref(), Some("() -> Int32"), "{:?}", get.detail);
+        assert_eq!(
+            get.detail.as_deref(),
+            Some("() -> Int32"),
+            "{:?}",
+            get.detail
+        );
     }
 
     #[test]

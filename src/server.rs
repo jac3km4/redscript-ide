@@ -673,19 +673,19 @@ impl LspServer<'_> {
                     serde_json::from_value(notif.params)?;
                 let uri = doc.uri;
                 if !is_file_uri(&uri) {
-                    self.context.logger().info(format!(
-                        "Document open ignored (non-file URI) uri={} version={}",
-                        uri.as_str(),
-                        doc.version,
-                    ));
+                    self.context.logger().verbose(|| {
+                        format!(
+                            "Document open ignored (non-file URI) uri={} version={}",
+                            uri.as_str(),
+                            doc.version,
+                        )
+                    });
                     return Ok(false);
                 }
                 let path = path_from_uri(&uri)?;
-                self.context.logger().info(format!(
-                    "Document open uri={} version={}",
-                    uri.as_str(),
-                    doc.version,
-                ));
+                self.context.logger().verbose(|| {
+                    format!("Document open uri={} version={}", uri.as_str(), doc.version,)
+                });
                 self.buffers.open(uri.clone(), doc.text, doc.version);
                 self.state_rev += 1;
                 self.latest_state_rev
@@ -697,18 +697,22 @@ impl LspServer<'_> {
                 let lsp::DidCloseTextDocumentParams { text_document: doc } =
                     serde_json::from_value(notif.params)?;
                 if !is_file_uri(&doc.uri) {
-                    self.context.logger().info(format!(
-                        "Document close ignored (non-file URI) uri={}",
-                        doc.uri.as_str(),
-                    ));
+                    self.context.logger().verbose(|| {
+                        format!(
+                            "Document close ignored (non-file URI) uri={}",
+                            doc.uri.as_str(),
+                        )
+                    });
                     return Ok(false);
                 }
                 let path = path_from_uri(&doc.uri)?;
-                self.context.logger().info(format!(
-                    "Document close uri={} version={:?}",
-                    doc.uri.as_str(),
-                    self.buffers.get(&doc.uri).and_then(Buffer::version),
-                ));
+                self.context.logger().verbose(|| {
+                    format!(
+                        "Document close uri={} version={:?}",
+                        doc.uri.as_str(),
+                        self.buffers.get(&doc.uri).and_then(Buffer::version),
+                    )
+                });
                 self.buffers.remove(&doc.uri);
                 self.state_rev += 1;
                 self.latest_state_rev
@@ -724,17 +728,21 @@ impl LspServer<'_> {
                     text_document: doc, ..
                 } = serde_json::from_value(notif.params)?;
                 if !is_file_uri(&doc.uri) {
-                    self.context.logger().info(format!(
-                        "Document save ignored (non-file URI) uri={}",
-                        doc.uri.as_str(),
-                    ));
+                    self.context.logger().verbose(|| {
+                        format!(
+                            "Document save ignored (non-file URI) uri={}",
+                            doc.uri.as_str(),
+                        )
+                    });
                     return Ok(false);
                 }
-                self.context.logger().info(format!(
-                    "Document save uri={} version={:?}",
-                    doc.uri.as_str(),
-                    self.buffers.get(&doc.uri).and_then(Buffer::version),
-                ));
+                self.context.logger().verbose(|| {
+                    format!(
+                        "Document save uri={} version={:?}",
+                        doc.uri.as_str(),
+                        self.buffers.get(&doc.uri).and_then(Buffer::version),
+                    )
+                });
                 // Resolve the path before advancing revisions so a malformed
                 // URI cannot request a check that is never queued.
                 let path = path_from_uri(&doc.uri)?;
@@ -821,7 +829,7 @@ impl LspServer<'_> {
                     token.cancel();
                     self.context
                         .logger()
-                        .info(format!("Request cancelled id={id}"));
+                        .verbose(|| format!("Request cancelled id={id}"));
                     self.connection.sender.send(Message::Response(Response {
                         id,
                         response_result: Err(response_error(
@@ -830,9 +838,11 @@ impl LspServer<'_> {
                         )),
                     }))?;
                 } else {
-                    self.context.logger().info(format!(
-                        "Cancellation received id={id}; request already completed or unknown"
-                    ));
+                    self.context.logger().verbose(|| {
+                        format!(
+                            "Cancellation received id={id}; request already completed or unknown"
+                        )
+                    });
                 }
             }
             _ => {
@@ -866,13 +876,15 @@ impl LspServer<'_> {
                 match &result {
                     Ok(value) => {
                         if is_summary_method(&method) {
-                            self.context.logger().info(format!(
-                                "Response method={} id={} {} elapsed_ms={:.3}",
-                                method,
-                                id,
-                                response_summary(&method, value),
-                                elapsed,
-                            ));
+                            self.context.logger().verbose(|| {
+                                format!(
+                                    "Response method={} id={} {} elapsed_ms={:.3}",
+                                    method,
+                                    id,
+                                    response_summary(&method, value),
+                                    elapsed,
+                                )
+                            });
                         }
                     }
                     Err(error) => {
@@ -904,16 +916,20 @@ impl LspServer<'_> {
                         return Ok(());
                     }
                     Some(_) => {
-                        self.context.logger().info(format!(
-                            "Rejected stale diagnostic publication state_rev={state_rev} current_state_rev={} diag_rev={diag_rev} current_diag_rev={}",
-                            self.state_rev, self.diag_rev,
-                        ));
+                        self.context.logger().verbose(|| {
+                            format!(
+                                "Rejected stale diagnostic publication state_rev={state_rev} current_state_rev={} diag_rev={diag_rev} current_diag_rev={}",
+                                self.state_rev, self.diag_rev,
+                            )
+                        });
                     }
                     None => {
-                        self.context.logger().info(format!(
-                            "Diagnostic computation aborted state_rev={state_rev} current_state_rev={} diag_rev={diag_rev} current_diag_rev={}",
-                            self.state_rev, self.diag_rev,
-                        ));
+                        self.context.logger().verbose(|| {
+                            format!(
+                                "Diagnostic computation aborted state_rev={state_rev} current_state_rev={} diag_rev={diag_rev} current_diag_rev={}",
+                                self.state_rev, self.diag_rev,
+                            )
+                        });
                     }
                 }
                 // A launch-time document open can supersede the initial batch
@@ -1303,13 +1319,15 @@ impl LspServer<'_> {
                 match &response_result {
                     Ok(value) => {
                         if log_summary {
-                            self.context.logger().info(format!(
-                                "Response method={} id={} {} elapsed_ms={:.3}",
-                                request.method,
-                                request.id,
-                                response_summary(&request.method, value),
-                                started.elapsed().as_secs_f64() * 1000.0,
-                            ));
+                            self.context.logger().verbose(|| {
+                                format!(
+                                    "Response method={} id={} {} elapsed_ms={:.3}",
+                                    request.method,
+                                    request.id,
+                                    response_summary(&request.method, value),
+                                    started.elapsed().as_secs_f64() * 1000.0,
+                                )
+                            });
                         }
                     }
                     Err(error) => {
@@ -1333,27 +1351,33 @@ impl LspServer<'_> {
                 lsp::notification::Initialized::METHOD => {}
                 lsp::notification::Cancel::METHOD => {
                     let params: lsp::CancelParams = serde_json::from_value(notif.params)?;
-                    self.context.logger().info(format!(
-                        "Cancellation received id={:?}; synchronous request handling may have already sent its response (receipt order does not establish when the client cancelled)",
-                        params.id,
-                    ));
+                    self.context.logger().verbose(|| {
+                        format!(
+                            "Cancellation received id={:?}; synchronous request handling may have already sent its response (receipt order does not establish when the client cancelled)",
+                            params.id,
+                        )
+                    });
                 }
                 lsp::notification::DidSaveTextDocument::METHOD => {
                     let lsp::DidSaveTextDocumentParams {
                         text_document: doc, ..
                     } = serde_json::from_value(notif.params)?;
                     if !is_file_uri(&doc.uri) {
-                        self.context.logger().info(format!(
-                            "Document save ignored (non-file URI) uri={}",
-                            doc.uri.as_str(),
-                        ));
+                        self.context.logger().verbose(|| {
+                            format!(
+                                "Document save ignored (non-file URI) uri={}",
+                                doc.uri.as_str(),
+                            )
+                        });
                         return Ok(());
                     }
-                    self.context.logger().info(format!(
-                        "Document save uri={} version={:?}",
-                        doc.uri.as_str(),
-                        self.buffers.get(&doc.uri).and_then(Buffer::version),
-                    ));
+                    self.context.logger().verbose(|| {
+                        format!(
+                            "Document save uri={} version={:?}",
+                            doc.uri.as_str(),
+                            self.buffers.get(&doc.uri).and_then(Buffer::version),
+                        )
+                    });
                     self.server.check(path_from_uri(&doc.uri)?, &self.context)?;
                 }
                 lsp::notification::DidOpenTextDocument::METHOD => {
@@ -1361,19 +1385,19 @@ impl LspServer<'_> {
                         serde_json::from_value(notif.params)?;
                     let uri = doc.uri;
                     if !is_file_uri(&uri) {
-                        self.context.logger().info(format!(
-                            "Document open ignored (non-file URI) uri={} version={}",
-                            uri.as_str(),
-                            doc.version,
-                        ));
+                        self.context.logger().verbose(|| {
+                            format!(
+                                "Document open ignored (non-file URI) uri={} version={}",
+                                uri.as_str(),
+                                doc.version,
+                            )
+                        });
                         return Ok(());
                     }
                     let path = path_from_uri(&uri)?;
-                    self.context.logger().info(format!(
-                        "Document open uri={} version={}",
-                        uri.as_str(),
-                        doc.version,
-                    ));
+                    self.context.logger().verbose(|| {
+                        format!("Document open uri={} version={}", uri.as_str(), doc.version,)
+                    });
                     self.buffers.open(uri.clone(), doc.text, doc.version);
                     self.server
                         .document_changed(path, self.buffers.get(&uri), &self.context)?;
@@ -1382,18 +1406,22 @@ impl LspServer<'_> {
                     let lsp::DidCloseTextDocumentParams { text_document: doc } =
                         serde_json::from_value(notif.params)?;
                     if !is_file_uri(&doc.uri) {
-                        self.context.logger().info(format!(
-                            "Document close ignored (non-file URI) uri={}",
-                            doc.uri.as_str(),
-                        ));
+                        self.context.logger().verbose(|| {
+                            format!(
+                                "Document close ignored (non-file URI) uri={}",
+                                doc.uri.as_str(),
+                            )
+                        });
                         return Ok(());
                     }
                     let path = path_from_uri(&doc.uri)?;
-                    self.context.logger().info(format!(
-                        "Document close uri={} version={:?}",
-                        doc.uri.as_str(),
-                        self.buffers.get(&doc.uri).and_then(Buffer::version),
-                    ));
+                    self.context.logger().verbose(|| {
+                        format!(
+                            "Document close uri={} version={:?}",
+                            doc.uri.as_str(),
+                            self.buffers.get(&doc.uri).and_then(Buffer::version),
+                        )
+                    });
                     self.buffers.remove(&doc.uri);
                     self.server.document_changed(path, None, &self.context)?;
                 }
@@ -1479,11 +1507,13 @@ impl LspServer<'_> {
             content_changes,
         } = serde_json::from_value(params)?;
         if !is_file_uri(&doc.uri) {
-            self.context.logger().info(format!(
-                "Document change ignored (non-file URI) uri={} version={}",
-                doc.uri.as_str(),
-                doc.version,
-            ));
+            self.context.logger().verbose(|| {
+                format!(
+                    "Document change ignored (non-file URI) uri={} version={}",
+                    doc.uri.as_str(),
+                    doc.version,
+                )
+            });
             return Ok(None);
         }
         let current_version = self.buffers.get(&doc.uri).and_then(Buffer::version);
@@ -1492,24 +1522,28 @@ impl LspServer<'_> {
             .try_change(&doc.uri, doc.version, content_changes)
         {
             Ok(()) => {
-                self.context.logger().info(format!(
-                    "Document change uri={} version={}",
-                    doc.uri.as_str(),
-                    doc.version,
-                ));
+                self.context.logger().verbose(|| {
+                    format!(
+                        "Document change uri={} version={}",
+                        doc.uri.as_str(),
+                        doc.version,
+                    )
+                });
                 Ok(Some(doc.uri))
             }
             Err(ChangeError::StaleVersion { .. } | ChangeError::NotOpen) => {
-                self.context.logger().info(format!(
-                    "Document change ignored ({}) uri={} version={} current_version={current_version:?}",
-                    if current_version.is_some_and(|version| version >= doc.version) {
-                        "stale"
-                    } else {
-                        "not open"
-                    },
-                    doc.uri.as_str(),
-                    doc.version,
-                ));
+                self.context.logger().verbose(|| {
+                    format!(
+                        "Document change ignored ({}) uri={} version={} current_version={current_version:?}",
+                        if current_version.is_some_and(|version| version >= doc.version) {
+                            "stale"
+                        } else {
+                            "not open"
+                        },
+                        doc.uri.as_str(),
+                        doc.version,
+                    )
+                });
                 Ok(None)
             }
             Err(ChangeError::InvalidRange(range)) => {
@@ -1625,30 +1659,34 @@ fn log_request_metadata(context: &LspContext, request: &lsp_server::Request) {
         return;
     }
     let params = &request.params;
-    context.logger().info(format!(
-        "Request method={} id={} uri={} line={:?} character={:?}",
-        request.method,
-        request.id,
-        params
-            .pointer("/textDocument/uri")
-            .and_then(Value::as_str)
-            .unwrap_or("<missing>"),
-        params.pointer("/position/line").and_then(Value::as_u64),
-        params
-            .pointer("/position/character")
-            .and_then(Value::as_u64),
-    ));
-    if request.method == lsp::request::Completion::METHOD {
-        context.logger().info(format!(
-            "Completion context id={} trigger_kind={:?} trigger_character={:?}",
+    context.logger().verbose(|| {
+        format!(
+            "Request method={} id={} uri={} line={:?} character={:?}",
+            request.method,
             request.id,
             params
-                .pointer("/context/triggerKind")
-                .and_then(Value::as_u64),
+                .pointer("/textDocument/uri")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>"),
+            params.pointer("/position/line").and_then(Value::as_u64),
             params
-                .pointer("/context/triggerCharacter")
-                .and_then(Value::as_str),
-        ));
+                .pointer("/position/character")
+                .and_then(Value::as_u64),
+        )
+    });
+    if request.method == lsp::request::Completion::METHOD {
+        context.logger().verbose(|| {
+            format!(
+                "Completion context id={} trigger_kind={:?} trigger_character={:?}",
+                request.id,
+                params
+                    .pointer("/context/triggerKind")
+                    .and_then(Value::as_u64),
+                params
+                    .pointer("/context/triggerCharacter")
+                    .and_then(Value::as_str),
+            )
+        });
     }
 }
 
@@ -2243,6 +2281,24 @@ impl<'a> LspLog<'a> {
     fn new(context: &'a LspContext) -> Self {
         Self { context }
     }
+
+    /// Emits a high-volume diagnostic log only when verbose logging is enabled.
+    ///
+    /// The message closure is not called otherwise, so default builds pay no
+    /// string allocation or JSON-RPC notification for these per-edit,
+    /// per-request, and per-query logs. Tests always enable them so their log
+    /// assertions keep working.
+    #[cfg(any(test, feature = "verbose-logs"))]
+    pub fn verbose(&self, message: impl FnOnce() -> String) {
+        self.context
+            .notify::<lsp::notification::LogMessage>(lsp::LogMessageParams {
+                typ: lsp::MessageType::INFO,
+                message: message(),
+            });
+    }
+
+    #[cfg(not(any(test, feature = "verbose-logs")))]
+    pub fn verbose(&self, _message: impl FnOnce() -> String) {}
 
     pub fn info(&self, message: impl Display) {
         self.context
