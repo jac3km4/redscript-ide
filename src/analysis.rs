@@ -85,6 +85,9 @@ impl CompilationCache {
                 };
                 from_scopes
                     .or_else(|| cache.interner.get_index(cache.interner.get_index_of(name)?))
+                    // The interner may know a name that has no type definition in
+                    // this snapshot; callers index `Symbols` with the result.
+                    .filter(|&typ| syms.get_type(typ).is_some())
             };
             // Type names in type positions always resolve. An identifier resolves
             // to a type only when no expression binding claims it, so a local,

@@ -100,7 +100,7 @@ impl<'ctx, 'a> ExprAt<'ctx, 'a> {
 
     pub fn definition_span(&self) -> Option<Span> {
         if let Some(typ) = self.type_ {
-            self.symbols[typ].span()
+            self.symbols.get_type(typ)?.span()
         } else if let Some(expr) = self.expr {
             match expr {
                 ir::Expr::Call { call, .. } => match &**call {

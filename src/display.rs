@@ -48,7 +48,8 @@ impl fmt::Display for ExprAtDisplay<'_, '_> {
             }
             writeln!(f, "### Symbol")?;
             writeln!(f, "```\n{typ}\n```")?;
-            writeln!(f, "{}", DocDisplay::new(inner.symbols()[typ].doc()))?;
+            let def = inner.symbols().get_type(typ).ok_or(fmt::Error)?;
+            writeln!(f, "{}", DocDisplay::new(def.doc()))?;
         };
         Ok(())
     }
@@ -135,7 +136,9 @@ impl fmt::Display for CallDisplay<'_, '_> {
                 if let Ok(ft) = closure_type.coalesced(self.symbols) {
                     writeln!(f, "{ft}")?;
                 }
-                return Ok(());
+                // Continue so the closing fence emitted after the match is
+                // written; a closure has no documentation to append.
+                &[]
             }
         };
         writeln!(f, "```")?;
@@ -431,6 +434,42 @@ mod tests {
     fn function_type_without_parameters() {
         let func = FunctionType::new([], [], Type::nullary(predef::INT32));
         assert_eq!(FunctionTypeDisplay::new(&func).to_string(), "() -> Int32");
+    }
+
+    #[test]
+    fn closure_call_hover_closes_code_fence() {
+        let sources = SourceMap::new();
+        sources.populate_boot_lib();
+        let source =
+            "func Test() -> Int32 { let f: () -> Int32 = () -> { return 1; }; return f(); }";
+        sources.push_back("display.reds", source);
+        let interner = TypeInterner::default();
+        let mut reporter = CompileErrorReporter::default();
+        let (unit, symbols) = infer_from_sources(
+            &sources,
+            Symbols::with_default_types(),
+            &mut reporter,
+            &interner,
+        );
+        let diagnostics = reporter.into_reported();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let entry = symbols
+            .free_functions()
+            .find(|entry| entry.name().to_string() == "Test")
+            .unwrap();
+        let function = &unit.functions[entry.key()];
+        let expr = function
+            .block
+            .find_at(source.find("f();").unwrap() as u32 + 1)
+            .expect("closure call expression");
+        let ir::Expr::Call { call, .. } = expr else {
+            panic!("expected a call expression")
+        };
+        assert!(matches!(**call, ir::Call::Closure { .. }));
+        let display = CallDisplay::new(call, &symbols).to_string();
+        assert!(display.starts_with("```\n"), "{display:?}");
+        assert!(display.trim_end().ends_with("```"), "{display:?}");
+        assert_eq!(display.matches("```").count(), 2, "{display:?}");
     }
 }
 
