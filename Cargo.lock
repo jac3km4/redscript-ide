@@ -689,7 +689,7 @@ dependencies = [
 [[package]]
 name = "redscript-code-edit"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f#8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f"
+source = "git+https://github.com/jac3km4/redscript?rev=ab77364#ab77364ff3d9c4e2633c03f67dcf3a21e9e8f7d3"
 dependencies = [
  "anyhow",
  "redscript-compiler-api",
@@ -698,7 +698,7 @@ dependencies = [
 [[package]]
 name = "redscript-community-ast"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f#8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f"
+source = "git+https://github.com/jac3km4/redscript?rev=ab77364#ab77364ff3d9c4e2633c03f67dcf3a21e9e8f7d3"
 dependencies = [
  "bitflags 2.13.2",
  "chumsky",
@@ -710,7 +710,7 @@ dependencies = [
 [[package]]
 name = "redscript-community-formatter"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f#8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f"
+source = "git+https://github.com/jac3km4/redscript?rev=ab77364#ab77364ff3d9c4e2633c03f67dcf3a21e9e8f7d3"
 dependencies = [
  "hashbrown 0.17.1",
  "pretty_dtoa",
@@ -721,7 +721,7 @@ dependencies = [
 [[package]]
 name = "redscript-community-parser"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f#8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f"
+source = "git+https://github.com/jac3km4/redscript?rev=ab77364#ab77364ff3d9c4e2633c03f67dcf3a21e9e8f7d3"
 dependencies = [
  "chumsky",
  "rayon",
@@ -731,7 +731,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-api"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f#8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f"
+source = "git+https://github.com/jac3km4/redscript?rev=ab77364#ab77364ff3d9c4e2633c03f67dcf3a21e9e8f7d3"
 dependencies = [
  "bon",
  "log",
@@ -746,7 +746,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-backend"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f#8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f"
+source = "git+https://github.com/jac3km4/redscript?rev=ab77364#ab77364ff3d9c4e2633c03f67dcf3a21e9e8f7d3"
 dependencies = [
  "bitfield-struct",
  "bon",
@@ -763,7 +763,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-frontend"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f#8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f"
+source = "git+https://github.com/jac3km4/redscript?rev=ab77364#ab77364ff3d9c4e2633c03f67dcf3a21e9e8f7d3"
 dependencies = [
  "bitfield-struct",
  "bon",
@@ -785,7 +785,7 @@ dependencies = [
 [[package]]
 name = "redscript-dotfile"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f#8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f"
+source = "git+https://github.com/jac3km4/redscript?rev=ab77364#ab77364ff3d9c4e2633c03f67dcf3a21e9e8f7d3"
 dependencies = [
  "anyhow",
  "hashbrown 0.17.1",
@@ -825,7 +825,7 @@ dependencies = [
 [[package]]
 name = "redscript-io"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f#8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f"
+source = "git+https://github.com/jac3km4/redscript?rev=ab77364#ab77364ff3d9c4e2633c03f67dcf3a21e9e8f7d3"
 dependencies = [
  "bitfield-struct",
  "byte",
@@ -839,7 +839,7 @@ dependencies = [
 [[package]]
 name = "redscript-redmod-adapter"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f#8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f"
+source = "git+https://github.com/jac3km4/redscript?rev=ab77364#ab77364ff3d9c4e2633c03f67dcf3a21e9e8f7d3"
 dependencies = [
  "redscript-community-ast",
  "redscript-compiler-frontend",
@@ -850,7 +850,7 @@ dependencies = [
 [[package]]
 name = "redscript-redmod-ast"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f#8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f"
+source = "git+https://github.com/jac3km4/redscript?rev=ab77364#ab77364ff3d9c4e2633c03f67dcf3a21e9e8f7d3"
 dependencies = [
  "redscript-community-ast",
 ]
@@ -858,7 +858,7 @@ dependencies = [
 [[package]]
 name = "redscript-redmod-formatter"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f#8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f"
+source = "git+https://github.com/jac3km4/redscript?rev=ab77364#ab77364ff3d9c4e2633c03f67dcf3a21e9e8f7d3"
 dependencies = [
  "redscript-redmod-ast",
  "redscript-redmod-parser",
@@ -867,7 +867,7 @@ dependencies = [
 [[package]]
 name = "redscript-redmod-parser"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f#8abc8d4e494f318a6f4d1e3add53a3d463f0fe8f"
+source = "git+https://github.com/jac3km4/redscript?rev=ab77364#ab77364ff3d9c4e2633c03f67dcf3a21e9e8f7d3"
 dependencies = [
  "chumsky",
  "redscript-community-ast",
