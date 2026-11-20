@@ -190,7 +190,6 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             ls.log_missing_roots(ctx);
-            ls.publish_all_diagnostics(ctx)?;
             ctx.logger().info("Language server ready for requests");
             Ok(Box::new(ls))
         },

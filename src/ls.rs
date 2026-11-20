@@ -33,6 +33,18 @@ const EMBEDDED_CACHE: &[u8] = include_bytes!("../assets/api.redscripts.zlib");
 const REDMOD_SUBSET_DOCS_URL: &str =
     "https://github.com/jac3km4/redscript/blob/v1.0.0/crates/compiler/redmod/adapter/README.md";
 
+/// Fails fast when the analysis worker's current request was cancelled.
+///
+/// Query entry points call this so a `$/cancelRequest` that arrives before the
+/// expensive analysis phase aborts the work instead of computing a result the
+/// worker would discard anyway.
+fn cancelled() -> anyhow::Result<()> {
+    if crate::server::is_cancelled() {
+        anyhow::bail!("request cancelled");
+    }
+    Ok(())
+}
+
 /// Accumulates compiler diagnostics and refreshed quick fixes across the
 /// workspace and standalone analyses performed during one publish pass.
 struct CompilerDiagnostics {
@@ -334,6 +346,9 @@ impl RedscriptLanguageServer {
         Ok(())
     }
 
+    /// Collects and publishes diagnostics synchronously. Kept for unit tests;
+    /// production code publishes through the protocol thread instead.
+    #[cfg(test)]
     pub fn publish_all_diagnostics(&mut self, ctx: &LspContext) -> anyhow::Result<()> {
         if let Some(batch) = self.collect_diagnostic_batch(ctx, || false)? {
             self.diagnostics.apply_and_flush(batch, ctx)?;
@@ -353,7 +368,8 @@ impl RedscriptLanguageServer {
         ctx: &LspContext,
         should_abort: impl Fn() -> bool,
     ) -> anyhow::Result<Option<DiagnosticBatch>> {
-        if should_abort() {
+        let abort = || should_abort() || crate::server::is_cancelled();
+        if abort() {
             return Ok(None);
         }
         let mut collected = CompilerDiagnostics {
@@ -370,7 +386,7 @@ impl RedscriptLanguageServer {
                 ctx,
             )
         })?;
-        if should_abort() {
+        if abort() {
             self.cached_fixes = collected.fixes;
             return Ok(None);
         }
@@ -385,7 +401,7 @@ impl RedscriptLanguageServer {
                     ctx,
                 )
             })?;
-            if should_abort() {
+            if abort() {
                 self.cached_fixes = collected.fixes;
                 return Ok(None);
             }
@@ -454,6 +470,7 @@ impl RedscriptLanguageServer {
         loc: CodeLocation<'_>,
         ctx: &LspContext,
     ) -> anyhow::Result<Option<lsp::Hover>> {
+        cancelled()?;
         if Dialect::of(loc.doc().path()).is_none() {
             return Ok(None);
         }
@@ -492,6 +509,7 @@ impl RedscriptLanguageServer {
         loc: CodeLocation<'_>,
         ctx: &LspContext,
     ) -> anyhow::Result<Arc<lsp::CompletionResponse>> {
+        cancelled()?;
         if Dialect::of(loc.doc().path()).is_none() {
             return Ok(Arc::new(lsp::CompletionResponse::Array(vec![])));
         }
@@ -552,6 +570,7 @@ impl RedscriptLanguageServer {
         loc: CodeLocation<'_>,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp::GotoDefinitionResponse> {
+        cancelled()?;
         if Dialect::of(loc.doc().path()).is_none() {
             return Ok(lsp::GotoDefinitionResponse::Array(vec![]));
         }
@@ -573,6 +592,7 @@ impl RedscriptLanguageServer {
         query: &str,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp::WorkspaceSymbolResponse> {
+        cancelled()?;
         self.check_workspace(|_, syms, _, sources| {
             let funcs = syms
                 .free_functions()
@@ -591,6 +611,7 @@ impl RedscriptLanguageServer {
                 });
             let mut results = Vec::new();
             for (id, def) in syms.types() {
+                cancelled()?;
                 let kind = match def.schema() {
                     TypeSchema::Aggregate(agg) if agg.flags().is_struct() => {
                         lsp::SymbolKind::STRUCT
@@ -655,6 +676,7 @@ impl RedscriptLanguageServer {
         tab_size: u16,
         ctx: &LspContext,
     ) -> anyhow::Result<Vec<lsp::TextEdit>> {
+        cancelled()?;
         let Some(dialect) = Dialect::of(doc.path()) else {
             return Ok(vec![]);
         };
@@ -723,6 +745,7 @@ impl RedscriptLanguageServer {
         context: lsp::CodeActionContext,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp::CodeActionResponse> {
+        cancelled()?;
         if Dialect::of(&path) != Some(Dialect::Community)
             || context.only.as_ref().is_some_and(|kinds| {
                 !kinds
@@ -815,6 +838,7 @@ impl RedscriptLanguageServer {
         mut action: lsp::CodeAction,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp::CodeAction> {
+        cancelled()?;
         let Some(data) = action.data.clone() else {
             return Ok(action);
         };
@@ -1343,7 +1367,11 @@ impl LanguageServer for RedscriptLanguageServer {
         self.rebuild(ctx)
     }
 
-    fn check(&mut self, path: PathBuf, ctx: &LspContext) -> anyhow::Result<Option<DiagnosticBatch>> {
+    fn check(
+        &mut self,
+        path: PathBuf,
+        ctx: &LspContext,
+    ) -> anyhow::Result<Option<DiagnosticBatch>> {
         if path.file_name().is_some_and(|name| name == ".redscript") {
             self.files_changed(vec![path], ctx)?;
             return self.collect_diagnostic_batch(ctx, || false);
@@ -1358,6 +1386,14 @@ impl LanguageServer for RedscriptLanguageServer {
         }
         self.rebuild(ctx)?;
         self.collect_diagnostic_batch(ctx, || false)
+    }
+
+    fn startup_diagnostics(
+        &mut self,
+        ctx: &LspContext,
+        should_abort: &(dyn Fn() -> bool + Sync),
+    ) -> anyhow::Result<Option<DiagnosticBatch>> {
+        self.collect_diagnostic_batch(ctx, should_abort)
     }
 
     fn change_workspace_folders(
@@ -1695,7 +1731,10 @@ mod tests {
             RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
         server.log_missing_roots(&ctx);
 
-        let batch = server.collect_diagnostic_batch(&ctx, || false).unwrap().unwrap();
+        let batch = server
+            .collect_diagnostic_batch(&ctx, || false)
+            .unwrap()
+            .unwrap();
         assert!(batch.compiler.contains_key(&dialect::identity(&path)));
 
         // Neither the produced batch nor an aborted collection may publish.

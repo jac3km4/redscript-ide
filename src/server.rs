@@ -1,12 +1,15 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, bail};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use lsp_server::{Connection, ErrorCode, Message, RequestId, Response, ResponseError};
 use lsp_types::notification::Notification;
 use lsp_types::request::Request;
@@ -15,7 +18,273 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::buffers::{Buffer, Buffers, ChangeError};
-use crate::diagnostics::DiagnosticBatch;
+use crate::diagnostics::{DiagnosticBatch, DiagnosticTracker};
+
+/// A shared cancellation flag for a single in-flight request.
+///
+/// The protocol thread flips it when a `$/cancelRequest` arrives, and the
+/// analysis worker observes it at cooperative checkpoints. Cancellation is
+/// best-effort: work already inside upstream `redscript` cannot be interrupted,
+/// but a cancelled request's result is discarded and never reaches the client.
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+thread_local! {
+    /// Cancellation token for the request the analysis worker is currently
+    /// executing. It lives on the worker thread so query helpers in `ls.rs` can
+    /// check cancellation without threading a parameter through every call.
+    static CURRENT_CANCEL: RefCell<Option<CancelToken>> = const { RefCell::new(None) };
+}
+
+/// Installs `token` as the current worker cancellation token.
+pub(crate) fn set_current_cancel(token: CancelToken) {
+    CURRENT_CANCEL.with(|current| *current.borrow_mut() = Some(token));
+}
+
+/// Clears the current worker cancellation token.
+pub(crate) fn clear_current_cancel() {
+    CURRENT_CANCEL.with(|current| *current.borrow_mut() = None);
+}
+
+/// Whether the analysis worker's current request has been cancelled.
+pub(crate) fn is_cancelled() -> bool {
+    CURRENT_CANCEL.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .is_some_and(CancelToken::is_cancelled)
+    })
+}
+
+/// Owned snapshot of a document, sent to the analysis worker because the
+/// protocol thread keeps exclusive ownership of [`Buffers`]. Cloning a
+/// [`Buffer`] is cheap (a `ropey::Rope` is reference counted).
+#[derive(Clone)]
+pub struct OwnedDocument {
+    path: PathBuf,
+    buffer: Buffer,
+}
+
+impl OwnedDocument {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn as_doc(&self) -> Document<'_> {
+        Document::new(self.path.clone(), &self.buffer)
+    }
+}
+
+/// Owned snapshot of a document plus a byte offset, the worker-side equivalent
+/// of [`CodeLocation`].
+#[derive(Clone)]
+pub struct OwnedCodeLocation {
+    doc: OwnedDocument,
+    pos: u32,
+}
+
+impl OwnedCodeLocation {
+    fn as_loc(&self) -> CodeLocation<'_> {
+        CodeLocation::new(self.doc.as_doc(), self.pos)
+    }
+}
+
+/// A request routed to the analysis worker.
+enum WorkerRequest {
+    Hover(OwnedCodeLocation),
+    Completion(OwnedCodeLocation),
+    GotoDefinition(OwnedCodeLocation),
+    DocumentSymbols(OwnedDocument),
+    WorkspaceSymbol(String),
+    Formatting {
+        doc: OwnedDocument,
+        tab_size: u16,
+    },
+    CodeAction {
+        path: PathBuf,
+        span: Range<u32>,
+        context: lsp::CodeActionContext,
+    },
+    CodeActionResolve(Box<lsp::CodeAction>),
+}
+
+/// Commands sent from the protocol thread to the analysis worker. The worker
+/// owns the [`LanguageServer`] exclusively, so every state change and query
+/// travels through this channel in protocol order.
+enum WorkerCmd {
+    DocumentsChanged {
+        state_rev: u64,
+        documents: Vec<(PathBuf, Option<Buffer>)>,
+    },
+    FilesChanged {
+        state_rev: u64,
+        paths: Vec<PathBuf>,
+    },
+    ChangeWorkspaceFolders {
+        state_rev: u64,
+        added: Vec<PathBuf>,
+        removed: Vec<PathBuf>,
+    },
+    Check {
+        state_rev: u64,
+        diag_rev: u64,
+        path: PathBuf,
+    },
+    StartupDiagnostics {
+        state_rev: u64,
+        diag_rev: u64,
+    },
+    Request {
+        id: RequestId,
+        method: String,
+        kind: Box<WorkerRequest>,
+        started: Instant,
+        cancel: CancelToken,
+    },
+    /// Barrier used on shutdown so every command queued before it completes in
+    /// order; the worker acknowledges once it is reached.
+    Flush(Sender<()>),
+}
+
+/// Events sent from the analysis worker back to the protocol thread.
+enum WorkerEvent {
+    Response {
+        id: RequestId,
+        method: String,
+        started: Instant,
+        result: Result<Value, ResponseError>,
+    },
+    Diagnostics {
+        state_rev: u64,
+        diag_rev: u64,
+        is_startup: bool,
+        batch: DiagnosticBatch,
+    },
+    WatchRoots {
+        state_rev: u64,
+        roots: Vec<PathBuf>,
+    },
+    Error(String),
+}
+
+/// Placeholder [`LanguageServer`] left in `LspServer` while the real one runs on
+/// the worker thread. The protocol loop never calls it; only synchronous test
+/// helpers that run without a worker could.
+#[derive(Default)]
+struct NoopServer;
+
+impl LanguageServer for NoopServer {
+    fn watch_roots(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    fn document_changed(
+        &mut self,
+        _path: PathBuf,
+        _buffer: Option<&Buffer>,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn files_changed(&mut self, _paths: Vec<PathBuf>, _ctx: &LspContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn check(
+        &mut self,
+        _path: PathBuf,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<Option<DiagnosticBatch>> {
+        Ok(None)
+    }
+
+    fn change_workspace_folders(
+        &mut self,
+        _added: Vec<PathBuf>,
+        _removed: Vec<PathBuf>,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn hover(
+        &self,
+        _doc: CodeLocation<'_>,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<Option<lsp::Hover>> {
+        Ok(None)
+    }
+
+    fn completion(
+        &self,
+        _doc: CodeLocation<'_>,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<Arc<lsp::CompletionResponse>> {
+        Ok(Arc::new(lsp::CompletionResponse::Array(Vec::new())))
+    }
+
+    fn goto_definition(
+        &self,
+        _doc: CodeLocation<'_>,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<lsp::GotoDefinitionResponse> {
+        Ok(lsp::GotoDefinitionResponse::Array(Vec::new()))
+    }
+
+    fn document_symbols(
+        &self,
+        _doc: Document<'_>,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<lsp::DocumentSymbolResponse> {
+        Ok(lsp::DocumentSymbolResponse::Nested(Vec::new()))
+    }
+
+    fn workspace_symbol(
+        &self,
+        _query: &str,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<lsp::WorkspaceSymbolResponse> {
+        Ok(lsp::WorkspaceSymbolResponse::Nested(Vec::new()))
+    }
+
+    fn format(
+        &self,
+        _doc: Document<'_>,
+        _tab_size: u16,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<Vec<lsp::TextEdit>> {
+        Ok(Vec::new())
+    }
+
+    fn code_action(
+        &self,
+        _path: PathBuf,
+        _span: Range<u32>,
+        _context: lsp::CodeActionContext,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<Vec<lsp::CodeActionOrCommand>> {
+        Ok(Vec::new())
+    }
+
+    fn code_action_resolve(
+        &self,
+        _action: lsp::CodeAction,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<lsp::CodeAction> {
+        bail!("no code actions")
+    }
+}
 
 pub struct LspServer<'a> {
     connection: Connection,
@@ -25,6 +294,25 @@ pub struct LspServer<'a> {
     watch_files: bool,
     watched_roots: Vec<PathBuf>,
     shutdown: bool,
+    /// Requests dispatched to the worker that have not yet produced a response,
+    /// keyed by id so `$/cancelRequest` can find and flag them.
+    in_flight: HashMap<RequestId, CancelToken>,
+    /// Monotonic revision of the document/workspace state. Diagnostics computed
+    /// for an older revision are rejected before they reach the client.
+    state_rev: u64,
+    /// Monotonic revision of save-triggered checks, independent of `state_rev`
+    /// so back-to-back saves only publish the latest batch.
+    diag_rev: u64,
+    latest_state_rev: Arc<AtomicU64>,
+    latest_diag_rev: Arc<AtomicU64>,
+    /// Authoritative diagnostic publication state, owned by the protocol
+    /// thread while the worker computes batches.
+    diagnostics: DiagnosticTracker,
+    /// Whether the initial workspace diagnostics still need to be computed.
+    startup_pending: bool,
+    /// Set once an edit or save supersedes the initial workspace diagnostics, so
+    /// they are not recomputed after a launch-time document open.
+    startup_edited: bool,
 }
 
 impl LspServer<'_> {
@@ -87,6 +375,14 @@ impl LspServer<'_> {
             watch_files,
             watched_roots: vec![],
             shutdown: false,
+            in_flight: HashMap::new(),
+            state_rev: 0,
+            diag_rev: 0,
+            latest_state_rev: Arc::new(AtomicU64::new(0)),
+            latest_diag_rev: Arc::new(AtomicU64::new(0)),
+            diagnostics: DiagnosticTracker::default(),
+            startup_pending: true,
+            startup_edited: false,
         };
         this.update_watchers()?;
 
@@ -94,17 +390,207 @@ impl LspServer<'_> {
     }
 
     fn run(&mut self) -> anyhow::Result<()> {
-        let mut next_message = None;
-        while let Ok(message) = next_message
-            .take()
-            .map(Ok)
-            .unwrap_or_else(|| self.connection.receiver.recv())
-        {
-            if !self.shutdown
-                && matches!(&message, Message::Notification(notif) if notif.method == lsp::notification::DidChangeTextDocument::METHOD)
-            {
-                let mut pending = Vec::new();
-                let mut message = message;
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<WorkerCmd>();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded::<WorkerEvent>();
+        // The worker owns the real server; the protocol thread keeps this
+        // placeholder and never calls it.
+        let server = std::mem::replace(&mut self.server, Box::new(NoopServer));
+        let context = self.context.clone();
+        let latest_state_rev = self.latest_state_rev.clone();
+        let latest_diag_rev = self.latest_diag_rev.clone();
+        let watch_files = self.watch_files;
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                worker_main(
+                    server,
+                    context,
+                    cmd_rx,
+                    event_tx,
+                    latest_state_rev,
+                    latest_diag_rev,
+                    watch_files,
+                );
+            });
+            self.protocol_loop(cmd_tx, event_rx)
+        })
+    }
+
+    /// Protocol thread: never blocks on analysis. It reads client messages and
+    /// worker events, forwards work to the worker, and rejects results computed
+    /// for a state that has since been superseded.
+    fn protocol_loop(
+        &mut self,
+        cmd_tx: Sender<WorkerCmd>,
+        event_rx: Receiver<WorkerEvent>,
+    ) -> anyhow::Result<()> {
+        let connection_rx = self.connection.receiver.clone();
+        let mut next_message: Option<Message> = None;
+
+        if self.startup_pending {
+            cmd_tx
+                .send(WorkerCmd::StartupDiagnostics {
+                    state_rev: 0,
+                    diag_rev: 0,
+                })
+                .ok();
+        }
+
+        loop {
+            let message = if let Some(message) = next_message.take() {
+                message
+            } else {
+                enum Incoming {
+                    Message(Message),
+                    Event(WorkerEvent),
+                    Disconnected,
+                }
+                let incoming = crossbeam_channel::select! {
+                    recv(connection_rx) -> message => match message {
+                        Ok(message) => Incoming::Message(message),
+                        Err(_) => Incoming::Disconnected,
+                    },
+                    recv(event_rx) -> event => match event {
+                        Ok(event) => Incoming::Event(event),
+                        Err(_) => Incoming::Disconnected,
+                    },
+                };
+                match incoming {
+                    Incoming::Message(message) => message,
+                    Incoming::Event(event) => {
+                        self.handle_worker_event(event, Some(&cmd_tx))?;
+                        continue;
+                    }
+                    // The client went away: returning drops `cmd_tx`, so the
+                    // worker finishes its queue and exits before the scope joins.
+                    Incoming::Disconnected => return Ok(()),
+                }
+            };
+
+            match message {
+                Message::Request(request) => {
+                    if self.handle_protocol_request(request, &cmd_tx, &event_rx)? {
+                        return Ok(());
+                    }
+                }
+                Message::Notification(notif) => {
+                    if self.handle_protocol_notification(
+                        notif,
+                        &cmd_tx,
+                        &connection_rx,
+                        &mut next_message,
+                    )? {
+                        return Ok(());
+                    }
+                }
+                Message::Response(response) => self.handle_watcher_response(response),
+            }
+        }
+    }
+
+    fn handle_protocol_request(
+        &mut self,
+        request: lsp_server::Request,
+        cmd_tx: &Sender<WorkerCmd>,
+        event_rx: &Receiver<WorkerEvent>,
+    ) -> anyhow::Result<bool> {
+        if self.shutdown {
+            // Synchronous path: logs the request and answers `InvalidRequest`
+            // without ever touching the worker.
+            self.handle(Message::Request(request))?;
+            return Ok(false);
+        }
+        if request.method == lsp::request::Shutdown::METHOD {
+            // Validate params before acknowledging, so a malformed shutdown
+            // still reports `InvalidParams`.
+            if let Err(error) = serde_json::from_value::<()>(request.params) {
+                let error = invalid_params(error);
+                self.context.logger().error(format!(
+                    "Request failed method={} id={} code={} message={} elapsed_ms={:.3}",
+                    request.method, request.id, error.code, error.message, 0.0,
+                ));
+                self.connection.sender.send(Message::Response(Response {
+                    id: request.id,
+                    response_result: Err(error),
+                }))?;
+                return Ok(false);
+            }
+            // Barrier: every command queued before the flush completes in order
+            // before shutdown is acknowledged.
+            let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+            cmd_tx.send(WorkerCmd::Flush(ack_tx)).ok();
+            loop {
+                crossbeam_channel::select! {
+                    recv(ack_rx) -> ack => {
+                        if ack.is_ok() {
+                            // The worker emitted every prior event before
+                            // acknowledging, so drain them before returning.
+                            while let Ok(event) = event_rx.try_recv() {
+                                self.handle_worker_event(event, Some(cmd_tx))?;
+                            }
+                        }
+                        break;
+                    }
+                    recv(event_rx) -> event => match event {
+                        Ok(event) => self.handle_worker_event(event, Some(cmd_tx))?,
+                        Err(_) => break,
+                    },
+                }
+            }
+            self.shutdown = true;
+            self.connection.sender.send(Message::Response(Response {
+                id: request.id,
+                response_result: Ok(Value::Null),
+            }))?;
+            return Ok(false);
+        }
+
+        log_request_metadata(&self.context, &request);
+        match self.parse_worker_request(&request.method, request.params) {
+            Ok(kind) => {
+                let cancel = CancelToken::default();
+                self.in_flight.insert(request.id.clone(), cancel.clone());
+                cmd_tx
+                    .send(WorkerCmd::Request {
+                        id: request.id,
+                        method: request.method,
+                        kind: Box::new(kind),
+                        started: Instant::now(),
+                        cancel,
+                    })
+                    .ok();
+            }
+            Err(error) => {
+                self.context.logger().error(format!(
+                    "Request failed method={} id={} code={} message={} elapsed_ms={:.3}",
+                    request.method, request.id, error.code, error.message, 0.0,
+                ));
+                self.connection.sender.send(Message::Response(Response {
+                    id: request.id,
+                    response_result: Err(error),
+                }))?;
+            }
+        }
+        Ok(false)
+    }
+
+    fn handle_protocol_notification(
+        &mut self,
+        notif: lsp_server::Notification,
+        cmd_tx: &Sender<WorkerCmd>,
+        connection_rx: &Receiver<Message>,
+        next_message: &mut Option<Message>,
+    ) -> anyhow::Result<bool> {
+        if self.shutdown {
+            // Once shut down, only `exit` matters.
+            return Ok(notif.method == lsp::notification::Exit::METHOD);
+        }
+        match notif.method.as_str() {
+            lsp::notification::Exit::METHOD => bail!("Received exit before shutdown"),
+            lsp::notification::Initialized::METHOD => {}
+            lsp::notification::DidChangeTextDocument::METHOD => {
+                let mut pending: Vec<lsp::Uri> = Vec::new();
+                let mut message = Message::Notification(notif);
                 loop {
                     let Message::Notification(notif) = message else {
                         unreachable!();
@@ -115,47 +601,289 @@ impl LspServer<'_> {
                         Err(err) => self.context.logger().error(err),
                     }
                     // Only drain changes already queued; every other message is a barrier.
-                    match self.connection.receiver.try_recv() {
+                    match connection_rx.try_recv() {
                         Ok(Message::Notification(notif))
                             if notif.method == lsp::notification::DidChangeTextDocument::METHOD =>
                         {
                             message = Message::Notification(notif);
                         }
                         other => {
-                            next_message = other.ok();
+                            *next_message = other.ok();
                             break;
                         }
                     }
                 }
-                // Apply the whole batch before rebuilding so N changed documents
-                // trigger a single workspace rebuild.
-                let outcome = {
-                    let mut documents = Vec::with_capacity(pending.len());
-                    for uri in pending {
-                        match path_from_uri(&uri) {
-                            Ok(path) => documents.push((path, self.buffers.get(&uri))),
-                            Err(err) => self.context.logger().error(format!("{err:#}")),
+                if !pending.is_empty() {
+                    self.state_rev += 1;
+                    self.latest_state_rev
+                        .store(self.state_rev, Ordering::Release);
+                    self.startup_edited = true;
+                    let documents = self.owned_documents(&pending);
+                    cmd_tx
+                        .send(WorkerCmd::DocumentsChanged {
+                            state_rev: self.state_rev,
+                            documents,
+                        })
+                        .ok();
+                }
+            }
+            lsp::notification::DidOpenTextDocument::METHOD => {
+                let lsp::DidOpenTextDocumentParams { text_document: doc } =
+                    serde_json::from_value(notif.params)?;
+                let uri = doc.uri;
+                if !is_file_uri(&uri) {
+                    self.context.logger().info(format!(
+                        "Document open ignored (non-file URI) uri={} version={}",
+                        uri.as_str(),
+                        doc.version,
+                    ));
+                    return Ok(false);
+                }
+                let path = path_from_uri(&uri)?;
+                self.context.logger().info(format!(
+                    "Document open uri={} version={}",
+                    uri.as_str(),
+                    doc.version,
+                ));
+                self.buffers.open(uri.clone(), doc.text, doc.version);
+                self.state_rev += 1;
+                self.latest_state_rev
+                    .store(self.state_rev, Ordering::Release);
+                let documents = vec![(path, self.buffers.get(&uri).cloned())];
+                cmd_tx
+                    .send(WorkerCmd::DocumentsChanged {
+                        state_rev: self.state_rev,
+                        documents,
+                    })
+                    .ok();
+            }
+            lsp::notification::DidCloseTextDocument::METHOD => {
+                let lsp::DidCloseTextDocumentParams { text_document: doc } =
+                    serde_json::from_value(notif.params)?;
+                if !is_file_uri(&doc.uri) {
+                    self.context.logger().info(format!(
+                        "Document close ignored (non-file URI) uri={}",
+                        doc.uri.as_str(),
+                    ));
+                    return Ok(false);
+                }
+                let path = path_from_uri(&doc.uri)?;
+                self.context.logger().info(format!(
+                    "Document close uri={} version={:?}",
+                    doc.uri.as_str(),
+                    self.buffers.get(&doc.uri).and_then(Buffer::version),
+                ));
+                self.buffers.remove(&doc.uri);
+                self.state_rev += 1;
+                self.latest_state_rev
+                    .store(self.state_rev, Ordering::Release);
+                cmd_tx
+                    .send(WorkerCmd::DocumentsChanged {
+                        state_rev: self.state_rev,
+                        documents: vec![(path, None)],
+                    })
+                    .ok();
+            }
+            lsp::notification::DidSaveTextDocument::METHOD => {
+                let lsp::DidSaveTextDocumentParams {
+                    text_document: doc, ..
+                } = serde_json::from_value(notif.params)?;
+                if !is_file_uri(&doc.uri) {
+                    self.context.logger().info(format!(
+                        "Document save ignored (non-file URI) uri={}",
+                        doc.uri.as_str(),
+                    ));
+                    return Ok(false);
+                }
+                self.context.logger().info(format!(
+                    "Document save uri={} version={:?}",
+                    doc.uri.as_str(),
+                    self.buffers.get(&doc.uri).and_then(Buffer::version),
+                ));
+                self.diag_rev += 1;
+                self.latest_diag_rev.store(self.diag_rev, Ordering::Release);
+                self.startup_edited = true;
+                cmd_tx
+                    .send(WorkerCmd::Check {
+                        state_rev: self.state_rev,
+                        diag_rev: self.diag_rev,
+                        path: path_from_uri(&doc.uri)?,
+                    })
+                    .ok();
+            }
+            lsp::notification::DidChangeWatchedFiles::METHOD => {
+                let params: lsp::DidChangeWatchedFilesParams =
+                    serde_json::from_value(notif.params)?;
+                let paths = params
+                    .changes
+                    .into_iter()
+                    .filter(|event| is_file_uri(&event.uri))
+                    .map(|event| path_from_uri(&event.uri))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                if !paths.is_empty() {
+                    self.state_rev += 1;
+                    self.latest_state_rev
+                        .store(self.state_rev, Ordering::Release);
+                    cmd_tx
+                        .send(WorkerCmd::FilesChanged {
+                            state_rev: self.state_rev,
+                            paths,
+                        })
+                        .ok();
+                }
+            }
+            lsp::notification::DidChangeConfiguration::METHOD => {
+                self.state_rev += 1;
+                self.latest_state_rev
+                    .store(self.state_rev, Ordering::Release);
+                cmd_tx
+                    .send(WorkerCmd::FilesChanged {
+                        state_rev: self.state_rev,
+                        paths: vec![],
+                    })
+                    .ok();
+            }
+            lsp::notification::DidChangeWorkspaceFolders::METHOD => {
+                let lsp::DidChangeWorkspaceFoldersParams { event } =
+                    serde_json::from_value(notif.params)?;
+                let added = event
+                    .added
+                    .into_iter()
+                    .filter(|folder| is_file_uri(&folder.uri))
+                    .map(|folder| path_from_uri(&folder.uri))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let removed = event
+                    .removed
+                    .into_iter()
+                    .filter(|folder| is_file_uri(&folder.uri))
+                    .map(|uri| path_from_uri(&uri.uri))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if !added.is_empty() || !removed.is_empty() {
+                    self.state_rev += 1;
+                    self.latest_state_rev
+                        .store(self.state_rev, Ordering::Release);
+                    cmd_tx
+                        .send(WorkerCmd::ChangeWorkspaceFolders {
+                            state_rev: self.state_rev,
+                            added,
+                            removed,
+                        })
+                        .ok();
+                }
+            }
+            lsp::notification::Cancel::METHOD => {
+                let params: lsp::CancelParams = serde_json::from_value(notif.params)?;
+                let id = match params.id {
+                    lsp::NumberOrString::Number(id) => RequestId::from(id),
+                    lsp::NumberOrString::String(id) => RequestId::from(id),
+                };
+                if let Some(token) = self.in_flight.remove(&id) {
+                    token.cancel();
+                    self.context
+                        .logger()
+                        .info(format!("Request cancelled id={id}"));
+                    self.connection.sender.send(Message::Response(Response {
+                        id,
+                        response_result: Err(response_error(
+                            ErrorCode::RequestCanceled,
+                            "Request cancelled",
+                        )),
+                    }))?;
+                } else {
+                    self.context.logger().info(format!(
+                        "Cancellation received id={id}; request already completed or unknown"
+                    ));
+                }
+            }
+            _ => {
+                self.context.logger().info(format!(
+                    "Received an unexpected notification: {}",
+                    notif.method
+                ));
+            }
+        }
+        Ok(false)
+    }
+
+    fn handle_worker_event(
+        &mut self,
+        event: WorkerEvent,
+        cmd_tx: Option<&Sender<WorkerCmd>>,
+    ) -> anyhow::Result<()> {
+        match event {
+            WorkerEvent::Response {
+                id,
+                method,
+                started,
+                result,
+            } => {
+                // A missing entry means the request was already cancelled and
+                // its `RequestCancelled` response already sent.
+                if self.in_flight.remove(&id).is_none() {
+                    return Ok(());
+                }
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                match &result {
+                    Ok(value) => {
+                        if is_summary_method(&method) {
+                            self.context.logger().info(format!(
+                                "Response method={} id={} {} elapsed_ms={:.3}",
+                                method,
+                                id,
+                                response_summary(&method, value),
+                                elapsed,
+                            ));
                         }
                     }
-                    self.server.documents_changed(&documents, &self.context)
-                };
-                let result = outcome.and_then(|()| self.update_watchers());
-                if let Err(err) = result {
-                    let message = format!("{err:#}");
-                    self.context.logger().error(&message);
-                    self.context.show_message(lsp::MessageType::ERROR, message);
+                    Err(error) => {
+                        self.context.logger().error(format!(
+                            "Request failed method={} id={} code={} message={} elapsed_ms={:.3}",
+                            method, id, error.code, error.message, elapsed,
+                        ));
+                    }
                 }
-                continue;
+                self.connection.sender.send(Message::Response(Response {
+                    id,
+                    response_result: result,
+                }))?;
             }
-            if matches!(&message, Message::Notification(notif) if notif.method == lsp::notification::Exit::METHOD)
-            {
-                if !self.shutdown {
-                    bail!("Received exit before shutdown");
+            WorkerEvent::Diagnostics {
+                state_rev,
+                diag_rev,
+                is_startup,
+                batch,
+            } => {
+                if state_rev == self.state_rev && diag_rev == self.diag_rev {
+                    self.startup_pending = false;
+                    self.diagnostics.apply_and_flush(batch, &self.context)?;
+                } else {
+                    self.context.logger().info(format!(
+                        "Rejected stale diagnostic publication state_rev={state_rev} current_state_rev={} diag_rev={diag_rev} current_diag_rev={}",
+                        self.state_rev, self.diag_rev,
+                    ));
+                    // A launch-time document open supersedes the initial
+                    // diagnostics; recompute them at the current revision so
+                    // workspace errors still surface.
+                    if is_startup
+                        && self.startup_pending
+                        && !self.startup_edited
+                        && let Some(cmd_tx) = cmd_tx
+                    {
+                        cmd_tx
+                            .send(WorkerCmd::StartupDiagnostics {
+                                state_rev: self.state_rev,
+                                diag_rev: self.diag_rev,
+                            })
+                            .ok();
+                    }
                 }
-                return Ok(());
             }
-            if let Err(err) = self.handle(message) {
-                let message = format!("{err:#}");
+            WorkerEvent::WatchRoots { state_rev, roots } => {
+                if state_rev == self.state_rev {
+                    self.update_watchers_with(roots)?;
+                }
+            }
+            WorkerEvent::Error(message) => {
                 self.context.logger().error(&message);
                 self.context.show_message(lsp::MessageType::ERROR, message);
             }
@@ -163,11 +891,161 @@ impl LspServer<'_> {
         Ok(())
     }
 
+    fn handle_watcher_response(&mut self, response: Response) {
+        if response.id == RequestId::from("source-watchers".to_owned())
+            || response.id == RequestId::from("remove-source-watchers".to_owned())
+        {
+            if let Err(error) = response.response_result {
+                self.context.logger().error(format!(
+                    "Could not register source watchers: {}",
+                    error.message
+                ));
+            }
+        } else {
+            self.context
+                .logger()
+                .info(format!("Received an unexpected response: {}", response.id));
+        }
+    }
+
+    fn owned_document(&self, uri: &lsp::Uri) -> anyhow::Result<OwnedDocument> {
+        let path = path_from_uri(uri)?;
+        let buffer = self.buffers.get(uri).context("URI not found")?.clone();
+        Ok(OwnedDocument { path, buffer })
+    }
+
+    fn owned_location(
+        &self,
+        uri: &lsp::Uri,
+        pos: lsp::Position,
+    ) -> anyhow::Result<OwnedCodeLocation> {
+        let doc = self.owned_document(uri)?;
+        let pos = doc
+            .buffer
+            .get_pos(pos.line, pos.character)
+            .context("position not found")?;
+        Ok(OwnedCodeLocation { doc, pos })
+    }
+
+    fn owned_documents(&self, uris: &[lsp::Uri]) -> Vec<(PathBuf, Option<Buffer>)> {
+        uris.iter()
+            .filter_map(|uri| match path_from_uri(uri) {
+                Ok(path) => Some((path, self.buffers.get(uri).cloned())),
+                Err(err) => {
+                    self.context.logger().error(format!("{err:#}"));
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn parse_worker_request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<WorkerRequest, ResponseError> {
+        match method {
+            lsp::request::HoverRequest::METHOD => {
+                let lsp::HoverParams {
+                    text_document_position_params: params,
+                    ..
+                } = serde_json::from_value(params).map_err(invalid_params)?;
+                let loc = self
+                    .owned_location(&params.text_document.uri, params.position)
+                    .map_err(invalid_params)?;
+                Ok(WorkerRequest::Hover(loc))
+            }
+            lsp::request::Completion::METHOD => {
+                let lsp::CompletionParams {
+                    text_document_position: params,
+                    ..
+                } = serde_json::from_value(params).map_err(invalid_params)?;
+                let loc = self
+                    .owned_location(&params.text_document.uri, params.position)
+                    .map_err(invalid_params)?;
+                Ok(WorkerRequest::Completion(loc))
+            }
+            lsp::request::GotoDefinition::METHOD => {
+                let lsp::GotoDefinitionParams {
+                    text_document_position_params: params,
+                    ..
+                } = serde_json::from_value(params).map_err(invalid_params)?;
+                let loc = self
+                    .owned_location(&params.text_document.uri, params.position)
+                    .map_err(invalid_params)?;
+                Ok(WorkerRequest::GotoDefinition(loc))
+            }
+            lsp::request::DocumentSymbolRequest::METHOD => {
+                let lsp::DocumentSymbolParams { text_document, .. } =
+                    serde_json::from_value(params).map_err(invalid_params)?;
+                let doc = self
+                    .owned_document(&text_document.uri)
+                    .map_err(invalid_params)?;
+                Ok(WorkerRequest::DocumentSymbols(doc))
+            }
+            lsp::request::WorkspaceSymbolRequest::METHOD => {
+                let lsp::WorkspaceSymbolParams { query, .. } =
+                    serde_json::from_value(params).map_err(invalid_params)?;
+                Ok(WorkerRequest::WorkspaceSymbol(query))
+            }
+            lsp::request::Formatting::METHOD => {
+                let lsp::DocumentFormattingParams {
+                    text_document,
+                    options,
+                    ..
+                } = serde_json::from_value(params).map_err(invalid_params)?;
+                let doc = self
+                    .owned_document(&text_document.uri)
+                    .map_err(invalid_params)?;
+                Ok(WorkerRequest::Formatting {
+                    doc,
+                    // Guard the truncating cast; LSP `tabSize` is a `u32`.
+                    tab_size: u16::try_from(options.tab_size).unwrap_or(4).max(1),
+                })
+            }
+            lsp::request::CodeActionRequest::METHOD => {
+                let lsp::CodeActionParams {
+                    text_document,
+                    range,
+                    context,
+                    ..
+                } = serde_json::from_value(params).map_err(invalid_params)?;
+                let path = path_from_uri(&text_document.uri).map_err(invalid_params)?;
+                let span = self
+                    .range(&text_document.uri, range)
+                    .map_err(invalid_params)?;
+                Ok(WorkerRequest::CodeAction {
+                    path,
+                    span,
+                    context,
+                })
+            }
+            lsp::request::CodeActionResolveRequest::METHOD => {
+                let action = serde_json::from_value(params).map_err(invalid_params)?;
+                Ok(WorkerRequest::CodeActionResolve(Box::new(action)))
+            }
+            _ => Err(response_error(
+                ErrorCode::MethodNotFound,
+                format!("Unknown request: {method}"),
+            )),
+        }
+    }
+
     fn update_watchers(&mut self) -> anyhow::Result<()> {
         if !self.watch_files {
             return Ok(());
         }
         let roots = self.server.watch_roots();
+        self.update_watchers_with(roots)
+    }
+
+    /// Registers or clears dynamic file watchers for `roots`, skipping work
+    /// when they are unchanged. Used by the protocol thread with roots computed
+    /// on the worker.
+    fn update_watchers_with(&mut self, roots: Vec<PathBuf>) -> anyhow::Result<()> {
+        if !self.watch_files {
+            return Ok(());
+        }
         if roots == self.watched_roots {
             return Ok(());
         }
@@ -666,6 +1544,246 @@ fn response_value<R: Serialize>(result: anyhow::Result<R>) -> Result<Value, Resp
         .map_err(|err| response_error(ErrorCode::InternalError, err))
 }
 
+/// Requests whose logs summarize the response shape instead of echoing it.
+fn is_summary_method(method: &str) -> bool {
+    matches!(
+        method,
+        lsp::request::HoverRequest::METHOD | lsp::request::Completion::METHOD
+    )
+}
+
+/// Logs the redacted request metadata for hover/completion, mirroring what the
+/// synchronous [`LspServer::handle`] path records.
+fn log_request_metadata(context: &LspContext, request: &lsp_server::Request) {
+    if !is_summary_method(&request.method) {
+        return;
+    }
+    let params = &request.params;
+    context.logger().info(format!(
+        "Request method={} id={} uri={} line={:?} character={:?}",
+        request.method,
+        request.id,
+        params
+            .pointer("/textDocument/uri")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>"),
+        params.pointer("/position/line").and_then(Value::as_u64),
+        params
+            .pointer("/position/character")
+            .and_then(Value::as_u64),
+    ));
+    if request.method == lsp::request::Completion::METHOD {
+        context.logger().info(format!(
+            "Completion context id={} trigger_kind={:?} trigger_character={:?}",
+            request.id,
+            params
+                .pointer("/context/triggerKind")
+                .and_then(Value::as_u64),
+            params
+                .pointer("/context/triggerCharacter")
+                .and_then(Value::as_str),
+        ));
+    }
+}
+
+/// Executes a worker request against the language server, adapting the raw
+/// result to the client's negotiated presentation capabilities.
+fn execute_request(
+    server: &mut dyn LanguageServer,
+    request: WorkerRequest,
+    context: &LspContext,
+) -> Result<Value, ResponseError> {
+    match request {
+        WorkerRequest::Hover(loc) => {
+            response_value(server.hover(loc.as_loc(), context).map(|hover| {
+                hover.map(|mut hover| {
+                    context.adapt_hover(&mut hover);
+                    hover
+                })
+            }))
+        }
+        WorkerRequest::Completion(loc) => {
+            response_value(server.completion(loc.as_loc(), context).map(|completion| {
+                // Keep cached completions independent of client presentation capabilities.
+                let mut completion = completion.as_ref().clone();
+                context.adapt_completion(&mut completion);
+                completion
+            }))
+        }
+        WorkerRequest::GotoDefinition(loc) => {
+            response_value(server.goto_definition(loc.as_loc(), context))
+        }
+        WorkerRequest::DocumentSymbols(doc) => {
+            let uri = context.uri(doc.path()).map_err(invalid_params)?;
+            response_value(
+                server
+                    .document_symbols(doc.as_doc(), context)
+                    .map(|symbols| context.adapt_document_symbols(symbols, &uri)),
+            )
+        }
+        WorkerRequest::WorkspaceSymbol(query) => {
+            response_value(server.workspace_symbol(&query, context))
+        }
+        WorkerRequest::Formatting { doc, tab_size } => {
+            response_value(server.format(doc.as_doc(), tab_size, context))
+        }
+        WorkerRequest::CodeAction {
+            path,
+            span,
+            context: action_context,
+        } => response_value(server.code_action(path, span, action_context, context)),
+        WorkerRequest::CodeActionResolve(action) => {
+            response_value(server.code_action_resolve(*action, context))
+        }
+    }
+}
+
+/// The analysis worker thread. It owns the language server exclusively and
+/// processes commands in FIFO order, emitting results as [`WorkerEvent`]s.
+fn worker_main<'a>(
+    mut server: Box<dyn LanguageServer + 'a>,
+    context: LspContext,
+    cmd_rx: Receiver<WorkerCmd>,
+    event_tx: Sender<WorkerEvent>,
+    latest_state_rev: Arc<AtomicU64>,
+    latest_diag_rev: Arc<AtomicU64>,
+    watch_files: bool,
+) {
+    let publish_roots =
+        |state_rev: u64, server: &dyn LanguageServer, event_tx: &Sender<WorkerEvent>| {
+            if watch_files {
+                event_tx
+                    .send(WorkerEvent::WatchRoots {
+                        state_rev,
+                        roots: server.watch_roots(),
+                    })
+                    .ok();
+            }
+        };
+
+    while let Ok(cmd) = cmd_rx.recv() {
+        match cmd {
+            WorkerCmd::DocumentsChanged {
+                state_rev,
+                documents,
+            } => {
+                let borrowed: Vec<(PathBuf, Option<&Buffer>)> = documents
+                    .iter()
+                    .map(|(path, buffer)| (path.clone(), buffer.as_ref()))
+                    .collect();
+                if let Err(err) = server.documents_changed(&borrowed, &context) {
+                    event_tx.send(WorkerEvent::Error(format!("{err:#}"))).ok();
+                }
+                publish_roots(state_rev, &*server, &event_tx);
+            }
+            WorkerCmd::FilesChanged { state_rev, paths } => {
+                if let Err(err) = server.files_changed(paths, &context) {
+                    event_tx.send(WorkerEvent::Error(format!("{err:#}"))).ok();
+                }
+                publish_roots(state_rev, &*server, &event_tx);
+            }
+            WorkerCmd::ChangeWorkspaceFolders {
+                state_rev,
+                added,
+                removed,
+            } => {
+                if let Err(err) = server.change_workspace_folders(added, removed, &context) {
+                    event_tx.send(WorkerEvent::Error(format!("{err:#}"))).ok();
+                }
+                publish_roots(state_rev, &*server, &event_tx);
+            }
+            WorkerCmd::Check {
+                state_rev,
+                diag_rev,
+                path,
+            } => {
+                // Always run the check so the server refreshes its state and
+                // quick fixes; the protocol thread rejects a superseded batch.
+                let cancel = CancelToken::default();
+                set_current_cancel(cancel);
+                let result = server.check(path, &context);
+                clear_current_cancel();
+                match result {
+                    Ok(Some(batch)) => {
+                        event_tx
+                            .send(WorkerEvent::Diagnostics {
+                                state_rev,
+                                diag_rev,
+                                is_startup: false,
+                                batch,
+                            })
+                            .ok();
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        event_tx.send(WorkerEvent::Error(format!("{err:#}"))).ok();
+                    }
+                }
+                publish_roots(state_rev, &*server, &event_tx);
+            }
+            WorkerCmd::StartupDiagnostics {
+                state_rev,
+                diag_rev,
+            } => {
+                let stale = || {
+                    latest_state_rev.load(Ordering::Acquire) != state_rev
+                        || latest_diag_rev.load(Ordering::Acquire) != diag_rev
+                };
+                let cancel = CancelToken::default();
+                set_current_cancel(cancel);
+                let result = server.startup_diagnostics(&context, &stale);
+                clear_current_cancel();
+                match result {
+                    Ok(Some(batch)) => {
+                        event_tx
+                            .send(WorkerEvent::Diagnostics {
+                                state_rev,
+                                diag_rev,
+                                is_startup: true,
+                                batch,
+                            })
+                            .ok();
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        event_tx.send(WorkerEvent::Error(format!("{err:#}"))).ok();
+                    }
+                }
+            }
+            WorkerCmd::Request {
+                id,
+                method,
+                kind,
+                started,
+                cancel,
+            } => {
+                if cancel.is_cancelled() {
+                    continue;
+                }
+                set_current_cancel(cancel.clone());
+                let result = execute_request(&mut *server, *kind, &context);
+                clear_current_cancel();
+                // A cancelled request already received its `RequestCancelled`
+                // response from the protocol thread; drop the late result.
+                if cancel.is_cancelled() {
+                    continue;
+                }
+                event_tx
+                    .send(WorkerEvent::Response {
+                        id,
+                        method,
+                        started,
+                        result,
+                    })
+                    .ok();
+            }
+            WorkerCmd::Flush(ack) => {
+                ack.send(()).ok();
+            }
+        }
+    }
+}
+
 pub trait LanguageServer: Send {
     fn watch_roots(&self) -> Vec<PathBuf>;
     fn document_changed(
@@ -688,11 +1806,21 @@ pub trait LanguageServer: Send {
         Ok(())
     }
     fn files_changed(&mut self, paths: Vec<PathBuf>, ctx: &LspContext) -> anyhow::Result<()>;
-    fn check(
+    fn check(&mut self, path: PathBuf, ctx: &LspContext)
+    -> anyhow::Result<Option<DiagnosticBatch>>;
+    /// Computes the initial workspace diagnostics without publishing them.
+    ///
+    /// The default implementation reports nothing; servers with real analysis
+    /// return a batch that the protocol thread commits only if it is still
+    /// current. `should_abort` lets the computation stop early once a newer
+    /// edit has superseded it.
+    fn startup_diagnostics(
         &mut self,
-        path: PathBuf,
-        ctx: &LspContext,
-    ) -> anyhow::Result<Option<DiagnosticBatch>>;
+        _ctx: &LspContext,
+        _should_abort: &(dyn Fn() -> bool + Sync),
+    ) -> anyhow::Result<Option<DiagnosticBatch>> {
+        Ok(None)
+    }
     fn change_workspace_folders(
         &mut self,
         added: Vec<PathBuf>,
@@ -1234,12 +2362,19 @@ mod tests {
         fn files_changed(&mut self, paths: Vec<PathBuf>, _ctx: &LspContext) -> anyhow::Result<()> {
             assert!(self.allow_document_changes, "unexpected file change");
             if let Some(events) = &self.events {
-                events.lock().unwrap().push(format!("files:{}", paths.len()));
+                events
+                    .lock()
+                    .unwrap()
+                    .push(format!("files:{}", paths.len()));
             }
             Ok(())
         }
 
-        fn check(&mut self, _path: PathBuf, _ctx: &LspContext) -> anyhow::Result<Option<DiagnosticBatch>> {
+        fn check(
+            &mut self,
+            _path: PathBuf,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<Option<DiagnosticBatch>> {
             assert!(self.allow_document_changes, "unexpected check");
             if let Some(events) = &self.events {
                 events.lock().unwrap().push("save".into());
@@ -1255,7 +2390,8 @@ mod tests {
         ) -> anyhow::Result<()> {
             if let Some(events) = &self.events {
                 events
-                    .lock().unwrap()
+                    .lock()
+                    .unwrap()
                     .push(format!("folders:{}:{}", added.len(), removed.len()));
             }
             self.watch_roots.retain(|root| !removed.contains(root));
@@ -1270,7 +2406,8 @@ mod tests {
         ) -> anyhow::Result<Option<lsp::Hover>> {
             if let Some(events) = &self.events {
                 events
-                    .lock().unwrap()
+                    .lock()
+                    .unwrap()
                     .push(format!("hover:{}", doc.doc().buffer().contents()));
             }
             self.hover.clone().context("stub handler failed")
@@ -1303,7 +2440,8 @@ mod tests {
         ) -> anyhow::Result<lsp::DocumentSymbolResponse> {
             if let Some(events) = &self.events {
                 events
-                    .lock().unwrap()
+                    .lock()
+                    .unwrap()
                     .push(format!("document_symbols:{}", doc.buffer().contents()));
             }
             Ok(self
@@ -1418,6 +2556,14 @@ mod tests {
                 watch_files: false,
                 watched_roots: vec![],
                 shutdown: false,
+                in_flight: HashMap::new(),
+                state_rev: 0,
+                diag_rev: 0,
+                latest_state_rev: Arc::new(AtomicU64::new(0)),
+                latest_diag_rev: Arc::new(AtomicU64::new(0)),
+                diagnostics: DiagnosticTracker::default(),
+                startup_pending: false,
+                startup_edited: false,
             },
             client,
         )
