@@ -663,7 +663,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "redscript-code-edit"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=18dc9b36#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
+source = "git+https://github.com/jac3km4/redscript?rev=18dc9b364c8fee7d2903085bbbebde45103ca6d3#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
 dependencies = [
  "anyhow",
  "redscript-compiler-api",
@@ -672,7 +672,7 @@ dependencies = [
 [[package]]
 name = "redscript-community-ast"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=18dc9b36#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
+source = "git+https://github.com/jac3km4/redscript?rev=18dc9b364c8fee7d2903085bbbebde45103ca6d3#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
 dependencies = [
  "bitflags 2.13.2",
  "chumsky",
@@ -684,7 +684,7 @@ dependencies = [
 [[package]]
 name = "redscript-community-formatter"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=18dc9b36#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
+source = "git+https://github.com/jac3km4/redscript?rev=18dc9b364c8fee7d2903085bbbebde45103ca6d3#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
 dependencies = [
  "hashbrown 0.17.1",
  "pretty_dtoa",
@@ -695,7 +695,7 @@ dependencies = [
 [[package]]
 name = "redscript-community-parser"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=18dc9b36#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
+source = "git+https://github.com/jac3km4/redscript?rev=18dc9b364c8fee7d2903085bbbebde45103ca6d3#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
 dependencies = [
  "chumsky",
  "redscript-community-ast",
@@ -704,7 +704,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-api"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=18dc9b36#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
+source = "git+https://github.com/jac3km4/redscript?rev=18dc9b364c8fee7d2903085bbbebde45103ca6d3#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
 dependencies = [
  "bon",
  "log",
@@ -719,7 +719,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-backend"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=18dc9b36#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
+source = "git+https://github.com/jac3km4/redscript?rev=18dc9b364c8fee7d2903085bbbebde45103ca6d3#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
 dependencies = [
  "bitfield-struct",
  "bon",
@@ -736,7 +736,7 @@ dependencies = [
 [[package]]
 name = "redscript-compiler-frontend"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=18dc9b36#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
+source = "git+https://github.com/jac3km4/redscript?rev=18dc9b364c8fee7d2903085bbbebde45103ca6d3#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
 dependencies = [
  "bitfield-struct",
  "bon",
@@ -757,7 +757,7 @@ dependencies = [
 [[package]]
 name = "redscript-dotfile"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=18dc9b36#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
+source = "git+https://github.com/jac3km4/redscript?rev=18dc9b364c8fee7d2903085bbbebde45103ca6d3#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
 dependencies = [
  "anyhow",
  "hashbrown 0.17.1",
@@ -797,7 +797,7 @@ dependencies = [
 [[package]]
 name = "redscript-io"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=18dc9b36#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
+source = "git+https://github.com/jac3km4/redscript?rev=18dc9b364c8fee7d2903085bbbebde45103ca6d3#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
 dependencies = [
  "bitfield-struct",
  "byte",
@@ -811,7 +811,7 @@ dependencies = [
 [[package]]
 name = "redscript-redmod-adapter"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=18dc9b36#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
+source = "git+https://github.com/jac3km4/redscript?rev=18dc9b364c8fee7d2903085bbbebde45103ca6d3#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
 dependencies = [
  "redscript-community-ast",
  "redscript-compiler-frontend",
@@ -822,7 +822,7 @@ dependencies = [
 [[package]]
 name = "redscript-redmod-ast"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=18dc9b36#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
+source = "git+https://github.com/jac3km4/redscript?rev=18dc9b364c8fee7d2903085bbbebde45103ca6d3#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
 dependencies = [
  "redscript-community-ast",
 ]
@@ -830,7 +830,7 @@ dependencies = [
 [[package]]
 name = "redscript-redmod-formatter"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=18dc9b36#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
+source = "git+https://github.com/jac3km4/redscript?rev=18dc9b364c8fee7d2903085bbbebde45103ca6d3#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
 dependencies = [
  "redscript-redmod-ast",
  "redscript-redmod-parser",
@@ -839,7 +839,7 @@ dependencies = [
 [[package]]
 name = "redscript-redmod-parser"
 version = "1.0.1"
-source = "git+https://github.com/jac3km4/redscript?rev=18dc9b36#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
+source = "git+https://github.com/jac3km4/redscript?rev=18dc9b364c8fee7d2903085bbbebde45103ca6d3#18dc9b364c8fee7d2903085bbbebde45103ca6d3"
 dependencies = [
  "chumsky",
  "redscript-community-ast",
@@ -1031,7 +1031,7 @@ checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
 [[package]]
 name = "stable_deref_trait"
 version = "1.1.1"
-source = "git+https://github.com/Storyyeller/stable_deref_trait?rev=59a35e0#59a35e0a40041133c6b8744f2b62f922e7d18d5b"
+source = "git+https://github.com/Storyyeller/stable_deref_trait?rev=59a35e0a40041133c6b8744f2b62f922e7d18d5b#59a35e0a40041133c6b8744f2b62f922e7d18d5b"
 
 [[package]]
 name = "stacker"

@@ -18,14 +18,14 @@ miniz_oxide = "0.9"
 lsp-server = "0.10"
 lsp-types = "0.97"
 tempfile = "3"
-redscript-io = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b36" }
-redscript-redmod-formatter = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b36" }
-redscript-redmod-adapter = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b36" }
-redscript-community-formatter = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b36" }
-redscript-compiler-api = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b36" }
-redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b36" }
-redscript-dotfile = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b36" }
-redscript-code-edit = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b36" }
+redscript-io = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b364c8fee7d2903085bbbebde45103ca6d3" }
+redscript-redmod-formatter = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b364c8fee7d2903085bbbebde45103ca6d3" }
+redscript-redmod-adapter = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b364c8fee7d2903085bbbebde45103ca6d3" }
+redscript-community-formatter = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b364c8fee7d2903085bbbebde45103ca6d3" }
+redscript-compiler-api = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b364c8fee7d2903085bbbebde45103ca6d3" }
+redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b364c8fee7d2903085bbbebde45103ca6d3" }
+redscript-dotfile = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b364c8fee7d2903085bbbebde45103ca6d3" }
+redscript-code-edit = { git = "https://github.com/jac3km4/redscript", rev = "18dc9b364c8fee7d2903085bbbebde45103ca6d3" }
 
 [workspace.metadata.release]
 pre-release-commit-message = "chore: release {{version}}"
@@ -63,7 +63,7 @@ tempfile.workspace = true
 redscript-compiler-frontend.workspace = true
 
 [patch.crates-io]
-stable_deref_trait = { git = "https://github.com/Storyyeller/stable_deref_trait", rev = "59a35e0" }
+stable_deref_trait = { git = "https://github.com/Storyyeller/stable_deref_trait", rev = "59a35e0a40041133c6b8744f2b62f922e7d18d5b" }
 
 [lints.rust]
 warnings = "warn"

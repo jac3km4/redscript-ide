@@ -1180,6 +1180,8 @@ mod tests {
         document_symbols: Option<lsp::DocumentSymbolResponse>,
         allow_document_changes: bool,
         events: Option<Rc<RefCell<Vec<String>>>>,
+        watch_roots: Vec<PathBuf>,
+        code_actions: Vec<lsp::CodeAction>,
     }
 
     impl LanguageServer for StubServer {
@@ -1187,7 +1189,7 @@ mod tests {
             if let Some(events) = &self.events {
                 events.borrow_mut().push("watchers".into());
             }
-            vec![]
+            self.watch_roots.clone()
         }
 
         fn document_changed(
@@ -1226,11 +1228,18 @@ mod tests {
 
         fn change_workspace_folders(
             &mut self,
-            _added: Vec<PathBuf>,
-            _removed: Vec<PathBuf>,
+            added: Vec<PathBuf>,
+            removed: Vec<PathBuf>,
             _ctx: &LspContext,
         ) -> anyhow::Result<()> {
-            panic!("unexpected workspace change");
+            if let Some(events) = &self.events {
+                events
+                    .borrow_mut()
+                    .push(format!("folders:{}:{}", added.len(), removed.len()));
+            }
+            self.watch_roots.retain(|root| !removed.contains(root));
+            self.watch_roots.extend(added);
+            Ok(())
         }
 
         fn hover(
@@ -1304,7 +1313,7 @@ mod tests {
             _path: PathBuf,
             span: Range<u32>,
             context: lsp::CodeActionContext,
-            _ctx: &LspContext,
+            ctx: &LspContext,
         ) -> anyhow::Result<lsp::CodeActionResponse> {
             if let Some(events) = &self.events {
                 events.borrow_mut().push(format!(
@@ -1312,15 +1321,65 @@ mod tests {
                     serde_json::to_string(&context)?
                 ));
             }
-            Ok(vec![])
+            self.code_actions
+                .iter()
+                .cloned()
+                .map(|action| {
+                    let action = if ctx.supports_code_action_resolve_edit() {
+                        action
+                    } else {
+                        let mut action = self.code_action_resolve(action, ctx)?;
+                        action.data = None;
+                        action
+                    };
+                    Ok(lsp::CodeActionOrCommand::CodeAction(action))
+                })
+                .collect()
         }
 
         fn code_action_resolve(
             &self,
-            action: lsp::CodeAction,
-            _ctx: &LspContext,
+            mut action: lsp::CodeAction,
+            ctx: &LspContext,
         ) -> anyhow::Result<lsp::CodeAction> {
+            let Some(data) = action.data.clone() else {
+                return Ok(action);
+            };
+            if data.get("stale").and_then(Value::as_bool).unwrap_or(false) {
+                action.edit = None;
+                if ctx.supports_code_action_disabled() {
+                    action.disabled = Some(lsp::CodeActionDisabled {
+                        reason: "stale".into(),
+                    });
+                }
+                return Ok(action);
+            }
+            action.edit = Some(stub_workspace_edit(ctx));
             Ok(action)
+        }
+    }
+
+    fn stub_workspace_edit(ctx: &LspContext) -> lsp::WorkspaceEdit {
+        let uri: lsp::Uri = "file:///C:/test.reds".parse().unwrap();
+        let edit = lsp::TextEdit::new(lsp::Range::default(), "fixed".into());
+        if ctx.supports_workspace_edit_document_changes() {
+            lsp::WorkspaceEdit {
+                document_changes: Some(lsp::DocumentChanges::Edits(vec![lsp::TextDocumentEdit {
+                    text_document: lsp::OptionalVersionedTextDocumentIdentifier {
+                        uri,
+                        version: Some(1),
+                    },
+                    edits: vec![lsp::OneOf::Left(edit)],
+                }])),
+                ..Default::default()
+            }
+        } else {
+            #[allow(clippy::mutable_key_type)]
+            let changes = [(uri, vec![edit])].into_iter().collect();
+            lsp::WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }
         }
     }
 
@@ -1732,6 +1791,154 @@ mod tests {
         assert!(!ctx.supports_code_action_resolve_edit());
     }
 
+    #[test]
+    fn code_action_dispatch_inlines_edits_without_lazy_edit_support() {
+        let (mut server, _client) = memory_server();
+        server.server = Box::new(StubServer {
+            code_actions: vec![lsp::CodeAction {
+                title: "Fix".into(),
+                kind: Some(lsp::CodeActionKind::QUICKFIX),
+                data: Some(json!({"fix": 1})),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        server
+            .context
+            .set_code_action_capabilities(&lsp::ClientCapabilities::default());
+        let actions = server
+            .dispatch(
+                lsp::request::CodeActionRequest::METHOD,
+                code_action_params(),
+            )
+            .unwrap();
+        let actions = actions.as_array().unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0]["data"].is_null());
+        assert!(actions[0]["edit"]["changes"].is_object());
+        assert!(actions[0]["edit"].get("documentChanges").is_none());
+    }
+
+    #[test]
+    fn code_action_dispatch_and_resolve_negotiate_lazy_edits() {
+        let (mut server, _client) = memory_server();
+        server.server = Box::new(StubServer {
+            code_actions: vec![lsp::CodeAction {
+                title: "Fix".into(),
+                kind: Some(lsp::CodeActionKind::QUICKFIX),
+                data: Some(json!({"fix": 1})),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        server.context.set_code_action_capabilities(
+            &serde_json::from_value(json!({
+                "textDocument": {"codeAction": {
+                    "codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["quickfix"]}},
+                    "dataSupport": true,
+                    "resolveSupport": {"properties": ["edit"]},
+                    "disabledSupport": true
+                }},
+                "workspace": {"workspaceEdit": {"documentChanges": true}}
+            }))
+            .unwrap(),
+        );
+        let actions = server
+            .dispatch(
+                lsp::request::CodeActionRequest::METHOD,
+                code_action_params(),
+            )
+            .unwrap();
+        let actions = actions.as_array().unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["data"], json!({"fix": 1}));
+        assert!(actions[0].get("edit").is_none());
+
+        let resolved = server
+            .dispatch(
+                lsp::request::CodeActionResolveRequest::METHOD,
+                actions[0].clone(),
+            )
+            .unwrap();
+        assert_eq!(resolved["data"], json!({"fix": 1}));
+        assert!(resolved["edit"]["documentChanges"].is_array());
+        assert!(resolved["edit"].get("changes").is_none());
+    }
+
+    #[test]
+    fn code_action_resolve_honors_workspace_edit_and_disabled_capabilities() {
+        let (mut server, _client) = memory_server();
+        let action = |data: Value| lsp::CodeAction {
+            title: "Fix".into(),
+            kind: Some(lsp::CodeActionKind::QUICKFIX),
+            data: Some(data),
+            ..Default::default()
+        };
+
+        // Resolve support without `documentChanges` produces a `changes` edit.
+        server.server = Box::new(StubServer {
+            code_actions: vec![action(json!({"fix": 1}))],
+            ..Default::default()
+        });
+        server.context.set_code_action_capabilities(
+            &serde_json::from_value(json!({
+                "textDocument": {"codeAction": {
+                    "codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["quickfix"]}},
+                    "dataSupport": true,
+                    "resolveSupport": {"properties": ["edit"]}
+                }}
+            }))
+            .unwrap(),
+        );
+        let actions = server
+            .dispatch(
+                lsp::request::CodeActionRequest::METHOD,
+                code_action_params(),
+            )
+            .unwrap();
+        let resolved = server
+            .dispatch(
+                lsp::request::CodeActionResolveRequest::METHOD,
+                actions.as_array().unwrap()[0].clone(),
+            )
+            .unwrap();
+        assert!(resolved["edit"]["changes"].is_object());
+        assert!(resolved["edit"].get("documentChanges").is_none());
+
+        // A stale fix is disabled only when the client advertises disabledSupport.
+        for (disabled_support, expect_disabled) in [(false, false), (true, true)] {
+            server.server = Box::new(StubServer {
+                code_actions: vec![action(json!({"stale": true}))],
+                ..Default::default()
+            });
+            server.context.set_code_action_capabilities(
+                &serde_json::from_value(json!({
+                    "textDocument": {"codeAction": {
+                        "codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["quickfix"]}},
+                        "dataSupport": true,
+                        "disabledSupport": disabled_support,
+                        "resolveSupport": {"properties": ["edit"]}
+                    }}
+                }))
+                .unwrap(),
+            );
+            let actions = server
+                .dispatch(
+                    lsp::request::CodeActionRequest::METHOD,
+                    code_action_params(),
+                )
+                .unwrap();
+            let resolved = server
+                .dispatch(
+                    lsp::request::CodeActionResolveRequest::METHOD,
+                    actions.as_array().unwrap()[0].clone(),
+                )
+                .unwrap();
+            assert!(resolved.get("edit").is_none());
+            assert_eq!(resolved.get("disabled").is_some(), expect_disabled);
+        }
+    }
+
     fn send_request(client: &Connection, id: i32, method: &str, params: Value) {
         client
             .sender
@@ -1797,6 +2004,43 @@ mod tests {
         let params: lsp::ShowMessageParams = serde_json::from_value(notification.params).unwrap();
         assert_eq!(params.typ, typ);
         params.message
+    }
+
+    fn receive_request(client: &Connection) -> lsp_server::Request {
+        loop {
+            match client
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                Message::Request(request) => return request,
+                Message::Notification(notification) => {
+                    assert_eq!(notification.method, lsp::notification::LogMessage::METHOD);
+                }
+                message => panic!("expected request, got {message:?}"),
+            }
+        }
+    }
+
+    fn register_watcher_globs(params: &Value) -> Vec<String> {
+        let mut globs = Vec::new();
+        for registration in params["registrations"].as_array().unwrap() {
+            for watcher in registration["registerOptions"]["watchers"]
+                .as_array()
+                .unwrap()
+            {
+                globs.push(watcher["globPattern"].as_str().unwrap().to_owned());
+            }
+        }
+        globs
+    }
+
+    fn code_action_params() -> Value {
+        json!({
+            "textDocument": {"uri": "file:///C:/test.reds"},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": []}
+        })
     }
 
     fn record_changes(server: &mut LspServer<'_>) -> Rc<RefCell<Vec<String>>> {
@@ -1968,6 +2212,67 @@ mod tests {
                 assert!(log.contains("current_version=Some(3)"), "{log}");
             }
         }
+    }
+
+    #[test]
+    fn queued_changes_skip_rejected_versions_and_still_coalesce_per_uri() {
+        let (mut server, client) = memory_server();
+        let events = record_changes(&mut server);
+        let uri = "file:///C:/test.reds";
+        queue_change(&client, uri, 2, json!([{ "text": "second" }]));
+        queue_change(
+            &client,
+            uri,
+            3,
+            json!([{
+                "range": { "start": { "line": 9, "character": 0 }, "end": { "line": 9, "character": 1 } },
+                "text": "rejected"
+            }]),
+        );
+        queue_change(&client, uri, 4, json!([{ "text": "fourth" }]));
+        queue_shutdown(&client);
+
+        server.run().unwrap();
+
+        // The rejected version is logged but must not stop the batch, and the
+        // URI still rebuilds exactly once with the last accepted contents.
+        assert_eq!(*events.borrow(), ["change:fourth:Some(4)"]);
+        let buffer = server.buffers.get(&uri.parse().unwrap()).unwrap();
+        assert_eq!(buffer.contents().to_string(), "fourth");
+        assert_eq!(buffer.version(), Some(4));
+        receive_log(&client, lsp::MessageType::INFO);
+        let error = receive_log(&client, lsp::MessageType::ERROR);
+        assert!(error.contains("invalid range"), "{error}");
+        receive_show_message(&client, lsp::MessageType::ERROR);
+        receive_log(&client, lsp::MessageType::INFO);
+        receive_response(&client, 99);
+    }
+
+    #[test]
+    fn queued_changes_flush_when_a_non_change_notification_arrives() {
+        let (mut server, client) = memory_server();
+        let events = record_changes(&mut server);
+        let uri = "file:///C:/test.reds";
+        queue_change(&client, uri, 2, json!([{ "text": "first" }]));
+        queue_change(&client, uri, 3, json!([{ "text": "second" }]));
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidChangeConfiguration::METHOD.into(),
+                json!({"settings": {}}),
+            )))
+            .unwrap();
+        queue_change(&client, uri, 4, json!([{ "text": "third" }]));
+        queue_shutdown(&client);
+
+        server.run().unwrap();
+
+        // Any queued notification is a barrier: the first two changes coalesce,
+        // and the third rebuilds separately.
+        assert_eq!(
+            *events.borrow(),
+            ["change:second:Some(3)", "files:0", "change:third:Some(4)"]
+        );
     }
 
     #[test]
@@ -2495,6 +2800,128 @@ mod tests {
                 .to_string()
                 .contains("before shutdown")
         );
+        assert!(!server.shutdown);
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn shutdown_then_exit_returns_cleanly() {
+        let (mut server, client) = memory_server();
+        send_request(&client, 7, lsp::request::Shutdown::METHOD, Value::Null);
+        send_exit(&client);
+        server.run().unwrap();
+        assert_eq!(
+            receive_response(&client, 7).response_result.unwrap(),
+            Value::Null
+        );
+        assert!(server.shutdown);
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn dynamic_watcher_registration_tracks_workspace_folders() {
+        let (mut server, client) = memory_server();
+        server.watch_files = true;
+        server.server = Box::new(StubServer {
+            watch_roots: vec![PathBuf::from("C:/workspace")],
+            ..Default::default()
+        });
+
+        server
+            .handle(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::Initialized::METHOD.into(),
+                Value::Null,
+            )))
+            .unwrap();
+        let register = receive_request(&client);
+        assert_eq!(register.id, RequestId::from("source-watchers".to_owned()));
+        assert_eq!(register.method, lsp::request::RegisterCapability::METHOD);
+        assert_eq!(register.params["registrations"][0]["id"], "source-watchers");
+        assert_eq!(
+            register.params["registrations"][0]["method"],
+            lsp::notification::DidChangeWatchedFiles::METHOD
+        );
+        assert_eq!(
+            register_watcher_globs(&register.params),
+            [
+                "C:/workspace/**/*.reds",
+                "C:/workspace/**/*.[sS][cC][rR][iI][pP][tT]",
+                "C:/workspace/.redscript",
+            ]
+        );
+
+        server
+            .handle(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidChangeWorkspaceFolders::METHOD.into(),
+                json!({"event": {
+                    "added": [{"uri": "file:///C:/other", "name": "other"}],
+                    "removed": [{"uri": "file:///C:/workspace", "name": "workspace"}],
+                }}),
+            )))
+            .unwrap();
+        let unregister = receive_request(&client);
+        assert_eq!(
+            unregister.id,
+            RequestId::from("remove-source-watchers".to_owned())
+        );
+        assert_eq!(
+            unregister.method,
+            lsp::request::UnregisterCapability::METHOD
+        );
+        assert_eq!(
+            unregister.params["unregisterations"][0]["id"],
+            "source-watchers"
+        );
+        assert_eq!(
+            unregister.params["unregisterations"][0]["method"],
+            lsp::notification::DidChangeWatchedFiles::METHOD
+        );
+        let register = receive_request(&client);
+        assert_eq!(register.id, RequestId::from("source-watchers".to_owned()));
+        assert_eq!(
+            register_watcher_globs(&register.params),
+            [
+                "C:/other/**/*.reds",
+                "C:/other/**/*.[sS][cC][rR][iI][pP][tT]",
+                "C:/other/.redscript",
+            ]
+        );
+
+        // Acknowledging the registration must not re-register unchanged roots.
+        server
+            .handle(Message::Response(Response {
+                id: RequestId::from("source-watchers".to_owned()),
+                response_result: Ok(Value::Null),
+            }))
+            .unwrap();
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn watcher_registration_is_skipped_without_dynamic_registration() {
+        let (mut server, client) = memory_server();
+        assert!(!server.watch_files);
+        server.server = Box::new(StubServer {
+            watch_roots: vec![PathBuf::from("C:/workspace")],
+            ..Default::default()
+        });
+        for (method, params) in [
+            (lsp::notification::Initialized::METHOD, Value::Null),
+            (
+                lsp::notification::DidChangeWorkspaceFolders::METHOD,
+                json!({"event": {
+                    "added": [{"uri": "file:///C:/other", "name": "other"}],
+                    "removed": [{"uri": "file:///C:/workspace", "name": "workspace"}],
+                }}),
+            ),
+        ] {
+            server
+                .handle(Message::Notification(lsp_server::Notification::new(
+                    method.into(),
+                    params,
+                )))
+                .unwrap();
+        }
         assert!(client.receiver.try_recv().is_err());
     }
 
