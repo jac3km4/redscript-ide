@@ -26,12 +26,16 @@ impl fmt::Display for ExprAtDisplay<'_, '_> {
                 writeln!(f, "{}", CallDisplay::new(call, inner.symbols()))?;
                 true
             } else if let ir::Expr::Field { field, .. } = expr {
-                writeln!(f, "### Field")?;
-                let (name, field) = inner.symbols().get_field(*field).ok_or(fmt::Error)?;
-                let typ = inner.expr_type().unwrap_or_else(|| field.type_().clone());
-                writeln!(f, "```{name}: {typ}```")?;
-                writeln!(f, "{}", DocDisplay::new(field.doc()))?;
-                true
+                match inner.symbols().get_field(*field) {
+                    Some((name, field)) => {
+                        writeln!(f, "### Field")?;
+                        let typ = inner.expr_type().unwrap_or_else(|| field.type_().clone());
+                        writeln!(f, "```{name}: {typ}```")?;
+                        writeln!(f, "{}", DocDisplay::new(field.doc()))?;
+                        true
+                    }
+                    None => false,
+                }
             } else if let Some(typ) = type_of(expr, func, inner.symbols()) {
                 writeln!(f, "### Type")?;
                 writeln!(f, "```\n{typ}\n```")?;
@@ -42,13 +46,14 @@ impl fmt::Display for ExprAtDisplay<'_, '_> {
         } else {
             false
         };
-        if let Some(typ) = inner.type_() {
+        if let Some(typ) = inner.type_()
+            && let Some(def) = inner.symbols().get_type(typ)
+        {
             if has_header {
                 writeln!(f, "---")?;
             }
             writeln!(f, "### Symbol")?;
             writeln!(f, "```\n{typ}\n```")?;
-            let def = inner.symbols().get_type(typ).ok_or(fmt::Error)?;
             writeln!(f, "{}", DocDisplay::new(def.doc()))?;
         };
         Ok(())
@@ -69,10 +74,20 @@ impl<'ctx, 'a> CallDisplay<'ctx, 'a> {
 
 impl fmt::Display for CallDisplay<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A closure whose type cannot be coalesced has no signature to render;
+        // omit the block entirely rather than emitting an empty fence.
+        if let ir::Call::Closure { closure_type, .. } = self.call
+            && closure_type.coalesced(self.symbols).is_err()
+        {
+            return Ok(());
+        }
         writeln!(f, "```")?;
         let doc = match self.call {
             &ir::Call::FreeFunction { function, .. } => {
-                let (name, func) = self.symbols.get_free_function(function).ok_or(fmt::Error)?;
+                let Some((name, func)) = self.symbols.get_free_function(function) else {
+                    writeln!(f, "```")?;
+                    return Ok(());
+                };
                 writeln!(f, "{name}{}", FunctionTypeDisplay::new(func.type_()))?;
                 func.doc()
             }
@@ -83,7 +98,10 @@ impl fmt::Display for CallDisplay<'_, '_> {
                 type_args,
                 ..
             } => {
-                let (name, func) = self.symbols.get_method(*method).ok_or(fmt::Error)?;
+                let Some((name, func)) = self.symbols.get_method(*method) else {
+                    writeln!(f, "```")?;
+                    return Ok(());
+                };
                 let specialized = coalesce_types(parent_type_args, self.symbols)
                     .zip(coalesce_types(type_args, self.symbols))
                     .and_then(|(args, call_args)| {
@@ -110,7 +128,10 @@ impl fmt::Display for CallDisplay<'_, '_> {
                 type_args,
                 ..
             } => {
-                let (name, func) = self.symbols.get_method(*method).ok_or(fmt::Error)?;
+                let Some((name, func)) = self.symbols.get_method(*method) else {
+                    writeln!(f, "```")?;
+                    return Ok(());
+                };
                 let specialized = receiver_type
                     .coalesced(self.symbols)
                     .ok()
@@ -136,8 +157,7 @@ impl fmt::Display for CallDisplay<'_, '_> {
                 if let Ok(ft) = closure_type.coalesced(self.symbols) {
                     writeln!(f, "{ft}")?;
                 }
-                // Continue so the closing fence emitted after the match is
-                // written; a closure has no documentation to append.
+                // A closure has no documentation to append.
                 &[]
             }
         };
@@ -470,6 +490,28 @@ mod tests {
         assert!(display.starts_with("```\n"), "{display:?}");
         assert!(display.trim_end().ends_with("```"), "{display:?}");
         assert_eq!(display.matches("```").count(), 2, "{display:?}");
+    }
+
+    #[test]
+    fn missing_type_symbols_render_nothing_instead_of_panicking() {
+        let sources = SourceMap::new();
+        sources.populate_boot_lib();
+        sources.push_back("display.reds", "func Test() -> Int32 { return 1; }");
+        let interner = TypeInterner::default();
+        let mut reporter = CompileErrorReporter::default();
+        let (_unit, symbols) = infer_from_sources(
+            &sources,
+            Symbols::with_default_types(),
+            &mut reporter,
+            &interner,
+        );
+        assert!(reporter.into_reported().is_empty());
+        // The interner may know a name that has no definition in this snapshot.
+        let unknown = interner.intern("NoSuchType");
+        assert!(symbols.get_type(unknown).is_none());
+        let at = ExprAt::new(None, None, Some(unknown), &symbols, &sources, None);
+        assert!(at.definition_span().is_none());
+        assert_eq!(at.display().to_string(), "");
     }
 }
 

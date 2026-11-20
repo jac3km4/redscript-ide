@@ -104,13 +104,15 @@ impl<'ctx, 'a> ExprAt<'ctx, 'a> {
         } else if let Some(expr) = self.expr {
             match expr {
                 ir::Expr::Call { call, .. } => match &**call {
-                    ir::Call::FreeFunction { function, .. } => self.symbols[*function].span(),
+                    ir::Call::FreeFunction { function, .. } => {
+                        self.symbols.get_free_function(*function)?.1.span()
+                    }
                     ir::Call::Instance { method, .. } | ir::Call::Static { method, .. } => {
-                        self.symbols[*method].span()
+                        self.symbols.get_method(*method)?.1.span()
                     }
                     _ => None,
                 },
-                ir::Expr::Field { field, .. } => self.symbols[*field].span(),
+                ir::Expr::Field { field, .. } => self.symbols.get_field(*field)?.1.span(),
                 ir::Expr::Local(local, _) | ir::Expr::Capture(local, _) => {
                     local_definition_span(self.func?, *local)
                 }
