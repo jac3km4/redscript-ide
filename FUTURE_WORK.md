@@ -21,17 +21,15 @@ Prioritized follow-ups from the LSP/code review. Keep fixes focused and add regr
 
 ## Architecture and quality
 
-- Move analysis off the protocol loop (worker thread, cancellation, stale-publication rejection).
-  Batched `textDocument/didChange` edits are now coalesced into a single rebuild, but the full
-  asynchronous design is blocked: the redscript compiler frontend uses `Rc`/`RefCell` throughout
-  (`Symbols`, `CompilationCache`, lowering), so the analysis state is `!Send` and cannot be moved
-  to another thread without an upstream change. `$/cancelRequest` therefore remains a no-op for
-  synchronous request handling.
 - Replace remaining brittle diagnostic-message assertions with structured checks where practical
   (protocol integration tests now assert on structured fields).
 
 ## Completed
 
+- Moved analysis off the protocol loop: workspace parsing/lowering/diagnostics now run on a
+  dedicated worker thread (enabled by the upstream `redscript` `sync`/`parallel` features), so the
+  protocol loop never blocks. `$/cancelRequest` cancels in-flight and queued requests cooperatively,
+  and diagnostics computed for a superseded document state are rejected before publication.
 - Unified diagnostic state into a single `DiagnosticTracker`; removed the fragmented
   per-category published sets and the associated `RefCell` fields.
 - Scoped fix-all code actions to their originating workspace or standalone document, and made fix

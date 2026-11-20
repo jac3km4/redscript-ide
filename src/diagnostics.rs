@@ -23,6 +23,7 @@ use crate::server::LspContext;
 /// publication lets the protocol thread reject batches produced for a state
 /// that has since been superseded, so stale results never mutate the tracker
 /// or reach the client.
+#[derive(Clone)]
 pub(crate) struct DiagnosticBatch {
     pub(crate) compiler: BTreeMap<PathBuf, Vec<lsp::Diagnostic>>,
     pub(crate) reads: BTreeMap<PathBuf, lsp::Diagnostic>,

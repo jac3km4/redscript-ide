@@ -1201,38 +1201,8 @@ impl LspServer<'_> {
         match message {
             Message::Request(request) => {
                 let started = Instant::now();
-                let log_summary = matches!(
-                    request.method.as_str(),
-                    lsp::request::HoverRequest::METHOD | lsp::request::Completion::METHOD
-                );
-                if log_summary {
-                    let params = &request.params;
-                    self.context.logger().info(format!(
-                        "Request method={} id={} uri={} line={:?} character={:?}",
-                        request.method,
-                        request.id,
-                        params
-                            .pointer("/textDocument/uri")
-                            .and_then(Value::as_str)
-                            .unwrap_or("<missing>"),
-                        params.pointer("/position/line").and_then(Value::as_u64),
-                        params
-                            .pointer("/position/character")
-                            .and_then(Value::as_u64),
-                    ));
-                    if request.method == lsp::request::Completion::METHOD {
-                        self.context.logger().info(format!(
-                            "Completion context id={} trigger_kind={:?} trigger_character={:?}",
-                            request.id,
-                            params
-                                .pointer("/context/triggerKind")
-                                .and_then(Value::as_u64),
-                            params
-                                .pointer("/context/triggerCharacter")
-                                .and_then(Value::as_str),
-                        ));
-                    }
-                }
+                let log_summary = is_summary_method(&request.method);
+                log_request_metadata(&self.context, &request);
                 let response_result = self.dispatch(&request.method, request.params);
                 match &response_result {
                     Ok(value) => {
@@ -2317,7 +2287,8 @@ fn capabilities() -> lsp::ServerCapabilities {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::collections::BTreeMap;
+    use std::sync::{Barrier, Mutex};
     use std::time::Duration;
 
     use super::*;
@@ -2331,6 +2302,7 @@ mod tests {
         events: Option<Arc<Mutex<Vec<String>>>>,
         watch_roots: Vec<PathBuf>,
         code_actions: Vec<lsp::CodeAction>,
+        startup_batch: Option<DiagnosticBatch>,
     }
 
     impl LanguageServer for StubServer {
@@ -2380,6 +2352,14 @@ mod tests {
                 events.lock().unwrap().push("save".into());
             }
             Ok(None)
+        }
+
+        fn startup_diagnostics(
+            &mut self,
+            _ctx: &LspContext,
+            _should_abort: &(dyn Fn() -> bool + Sync),
+        ) -> anyhow::Result<Option<DiagnosticBatch>> {
+            Ok(self.startup_batch.clone())
         }
 
         fn change_workspace_folders(
@@ -4142,5 +4122,300 @@ mod tests {
         let uri = lsp::Uri::from_str("file:///some/path/r6").unwrap();
         let path = path_from_uri(&uri).unwrap();
         assert_eq!(path, PathBuf::from("/some/path/r6"));
+    }
+
+    /// A stub whose `hover` and `check` block until released, so tests can drive
+    /// the protocol loop while the worker is busy.
+    struct BlockingStubServer {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        events: Arc<Mutex<Vec<String>>>,
+        check_batch: Option<DiagnosticBatch>,
+    }
+
+    impl LanguageServer for BlockingStubServer {
+        fn watch_roots(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+
+        fn document_changed(
+            &mut self,
+            _path: PathBuf,
+            _buffer: Option<&Buffer>,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("change".into());
+            Ok(())
+        }
+
+        fn files_changed(&mut self, _paths: Vec<PathBuf>, _ctx: &LspContext) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn check(
+            &mut self,
+            _path: PathBuf,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<Option<DiagnosticBatch>> {
+            self.events.lock().unwrap().push("check:start".into());
+            self.entered.wait();
+            self.release.wait();
+            self.events.lock().unwrap().push("check:end".into());
+            Ok(self.check_batch.take())
+        }
+
+        fn change_workspace_folders(
+            &mut self,
+            _added: Vec<PathBuf>,
+            _removed: Vec<PathBuf>,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn hover(
+            &self,
+            _doc: CodeLocation<'_>,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<Option<lsp::Hover>> {
+            self.events.lock().unwrap().push("hover:start".into());
+            self.entered.wait();
+            self.release.wait();
+            self.events.lock().unwrap().push("hover:end".into());
+            Ok(None)
+        }
+
+        fn completion(
+            &self,
+            _doc: CodeLocation<'_>,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<Arc<lsp::CompletionResponse>> {
+            Ok(Arc::new(lsp::CompletionResponse::Array(Vec::new())))
+        }
+
+        fn goto_definition(
+            &self,
+            _doc: CodeLocation<'_>,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<lsp::GotoDefinitionResponse> {
+            Ok(lsp::GotoDefinitionResponse::Array(Vec::new()))
+        }
+
+        fn document_symbols(
+            &self,
+            _doc: Document<'_>,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<lsp::DocumentSymbolResponse> {
+            Ok(lsp::DocumentSymbolResponse::Nested(Vec::new()))
+        }
+
+        fn workspace_symbol(
+            &self,
+            _query: &str,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<lsp::WorkspaceSymbolResponse> {
+            Ok(lsp::WorkspaceSymbolResponse::Nested(Vec::new()))
+        }
+
+        fn format(
+            &self,
+            _doc: Document<'_>,
+            _tab_size: u16,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<Vec<lsp::TextEdit>> {
+            Ok(Vec::new())
+        }
+
+        fn code_action(
+            &self,
+            _path: PathBuf,
+            _span: Range<u32>,
+            _context: lsp::CodeActionContext,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<Vec<lsp::CodeActionOrCommand>> {
+            Ok(Vec::new())
+        }
+
+        fn code_action_resolve(
+            &self,
+            _action: lsp::CodeAction,
+            _ctx: &LspContext,
+        ) -> anyhow::Result<lsp::CodeAction> {
+            bail!("no code actions")
+        }
+    }
+
+    fn blocking_server(
+        server: &mut LspServer<'static>,
+        check_batch: Option<DiagnosticBatch>,
+    ) -> (Arc<Barrier>, Arc<Barrier>, Arc<Mutex<Vec<String>>>) {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        server.server = Box::new(BlockingStubServer {
+            entered: entered.clone(),
+            release: release.clone(),
+            events: events.clone(),
+            check_batch,
+        });
+        (entered, release, events)
+    }
+
+    fn publish_notifications(
+        receiver: &crossbeam_channel::Receiver<Message>,
+    ) -> Vec<lsp::PublishDiagnosticsParams> {
+        receiver
+            .try_iter()
+            .filter_map(|message| {
+                let Message::Notification(notification) = message else {
+                    return None;
+                };
+                (notification.method == "textDocument/publishDiagnostics")
+                    .then(|| serde_json::from_value(notification.params).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn protocol_loop_cancels_in_flight_requests_without_blocking() {
+        let (mut server, client) = memory_server();
+        let (entered, release, events) = blocking_server(&mut server, None);
+
+        let uri = "file:///C:/test.reds";
+        send_request(
+            &client,
+            1,
+            lsp::request::HoverRequest::METHOD,
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 0, "character": 3 } }),
+        );
+        let handle = std::thread::spawn(move || server.run());
+
+        // The worker is now blocked inside `hover`; the protocol thread must
+        // still answer a cancellation without waiting for it.
+        entered.wait();
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::Cancel::METHOD.into(),
+                json!({ "id": 1 }),
+            )))
+            .unwrap();
+        let response = receive_response(&client, 1);
+        assert_eq!(
+            response.response_result.unwrap_err().code,
+            ErrorCode::RequestCanceled as i32
+        );
+
+        // Let the worker finish; its late result must be dropped, not sent twice.
+        release.wait();
+        queue_shutdown(&client);
+        handle.join().unwrap().unwrap();
+        receive_response(&client, 99);
+        assert_eq!(*events.lock().unwrap(), ["hover:start", "hover:end"]);
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn stale_diagnostic_publication_is_rejected() {
+        let (mut server, client) = memory_server();
+        let path = PathBuf::from("C:/test.reds");
+        let batch = DiagnosticBatch {
+            compiler: BTreeMap::from([(
+                path.clone(),
+                vec![lsp::Diagnostic {
+                    range: lsp::Range::default(),
+                    message: "stale".into(),
+                    ..Default::default()
+                }],
+            )]),
+            reads: BTreeMap::new(),
+            configs: BTreeMap::new(),
+            versions: HashMap::new(),
+        };
+        let (entered, release, _events) = blocking_server(&mut server, Some(batch));
+
+        let uri = "file:///C:/test.reds";
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::DidSaveTextDocument::METHOD.into(),
+                json!({ "textDocument": { "uri": uri } }),
+            )))
+            .unwrap();
+        let handle = std::thread::spawn(move || server.run());
+
+        // The check is in flight; supersede it with an edit before it publishes.
+        entered.wait();
+        queue_change(&client, uri, 2, json!([{ "text": "new" }]));
+        // The protocol thread handles messages in order, so once it logs this
+        // unknown cancellation the edit above has already advanced the state.
+        client
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                lsp::notification::Cancel::METHOD.into(),
+                json!({ "id": 999 }),
+            )))
+            .unwrap();
+        loop {
+            let log = receive_log(&client, lsp::MessageType::INFO);
+            if log.contains("Cancellation received id=") {
+                break;
+            }
+        }
+        release.wait();
+        queue_shutdown(&client);
+        handle.join().unwrap().unwrap();
+        receive_response(&client, 99);
+
+        // The batch computed for the superseded revision never reached the client.
+        assert!(publish_notifications(&client.receiver).is_empty());
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn startup_diagnostics_are_computed_off_the_protocol_loop() {
+        let (mut server, client) = memory_server();
+        server.startup_pending = true;
+        let path = PathBuf::from("C:/test.reds");
+        server.server = Box::new(StubServer {
+            startup_batch: Some(DiagnosticBatch {
+                compiler: BTreeMap::from([(
+                    path.clone(),
+                    vec![lsp::Diagnostic {
+                        range: lsp::Range::default(),
+                        message: "startup".into(),
+                        ..Default::default()
+                    }],
+                )]),
+                reads: BTreeMap::new(),
+                configs: BTreeMap::new(),
+                versions: HashMap::from([(path.clone(), 1)]),
+            }),
+            ..Default::default()
+        });
+
+        // Shutdown is queued before the loop starts, so the startup batch is
+        // drained and published while handling the shutdown barrier.
+        queue_shutdown(&client);
+        server.run().unwrap();
+
+        let messages: Vec<Message> = client.receiver.try_iter().collect();
+        let published: Vec<lsp::PublishDiagnosticsParams> = messages
+            .iter()
+            .filter_map(|message| {
+                let Message::Notification(notification) = message else {
+                    return None;
+                };
+                (notification.method == "textDocument/publishDiagnostics")
+                    .then(|| serde_json::from_value(notification.params.clone()).unwrap())
+            })
+            .collect();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].uri, uri_from_path(&path).unwrap());
+        assert_eq!(published[0].version, Some(1));
+        assert_eq!(published[0].diagnostics[0].message, "startup");
+        assert!(messages.iter().any(
+            |message| matches!(message, Message::Response(response) if response.id == RequestId::from(99))
+        ));
     }
 }
