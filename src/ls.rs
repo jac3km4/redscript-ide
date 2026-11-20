@@ -1395,7 +1395,14 @@ impl LanguageServer for RedscriptLanguageServer {
         should_abort: &(dyn Fn() -> bool + Sync),
     ) -> anyhow::Result<Option<DiagnosticBatch>> {
         if path.file_name().is_some_and(|name| name == ".redscript") {
-            self.files_changed(vec![path], ctx)?;
+            // Reload configuration before the abort check so a superseded check
+            // that still runs is cheap; the newer check reuses the reload.
+            dialect::clear_identity_cache();
+            self.reload_workspaces();
+            if should_abort() {
+                return Ok(None);
+            }
+            self.rebuild(ctx)?;
             return self.collect_diagnostic_batch(ctx, should_abort);
         }
 
@@ -1405,6 +1412,11 @@ impl LanguageServer for RedscriptLanguageServer {
             && path.is_file()
         {
             self.standalone_paths.insert(path);
+        }
+        // A newer save already superseded this check, and it will rebuild the
+        // snapshot it publishes; skip the filesystem scan here.
+        if should_abort() {
+            return Ok(None);
         }
         self.rebuild(ctx)?;
         self.collect_diagnostic_batch(ctx, should_abort)
@@ -1797,6 +1809,33 @@ mod tests {
                 .is_none()
         );
         assert_eq!(published(&receiver), 0);
+    }
+
+    #[test]
+    fn superseded_checks_skip_the_filesystem_scan() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let path = temp.path().join("saved.reds");
+        fs::write(&path, "public class Saved {}").unwrap();
+        let generation = server.generation;
+
+        assert!(
+            server
+                .check_cancellable(path.clone(), &ctx, &|| true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            server.generation, generation,
+            "an aborted check must not rebuild the snapshot"
+        );
+
+        assert!(
+            server
+                .check_cancellable(path, &ctx, &|| false)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(server.generation, generation.wrapping_add(1));
     }
 
     #[test]
