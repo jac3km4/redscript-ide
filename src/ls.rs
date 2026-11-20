@@ -169,8 +169,10 @@ impl RedscriptLanguageServer {
 
     fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
-
-        self.cached_fixes.borrow_mut().clear();
+        // Cached fixes are validated per file against the current source
+        // contents, so an unrelated edit must not discard fixes for untouched
+        // files. `publish_diagnostics_with_unit` refreshes each analyzed file's
+        // fixes on every save.
     }
 
     fn make_edit_snapshot(&self) -> anyhow::Result<CompilationCache> {
@@ -479,6 +481,23 @@ impl RedscriptLanguageServer {
         }
     }
 
+    /// Returns the workspace folder key (the key of `self.workspaces`) that owns
+    /// `path`, or `None` when the path is not part of any workspace.
+    fn workspace_root_for(&self, path: &Path) -> Option<PathBuf> {
+        let path = dialect::identity(path);
+        self.workspaces
+            .iter()
+            .flat_map(|(owner, workspace)| workspace.roots.iter().map(move |root| (root, owner)))
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by(|(a, owner_a), (b, owner_b)| {
+                a.components()
+                    .count()
+                    .cmp(&b.components().count())
+                    .then_with(|| owner_b.cmp(owner_a))
+            })
+            .map(|(_, owner)| owner.clone())
+    }
+
     fn hover_at(
         &self,
         loc: CodeLocation<'_>,
@@ -763,6 +782,10 @@ impl RedscriptLanguageServer {
             return Ok(vec![]);
         }
         let path = dialect::identity(&path);
+        let scope = match self.workspace_root_for(&path) {
+            Some(ws_root) => FixScope::Workspace(ws_root),
+            None => FixScope::Standalone(path.clone()),
+        };
         let fixes = self.cached_fixes.borrow();
 
         let mut actions = Vec::new();
@@ -801,12 +824,19 @@ impl RedscriptLanguageServer {
                     continue;
                 }
                 fix_all_kinds.push(fix.kind);
+                let fix_all_title = match &scope {
+                    FixScope::Workspace(_) => {
+                        format!("{} - fix all in the workspace", fix.kind)
+                    }
+                    FixScope::Standalone(_) => format!("{} - fix all in this file", fix.kind),
+                };
                 let fix_all = lsp::CodeAction {
-                    title: format!("{} - fix all in the workspace", fix.kind),
+                    title: fix_all_title,
                     kind: Some(lsp::CodeActionKind::QUICKFIX),
                     data: Some(serde_json::to_value(FixRequest::FixAll(
                         fix.kind,
                         self.generation,
+                        scope.clone(),
                     ))?),
                     ..Default::default()
                 };
@@ -844,17 +874,29 @@ impl RedscriptLanguageServer {
             FixRequest::FixOne(fix) if self.valid_fix(&fix) => {
                 action.edit = Some(self.workspace_edit(vec![(fix.uri, vec![fix.edit])], ctx));
             }
-            FixRequest::FixAll(kind, generation) if generation == self.generation => {
+            FixRequest::FixAll(kind, _generation, scope) => {
                 let mut unique = HashSet::<(lsp::Uri, lsp::Range)>::new();
 
                 #[allow(clippy::mutable_key_type)]
                 let mut edits = std::collections::HashMap::<lsp::Uri, Vec<lsp::TextEdit>>::new();
-                for fix in self
-                    .cached_fixes
-                    .borrow()
-                    .values()
-                    .flat_map(|f| f.values())
-                    .flatten()
+                let fixes = self.cached_fixes.borrow();
+                let mut selected = Vec::new();
+                match &scope {
+                    FixScope::Standalone(target) => {
+                        if let Some(slots) = fixes.get(target) {
+                            selected.extend(slots.values().flatten());
+                        }
+                    }
+                    FixScope::Workspace(ws_root) => {
+                        for (path, slots) in fixes.iter() {
+                            if self.workspace_root_for(path).as_ref() == Some(ws_root) {
+                                selected.extend(slots.values().flatten());
+                            }
+                        }
+                    }
+                }
+                for fix in selected
+                    .into_iter()
                     .filter(|f| f.kind == kind && self.valid_fix(f))
                 {
                     if unique.insert((fix.uri.clone(), fix.edit.range)) {
@@ -864,6 +906,7 @@ impl RedscriptLanguageServer {
                             .push(fix.edit.clone());
                     }
                 }
+                drop(fixes);
 
                 action.edit = Some(self.workspace_edit(edits.into_iter().collect(), ctx));
             }
@@ -934,7 +977,7 @@ impl RedscriptLanguageServer {
         let Ok(path) = crate::server::path_from_uri(&fix.uri) else {
             return false;
         };
-        if Dialect::of(&path) != Some(Dialect::Community) || fix.generation != self.generation {
+        if Dialect::of(&path) != Some(Dialect::Community) {
             return false;
         }
         let path = dialect::identity(&path);
@@ -1076,9 +1119,8 @@ impl RedscriptLanguageServer {
             let slots = fixes.entry_ref(path).or_default();
             for diag in &diags {
                 if Dialect::of(path) == Some(Dialect::Community)
-                    && let Some(mut fix) = generate_fix(diag, file, unit, symbols, sources, ctx)
+                    && let Some(fix) = generate_fix(diag, file, unit, symbols, sources, ctx)
                 {
-                    fix.generation = self.generation;
                     let span = diag.span();
                     slots.entry((span.start, span.end)).or_default().push(fix);
                 }
@@ -1480,7 +1522,6 @@ fn generate_fix<'ctx>(
         uri: ctx.uri(file.path()).ok()?,
         edit: lsp::TextEdit::new(edit_range, edit.content.to_string()),
         expected_source: file.source().to_owned(),
-        generation: 0,
     })
 }
 
@@ -1602,7 +1643,6 @@ fn generate_ide_fix<'ctx>(
         uri: ctx.uri(diag_file.path()).ok()?,
         edit: lsp::TextEdit::new(edit_range, replacement),
         expected_source: source.to_owned(),
-        generation: 0,
     })
 }
 
@@ -2300,10 +2340,16 @@ impl FileResolution<'_> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum FixScope {
+    Workspace(PathBuf),
+    Standalone(PathBuf),
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 enum FixRequest {
     FixOne(Box<Fix>),
-    FixAll(FixKind, u64),
+    FixAll(FixKind, u64, FixScope),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2318,7 +2364,6 @@ struct Fix {
     uri: lsp::Uri,
     edit: lsp::TextEdit,
     expected_source: String,
-    generation: u64,
 }
 
 impl Fix {
@@ -4178,7 +4223,6 @@ mod tests {
             uri: ctx.uri(&path).unwrap(),
             edit: lsp::TextEdit::new(lsp::Range::default(), "public ".into()),
             expected_source: "class Native {}".into(),
-            generation: server.generation,
         };
         assert!(!server.valid_fix(&fix));
         let community = temp.path().join("test.reds");
@@ -4191,7 +4235,6 @@ mod tests {
         );
         fix.uri = ctx.uri(&community).unwrap();
         fix.expected_source = "public class Community {}".into();
-        fix.generation = server.generation;
         assert!(server.valid_fix(&fix));
         fix.expected_source.clear();
         assert!(!server.valid_fix(&fix));
@@ -4216,7 +4259,6 @@ mod tests {
             uri: ctx.uri(&path).unwrap(),
             edit: lsp::TextEdit::new(lsp::Range::default(), "public ".into()),
             expected_source: "class Native {}".into(),
-            generation: server.generation,
         };
         server
             .cached_fixes
@@ -4230,6 +4272,7 @@ mod tests {
                 serde_json::to_value(FixRequest::FixAll(
                     FixKind::MakeFieldPublic,
                     server.generation,
+                    FixScope::Workspace(temp.path().to_path_buf()),
                 ))
                 .unwrap(),
             ),
@@ -4249,7 +4292,6 @@ mod tests {
             uri: "file:///C:/scripts/test.reds".parse().unwrap(),
             edit: lsp::TextEdit::new(lsp::Range::default(), String::new()),
             expected_source: String::new(),
-            generation: 0,
         };
         let coded = |code: &str| lsp::Diagnostic {
             code: Some(lsp::NumberOrString::String(code.into())),
@@ -4610,8 +4652,11 @@ mod tests {
                         diagnostic_code: None,
                         uri: uri.clone(),
                         edit: lsp::TextEdit::new(lsp::Range::default(), format!("fix {start}")),
-                        expected_source: text.into(),
-                        generation: if start == 12 { 1 } else { 0 },
+                        expected_source: if start == 12 {
+                            "stale".into()
+                        } else {
+                            text.into()
+                        },
                     }],
                 )
             })
@@ -4761,14 +4806,23 @@ mod tests {
                     unchanged
                 );
 
-                server.generation += 1;
+                let is_fix_all = matches!(
+                    serde_json::from_value::<FixRequest>(action.data.clone().unwrap()),
+                    Ok(FixRequest::FixAll(..))
+                );
+                if is_fix_all {
+                    continue;
+                }
+
+                // Simulate the target file changing so the cached fix is stale.
+                server.overlays.get_mut(&path).unwrap().text = "changed".into();
                 action.edit = Some(lsp::WorkspaceEdit::default());
                 let mut stale = server.code_action_resolve(action.clone(), &ctx).unwrap();
                 assert!(stale.edit.is_none());
                 assert_eq!(stale.disabled.take().is_some(), disabled_supported);
                 action.edit = None;
                 assert_eq!(stale, action);
-                server.generation -= 1;
+                server.overlays.get_mut(&path).unwrap().text = "public class Test {}".into();
             }
         }
     }
@@ -4802,7 +4856,6 @@ mod tests {
                         diagnostic_code: None,
                         uri: uri.clone(),
                         expected_source: String::new(),
-                        generation: 0,
                         edit: lsp::TextEdit::new(
                             lsp::Range::new(
                                 lsp::Position::new(0, start),
@@ -4818,6 +4871,7 @@ mod tests {
             .cached_fixes
             .borrow_mut()
             .insert(PathBuf::from("test.reds"), fixes);
+        let scope = FixScope::Standalone(PathBuf::from("test.reds"));
 
         for document_changes in [false, true] {
             ctx.set_code_action_capabilities(
@@ -4829,7 +4883,12 @@ mod tests {
             for kind in [kinds[0], kinds[0], kinds[1]] {
                 let action = lsp::CodeAction {
                     data: Some(
-                        serde_json::to_value(FixRequest::FixAll(kind, server.generation)).unwrap(),
+                        serde_json::to_value(FixRequest::FixAll(
+                            kind,
+                            server.generation,
+                            scope.clone(),
+                        ))
+                        .unwrap(),
                     ),
                     ..Default::default()
                 };
@@ -4860,6 +4919,161 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn make_public_fix(uri: lsp::Uri, expected_source: &str) -> Fix {
+        Fix {
+            kind: FixKind::MakeFieldPublic,
+            target_name: None,
+            diagnostic_range: None,
+            diagnostic_code: None,
+            uri,
+            edit: lsp::TextEdit::new(lsp::Range::default(), "public ".into()),
+            expected_source: expected_source.into(),
+        }
+    }
+
+    fn insert_cached_fix(
+        server: &mut RedscriptLanguageServer,
+        path: PathBuf,
+        uri: lsp::Uri,
+        text: &str,
+    ) {
+        server.overlays.insert(
+            path.clone(),
+            Overlay {
+                text: text.into(),
+                version: 1,
+            },
+        );
+        server.cached_fixes.borrow_mut().insert(
+            path,
+            BTreeMap::from([((0, 1), vec![make_public_fix(uri, text)])]),
+        );
+    }
+
+    #[test]
+    fn fix_all_standalone_scope_excludes_other_files() {
+        let mut server = server();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let ctx = LspContext::new(sender);
+        let text = "public class Test {}";
+        let uri_a: lsp::Uri = "file:///C:/scripts/a.reds".parse().unwrap();
+        let uri_b: lsp::Uri = "file:///C:/scripts/b.reds".parse().unwrap();
+        let path_a = dialect::identity(&crate::server::path_from_uri(&uri_a).unwrap());
+        let path_b = dialect::identity(&crate::server::path_from_uri(&uri_b).unwrap());
+        insert_cached_fix(&mut server, path_a.clone(), uri_a.clone(), text);
+        insert_cached_fix(&mut server, path_b, uri_b.clone(), text);
+
+        let action = lsp::CodeAction {
+            data: Some(
+                serde_json::to_value(FixRequest::FixAll(
+                    FixKind::MakeFieldPublic,
+                    0,
+                    FixScope::Standalone(path_a),
+                ))
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let resolved = server.code_action_resolve(action, &ctx).unwrap();
+        #[allow(clippy::mutable_key_type)]
+        let changes = resolved.edit.unwrap().changes.unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(changes.contains_key(&uri_a));
+        assert!(!changes.contains_key(&uri_b));
+    }
+
+    #[test]
+    fn fix_all_workspace_scope_excludes_other_workspaces() {
+        let mut server = server();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let ctx = LspContext::new(sender);
+        let root_a = tempdir();
+        let root_b = tempdir();
+        for root in [root_a.path(), root_b.path()] {
+            server.workspaces.insert(
+                root.to_path_buf(),
+                WorkspaceDir {
+                    roots: vec![root.to_path_buf()],
+                    format_settings: FormatSettings::default(),
+                    format_indent: None,
+                },
+            );
+        }
+        let text = "public class Test {}";
+        let path_a = dialect::identity(&root_a.path().join("a.reds"));
+        let path_b = dialect::identity(&root_b.path().join("b.reds"));
+        let uri_a = ctx.uri(&path_a).unwrap();
+        let uri_b = ctx.uri(&path_b).unwrap();
+        insert_cached_fix(&mut server, path_a.clone(), uri_a.clone(), text);
+        insert_cached_fix(&mut server, path_b.clone(), uri_b.clone(), text);
+        assert_eq!(
+            server.workspace_root_for(&path_a),
+            Some(root_a.path().to_path_buf())
+        );
+        assert_eq!(
+            server.workspace_root_for(&path_b),
+            Some(root_b.path().to_path_buf())
+        );
+
+        let action = lsp::CodeAction {
+            data: Some(
+                serde_json::to_value(FixRequest::FixAll(
+                    FixKind::MakeFieldPublic,
+                    0,
+                    FixScope::Workspace(root_a.path().to_path_buf()),
+                ))
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let resolved = server.code_action_resolve(action, &ctx).unwrap();
+        #[allow(clippy::mutable_key_type)]
+        let changes = resolved.edit.unwrap().changes.unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(changes.contains_key(&uri_a));
+        assert!(!changes.contains_key(&uri_b));
+    }
+
+    #[test]
+    fn unrelated_edits_preserve_valid_fixes() {
+        let mut server = server();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let ctx = LspContext::new(sender);
+        let text = "public class Test {}";
+        let uri_a: lsp::Uri = "file:///C:/scripts/a.reds".parse().unwrap();
+        let uri_b: lsp::Uri = "file:///C:/scripts/b.reds".parse().unwrap();
+        let path_a = dialect::identity(&crate::server::path_from_uri(&uri_a).unwrap());
+        let path_b = dialect::identity(&crate::server::path_from_uri(&uri_b).unwrap());
+        insert_cached_fix(&mut server, path_a.clone(), uri_a.clone(), text);
+        let fix = make_public_fix(uri_a, text);
+        assert!(server.valid_fix(&fix));
+
+        // Simulate editing another file and rebuilding; the cached fix for the
+        // untouched file A must survive because validity is content-based.
+        server.overlays.insert(
+            path_b,
+            Overlay {
+                text: "public class Other {}".into(),
+                version: 1,
+            },
+        );
+        server.invalidate();
+
+        assert!(server.valid_fix(&fix));
+        assert!(server.cached_fixes.borrow().contains_key(&path_a));
+        let action = lsp::CodeAction {
+            data: Some(serde_json::to_value(FixRequest::FixOne(Box::new(fix))).unwrap()),
+            ..Default::default()
+        };
+        assert!(
+            server
+                .code_action_resolve(action, &ctx)
+                .unwrap()
+                .edit
+                .is_some()
+        );
     }
 
     #[test]
