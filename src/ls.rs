@@ -23,7 +23,8 @@ use crate::dialect::{self, Dialect};
 use crate::query::ExprAt;
 use crate::server::{CodeLocation, Document, LanguageServer, LspContext};
 use crate::workspace::{
-    FileResolution, Overlay, WorkspaceDir, collect_workspace_sources, record_source_read_error,
+    FileResolution, LoadedWorkspace, Overlay, WorkspaceDir, collect_workspace_sources,
+    record_source_read_error,
 };
 
 #[path = "document_symbols.rs"]
@@ -1005,22 +1006,21 @@ impl RedscriptLanguageServer {
     }
 
     fn reload_workspaces(&mut self) {
-        self.reload_workspaces_except(&HashSet::new());
+        self.reload_workspaces_with(&HashMap::new());
     }
 
-    /// Reloads workspace configuration for every loaded folder except those in
-    /// `skip`, which the caller has already loaded.
-    fn reload_workspaces_except(&mut self, skip: &HashSet<PathBuf>) {
+    /// Reloads workspace configuration for every loaded folder, reusing the
+    /// results in `preloaded` for folders the caller has already loaded.
+    fn reload_workspaces_with(&mut self, preloaded: &HashMap<PathBuf, LoadedWorkspace>) {
         dialect::clear_identity_cache();
         let mut workspaces = HashMap::with_capacity(self.workspaces.len());
         let mut config_diagnostics = BTreeMap::new();
         let mut config_warnings = BTreeSet::new();
         for (dir, previous) in &self.workspaces {
-            if skip.contains(dir) {
-                workspaces.insert(dir.clone(), previous.clone());
-                continue;
-            }
-            let loaded = WorkspaceDir::load(dir, Some(previous));
+            let loaded = match preloaded.get(dir) {
+                Some(loaded) => loaded.clone(),
+                None => WorkspaceDir::load(dir, Some(previous)),
+            };
             if let Some(diagnostic) = loaded.diagnostic {
                 config_diagnostics.insert(loaded.dotfile_path, diagnostic);
             }
@@ -1436,15 +1436,20 @@ impl LanguageServer for RedscriptLanguageServer {
         for folder in removed {
             self.workspaces.remove(&folder);
         }
-        // Load each added folder once; the reload below only refreshes the
-        // folders that were already present.
-        let added_set: HashSet<PathBuf> = added.iter().cloned().collect();
-        for dir in added {
-            let previous = self.workspaces.get(&dir);
-            let loaded = WorkspaceDir::load(&dir, previous);
-            self.workspaces.insert(dir, loaded.workspace);
+        // Load each added folder once; the reload below reuses these results and
+        // only re-reads folders that were already present.
+        let preloaded: HashMap<PathBuf, LoadedWorkspace> = added
+            .into_iter()
+            .map(|dir| {
+                let loaded = WorkspaceDir::load(&dir, self.workspaces.get(&dir));
+                (dir, loaded)
+            })
+            .collect();
+        for (dir, loaded) in &preloaded {
+            self.workspaces
+                .insert(dir.clone(), loaded.workspace.clone());
         }
-        self.reload_workspaces_except(&added_set);
+        self.reload_workspaces_with(&preloaded);
         self.rebuild(ctx)
     }
 
@@ -2942,6 +2947,36 @@ mod tests {
             .change_workspace_folders(vec![], vec![temp.path().to_owned()], &ctx)
             .unwrap();
         assert!(server.workspaces.is_empty());
+    }
+
+    #[test]
+    fn added_workspace_folder_reports_configuration_errors() {
+        let (_temp, mut server, ctx, receiver) = fixture();
+        let added = tempdir();
+        let dotfile = added.path().join(".redscript");
+        fs::write(&dotfile, "source_roots = 123\n").unwrap();
+        server
+            .change_workspace_folders(vec![added.path().to_owned()], vec![], &ctx)
+            .unwrap();
+        server.publish_all_diagnostics(&ctx).unwrap();
+        let dotfile_uri = ctx.uri(&dialect::identity(&dotfile)).unwrap();
+        let messages: Vec<_> = receiver.try_iter().collect();
+        assert!(messages.iter().any(|msg| {
+            matches!(msg, lsp_server::Message::Notification(notif)
+                if notif.method == "textDocument/publishDiagnostics"
+                    && serde_json::from_value::<lsp::PublishDiagnosticsParams>(notif.params.clone())
+                        .is_ok_and(|p| p.uri == dotfile_uri
+                            && p.diagnostics.len() == 1
+                            && p.diagnostics[0].code
+                                == Some(lsp::NumberOrString::String("INVALID_CONFIG".into()))))
+        }));
+        assert!(messages.iter().any(|msg| {
+            matches!(msg, lsp_server::Message::Notification(notif)
+                if notif.method == "window/showMessage"
+                    && serde_json::from_value::<lsp::ShowMessageParams>(notif.params.clone())
+                        .is_ok_and(|p| p.typ == lsp::MessageType::WARNING
+                            && p.message.contains("Invalid configuration")))
+        }));
     }
 
     #[test]

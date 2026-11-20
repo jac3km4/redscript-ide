@@ -24,6 +24,7 @@ pub(crate) struct WorkspaceDir {
     pub(crate) format_indent: Option<u16>,
 }
 
+#[derive(Clone)]
 pub(crate) struct LoadedWorkspace {
     pub(crate) workspace: WorkspaceDir,
     pub(crate) dotfile_path: PathBuf,
