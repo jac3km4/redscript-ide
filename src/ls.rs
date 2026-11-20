@@ -1551,8 +1551,9 @@ impl LanguageServer for RedscriptLanguageServer {
 
 #[cfg(test)]
 mod tests {
-    use redscript_compiler_api::ir;
-    use redscript_compiler_api::{CompileErrorReporter, LowerError, ScriptBundle, SourceMapExt};
+    use redscript_compiler_api::{
+        CompileErrorReporter, LowerError, ScriptBundle, SourceMapExt, ir,
+    };
 
     use super::*;
     use crate::code_actions::FixKind;

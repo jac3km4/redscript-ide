@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use ignore::IncrementalIgnore;
-
 use redscript_compiler_api::{
     CompileErrorReporter, Diagnostic, DiagnosticLevel, LoweredCompilationUnit, Symbols,
     TypeInterner, ast, parse_file,
