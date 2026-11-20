@@ -409,12 +409,27 @@ impl RedscriptLanguageServer {
             }
         }
         self.cached_fixes = collected.fixes;
+        self.prune_cached_fixes();
         let versions = self
             .overlays
             .iter()
             .map(|(path, overlay)| (path.clone(), overlay.version))
             .collect();
         Ok(Some(self.diagnostics.snapshot(collected.by_file, versions)))
+    }
+
+    /// Drops cached quick fixes for files that are no longer part of any
+    /// analyzed snapshot, so removing a workspace folder or deleting a file
+    /// does not leave its fixes addressable.
+    fn prune_cached_fixes(&mut self) {
+        let workspace = self.compilation_cache.borrow_file_ids();
+        let standalone = &self.standalone;
+        let overlays = &self.overlays;
+        self.cached_fixes.retain(|path, _| {
+            workspace.contains_key(path)
+                || standalone.contains_key(path)
+                || overlays.contains_key(path)
+        });
     }
 
     /// The most specific workspace root containing `path`, together with the
@@ -3247,6 +3262,26 @@ mod tests {
         assert!(server.cached_fixes.contains_key(&path));
         assert_eq!(server.apply_document(&path, None, &ctx), Some(true));
         assert!(!server.cached_fixes.contains_key(&path));
+    }
+
+    #[test]
+    fn rebuild_prunes_cached_fixes_for_removed_files() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let deleted = dialect::identity(&temp.path().join("deleted.reds"));
+        fs::write(&deleted, "public class Deleted {}").unwrap();
+        server.files_changed(vec![deleted.clone()], &ctx).unwrap();
+        assert!(
+            server
+                .compilation_cache
+                .borrow_file_ids()
+                .contains_key(&deleted)
+        );
+        server.cached_fixes.insert(deleted.clone(), BTreeMap::new());
+
+        fs::remove_file(&deleted).unwrap();
+        server.files_changed(vec![deleted.clone()], &ctx).unwrap();
+        server.collect_diagnostic_batch(&ctx, || false).unwrap();
+        assert!(!server.cached_fixes.contains_key(&deleted));
     }
 
     #[test]
