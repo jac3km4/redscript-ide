@@ -683,15 +683,17 @@ impl LspServer<'_> {
                     return Ok(false);
                 }
                 let path = path_from_uri(&uri)?;
-                self.context.logger().verbose(|| {
-                    format!("Document open uri={} version={}", uri.as_str(), doc.version,)
-                });
                 self.buffers.open(uri.clone(), doc.text, doc.version);
                 self.state_rev += 1;
                 self.latest_state_rev
                     .store(self.state_rev, Ordering::Release);
                 let documents = vec![(path, self.buffers.get(&uri).cloned())];
                 cmd_tx.send(WorkerCmd::DocumentsChanged { documents }).ok();
+                // Emit after the state is committed: clients and tests use this
+                // log as the point where the open has superseded pending work.
+                self.context.logger().verbose(|| {
+                    format!("Document open uri={} version={}", uri.as_str(), doc.version,)
+                });
             }
             lsp::notification::DidCloseTextDocument::METHOD => {
                 let lsp::DidCloseTextDocumentParams { text_document: doc } =
@@ -706,13 +708,7 @@ impl LspServer<'_> {
                     return Ok(false);
                 }
                 let path = path_from_uri(&doc.uri)?;
-                self.context.logger().verbose(|| {
-                    format!(
-                        "Document close uri={} version={:?}",
-                        doc.uri.as_str(),
-                        self.buffers.get(&doc.uri).and_then(Buffer::version),
-                    )
-                });
+                let version = self.buffers.get(&doc.uri).and_then(Buffer::version);
                 self.buffers.remove(&doc.uri);
                 self.state_rev += 1;
                 self.latest_state_rev
@@ -722,6 +718,15 @@ impl LspServer<'_> {
                         documents: vec![(path, None)],
                     })
                     .ok();
+                // Emit after the state is committed so the log marks the point
+                // where the close has superseded pending work.
+                self.context.logger().verbose(|| {
+                    format!(
+                        "Document close uri={} version={:?}",
+                        doc.uri.as_str(),
+                        version,
+                    )
+                });
             }
             lsp::notification::DidSaveTextDocument::METHOD => {
                 let lsp::DidSaveTextDocumentParams {
@@ -736,16 +741,10 @@ impl LspServer<'_> {
                     });
                     return Ok(false);
                 }
-                self.context.logger().verbose(|| {
-                    format!(
-                        "Document save uri={} version={:?}",
-                        doc.uri.as_str(),
-                        self.buffers.get(&doc.uri).and_then(Buffer::version),
-                    )
-                });
                 // Resolve the path before advancing revisions so a malformed
                 // URI cannot request a check that is never queued.
                 let path = path_from_uri(&doc.uri)?;
+                let version = self.buffers.get(&doc.uri).and_then(Buffer::version);
                 self.diag_rev += 1;
                 self.latest_diag_rev.store(self.diag_rev, Ordering::Release);
                 self.startup_edited = true;
@@ -757,6 +756,15 @@ impl LspServer<'_> {
                         path,
                     })
                     .ok();
+                // Emit after the revision is committed so the log marks the
+                // point where the save has superseded pending work.
+                self.context.logger().verbose(|| {
+                    format!(
+                        "Document save uri={} version={:?}",
+                        doc.uri.as_str(),
+                        version,
+                    )
+                });
             }
             lsp::notification::DidChangeWatchedFiles::METHOD => {
                 let params: lsp::DidChangeWatchedFilesParams =
