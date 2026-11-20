@@ -104,7 +104,8 @@ impl RedscriptLanguageServer {
         let mut config_diagnostics = BTreeMap::new();
         let mut config_warnings = BTreeSet::new();
         for dir in workspace_folders {
-            let dir = dir.into();
+            let dir: PathBuf = dir.into();
+            let dir = dialect::identity(&dir);
             let loaded = WorkspaceDir::load(&dir, None);
             if let Some(diagnostic) = loaded.diagnostic {
                 config_diagnostics.insert(loaded.dotfile_path, diagnostic);
@@ -415,10 +416,10 @@ impl RedscriptLanguageServer {
         Ok(Some(self.diagnostics.snapshot(collected.by_file, versions)))
     }
 
-    fn resolve_file(&self, path: &Path) -> FileResolution<'_> {
-        let path = dialect::identity(path);
-        if let Some((root, _, workspace)) = self
-            .workspaces
+    /// The most specific workspace root containing `path`, together with the
+    /// workspace folder that owns it and the loaded workspace.
+    fn find_workspace_root(&self, path: &Path) -> Option<(&PathBuf, &PathBuf, &WorkspaceDir)> {
+        self.workspaces
             .iter()
             .flat_map(|(owner, workspace)| {
                 workspace
@@ -433,7 +434,11 @@ impl RedscriptLanguageServer {
                     .cmp(&b.components().count())
                     .then_with(|| owner_b.cmp(owner_a))
             })
-        {
+    }
+
+    fn resolve_file(&self, path: &Path) -> FileResolution<'_> {
+        let path = dialect::identity(path);
+        if let Some((root, _, workspace)) = self.find_workspace_root(&path) {
             // An open buffer that the workspace walk would skip is treated as
             // if it had never been discovered, so it cannot be injected into
             // workspace compilation.
@@ -451,17 +456,7 @@ impl RedscriptLanguageServer {
     /// `path`, or `None` when the path is not part of any workspace.
     fn workspace_root_for(&self, path: &Path) -> Option<PathBuf> {
         let path = dialect::identity(path);
-        let (root, owner) = self
-            .workspaces
-            .iter()
-            .flat_map(|(owner, workspace)| workspace.roots.iter().map(move |root| (root, owner)))
-            .filter(|(root, _)| path.starts_with(root))
-            .max_by(|(a, owner_a), (b, owner_b)| {
-                a.components()
-                    .count()
-                    .cmp(&b.components().count())
-                    .then_with(|| owner_b.cmp(owner_a))
-            })?;
+        let (root, owner, _) = self.find_workspace_root(&path)?;
         (!dialect::is_ignored(&path, root)).then(|| owner.clone())
     }
 
@@ -1010,11 +1005,21 @@ impl RedscriptLanguageServer {
     }
 
     fn reload_workspaces(&mut self) {
+        self.reload_workspaces_except(&HashSet::new());
+    }
+
+    /// Reloads workspace configuration for every loaded folder except those in
+    /// `skip`, which the caller has already loaded.
+    fn reload_workspaces_except(&mut self, skip: &HashSet<PathBuf>) {
         dialect::clear_identity_cache();
         let mut workspaces = HashMap::with_capacity(self.workspaces.len());
         let mut config_diagnostics = BTreeMap::new();
         let mut config_warnings = BTreeSet::new();
         for (dir, previous) in &self.workspaces {
+            if skip.contains(dir) {
+                workspaces.insert(dir.clone(), previous.clone());
+                continue;
+            }
             let loaded = WorkspaceDir::load(dir, Some(previous));
             if let Some(diagnostic) = loaded.diagnostic {
                 config_diagnostics.insert(loaded.dotfile_path, diagnostic);
@@ -1307,6 +1312,11 @@ impl RedscriptLanguageServer {
             self.overlays.remove(&path);
             self.standalone.remove(&path);
             self.standalone_paths.remove(&path);
+            // A closed standalone file is no longer analyzed, so its cached
+            // quick fixes would otherwise linger forever.
+            if self.resolve_file(&path).as_workspace().is_none() {
+                self.cached_fixes.remove(&path);
+            }
         }
         Some(buffer.is_none())
     }
@@ -1415,15 +1425,26 @@ impl LanguageServer for RedscriptLanguageServer {
         ctx: &LspContext,
     ) -> anyhow::Result<()> {
         dialect::clear_identity_cache();
+        let removed: Vec<PathBuf> = removed
+            .into_iter()
+            .map(|folder| dialect::identity(&folder))
+            .collect();
+        let added: Vec<PathBuf> = added
+            .into_iter()
+            .map(|folder| dialect::identity(&folder))
+            .collect();
         for folder in removed {
             self.workspaces.remove(&folder);
         }
+        // Load each added folder once; the reload below only refreshes the
+        // folders that were already present.
+        let added_set: HashSet<PathBuf> = added.iter().cloned().collect();
         for dir in added {
             let previous = self.workspaces.get(&dir);
             let loaded = WorkspaceDir::load(&dir, previous);
             self.workspaces.insert(dir, loaded.workspace);
         }
-        self.reload_workspaces();
+        self.reload_workspaces_except(&added_set);
         self.rebuild(ctx)
     }
 
@@ -3137,6 +3158,20 @@ mod tests {
                 .expect("value completion");
             assert_eq!(value.detail.as_deref(), Some(expected), "{receiver}");
         }
+    }
+
+    #[test]
+    fn closing_standalone_file_drops_cached_fixes() {
+        let (_temp, mut server, ctx, _receiver) = fixture();
+        let external = tempdir();
+        let path = dialect::identity(&external.path().join("solo.reds"));
+        let text = "public class Test { let value: Int32; }";
+        let uri = ctx.uri(&path).unwrap();
+        insert_cached_fix(&mut server, path.clone(), uri, text);
+        assert!(server.resolve_file(&path).as_workspace().is_none());
+        assert!(server.cached_fixes.contains_key(&path));
+        assert_eq!(server.apply_document(&path, None, &ctx), Some(true));
+        assert!(!server.cached_fixes.contains_key(&path));
     }
 
     #[test]

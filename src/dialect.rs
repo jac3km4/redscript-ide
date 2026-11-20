@@ -29,9 +29,9 @@ impl Dialect {
 }
 
 // Memoized `raw path -> canonical identity` results, plus the compiled ignore
-// matchers used by [`is_ignored`]. The language server is single-threaded, so
-// these live in thread-local storage; each test thread therefore gets a fresh
-// cache.
+// matchers used by [`is_ignored`]. All analysis happens on one dedicated worker
+// thread (plus each protocol thread), so these live in thread-local storage;
+// each thread therefore gets a fresh cache.
 thread_local! {
     static IDENTITY_CACHE: RefCell<HashMap<PathBuf, PathBuf>> = RefCell::new(HashMap::new());
     static IGNORE_MATCHERS: RefCell<HashMap<PathBuf, Option<IncrementalIgnore>>> =
