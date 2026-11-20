@@ -1212,6 +1212,49 @@ impl RedscriptLanguageServer {
         )?;
         query_cache.query_at(id, loc.pos(), cb, ctx)
     }
+
+    /// Apply an overlay for a single document without triggering a rebuild.
+    ///
+    /// Returns `Some(reload)` for a supported dialect (`reload` is true when the
+    /// buffer was closed and disk contents must be restored), or `None` for a
+    /// path whose dialect is unsupported.
+    fn apply_document(
+        &mut self,
+        path: &Path,
+        buffer: Option<&crate::buffers::Buffer>,
+        ctx: &LspContext,
+    ) -> Option<bool> {
+        let path = dialect::identity(path);
+        if Dialect::of(&path).is_none() {
+            if buffer.is_some()
+                && let Some(ext) = path.extension().and_then(|ext| ext.to_str())
+                && ext.eq_ignore_ascii_case("reds")
+                && self.warned_extensions.insert(path.clone())
+            {
+                let message = format!(
+                    "File '{}' uses uppercase extension '.{ext}'; community REDscript requires lowercase '.reds', so this file will not be analyzed.",
+                    path.display(),
+                );
+                ctx.logger().warn(&message);
+                ctx.show_message(lsp::MessageType::WARNING, message);
+            }
+            return None;
+        }
+        if let Some(buffer) = buffer {
+            self.overlays.insert(
+                path,
+                Overlay {
+                    text: Arc::from(buffer.contents().to_string()),
+                    version: buffer.version().unwrap_or(0),
+                },
+            );
+        } else {
+            self.overlays.remove(&path);
+            self.standalone.remove(&path);
+            self.standalone_paths.remove(&path);
+        }
+        Some(buffer.is_none())
+    }
 }
 
 impl LanguageServer for RedscriptLanguageServer {
@@ -1237,38 +1280,33 @@ impl LanguageServer for RedscriptLanguageServer {
         buffer: Option<&crate::buffers::Buffer>,
         ctx: &LspContext,
     ) -> anyhow::Result<()> {
-        let path = dialect::identity(&path);
-        if Dialect::of(&path).is_none() {
-            if buffer.is_some()
-                && let Some(ext) = path.extension().and_then(|ext| ext.to_str())
-                && ext.eq_ignore_ascii_case("reds")
-                && self.warned_extensions.insert(path.clone())
-            {
-                let message = format!(
-                    "File '{}' uses uppercase extension '.{ext}'; community REDscript requires lowercase '.reds', so this file will not be analyzed.",
-                    path.display(),
-                );
-                ctx.logger().warn(&message);
-                ctx.show_message(lsp::MessageType::WARNING, message);
-            }
-            return Ok(());
-        }
-        if let Some(buffer) = buffer {
-            self.overlays.insert(
-                path.clone(),
-                Overlay {
-                    text: Arc::from(buffer.contents().to_string()),
-                    version: buffer.version().unwrap_or(0),
-                },
-            );
-        } else {
-            self.overlays.remove(&path);
-            self.standalone.remove(&path);
-            self.standalone_paths.remove(&path);
-        }
         // Closing must restore disk contents (or remove an unsaved file).
         // Open/change use known sources; filesystem notifications refresh discovery.
-        self.rebuild_with_reload(ctx, buffer.is_none())
+        if let Some(reload) = self.apply_document(&path, buffer, ctx) {
+            self.rebuild_with_reload(ctx, reload)?;
+        }
+        Ok(())
+    }
+
+    fn documents_changed(
+        &mut self,
+        documents: &[(PathBuf, Option<&crate::buffers::Buffer>)],
+        ctx: &LspContext,
+    ) -> anyhow::Result<()> {
+        // Apply every overlay first so a batch of edits sharing sources rebuilds
+        // the workspace exactly once instead of once per changed document.
+        let mut reload = false;
+        let mut applied = false;
+        for (path, buffer) in documents {
+            if let Some(document_reload) = self.apply_document(path, *buffer, ctx) {
+                applied = true;
+                reload |= document_reload;
+            }
+        }
+        if applied {
+            self.rebuild_with_reload(ctx, reload)?;
+        }
+        Ok(())
     }
 
     fn files_changed(&mut self, _paths: Vec<PathBuf>, ctx: &LspContext) -> anyhow::Result<()> {
@@ -1821,6 +1859,47 @@ mod tests {
                 .iter()
                 .any(|log| log.message == "Query analysis=speculative snapshot")
         );
+    }
+
+    #[test]
+    fn documents_changed_applies_a_batch_with_one_rebuild() {
+        let (temp, mut server, ctx, receiver) = fixture();
+        let a = temp.path().join("a.reds");
+        let b = temp.path().join("b.reds");
+        let mut buffers = crate::buffers::Buffers::default();
+        let uri_a = ctx.uri(&a).unwrap();
+        let uri_b = ctx.uri(&b).unwrap();
+        buffers.open(uri_a.clone(), "public class A {}".into(), 1);
+        buffers.open(uri_b.clone(), "public class B {}".into(), 1);
+        server
+            .documents_changed(
+                &[
+                    (a.clone(), buffers.get(&uri_a)),
+                    (b.clone(), buffers.get(&uri_b)),
+                ],
+                &ctx,
+            )
+            .unwrap();
+        let rebuilds = receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                lsp_server::Message::Notification(notification)
+                    if notification.method == "window/logMessage" =>
+                {
+                    serde_json::from_value::<lsp::LogMessageParams>(notification.params).ok()
+                }
+                _ => None,
+            })
+            .filter(|log| log.message.contains("Rebuild started"))
+            .count();
+        assert_eq!(rebuilds, 1);
+        server
+            .check_workspace(|_, symbols, _, _| {
+                assert!(symbols.types().any(|(id, _)| id.as_str() == "A"));
+                assert!(symbols.types().any(|(id, _)| id.as_str() == "B"));
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

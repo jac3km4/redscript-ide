@@ -126,20 +126,23 @@ impl LspServer<'_> {
                         }
                     }
                 }
-                for uri in pending {
-                    let result = (|| {
-                        self.server.document_changed(
-                            path_from_uri(&uri)?,
-                            self.buffers.get(&uri),
-                            &self.context,
-                        )?;
-                        self.update_watchers()
-                    })();
-                    if let Err(err) = result {
-                        let message = format!("{err:#}");
-                        self.context.logger().error(&message);
-                        self.context.show_message(lsp::MessageType::ERROR, message);
+                // Apply the whole batch before rebuilding so N changed documents
+                // trigger a single workspace rebuild.
+                let outcome = {
+                    let mut documents = Vec::with_capacity(pending.len());
+                    for uri in pending {
+                        match path_from_uri(&uri) {
+                            Ok(path) => documents.push((path, self.buffers.get(&uri))),
+                            Err(err) => self.context.logger().error(format!("{err:#}")),
+                        }
                     }
+                    self.server.documents_changed(&documents, &self.context)
+                };
+                let result = outcome.and_then(|()| self.update_watchers());
+                if let Err(err) = result {
+                    let message = format!("{err:#}");
+                    self.context.logger().error(&message);
+                    self.context.show_message(lsp::MessageType::ERROR, message);
                 }
                 continue;
             }
@@ -670,6 +673,19 @@ pub trait LanguageServer {
         buffer: Option<&Buffer>,
         ctx: &LspContext,
     ) -> anyhow::Result<()>;
+    /// Apply a batch of document changes. The default implementation forwards to
+    /// [`LanguageServer::document_changed`] one document at a time; servers that
+    /// can coalesce the resulting work should override this to do a single pass.
+    fn documents_changed(
+        &mut self,
+        documents: &[(PathBuf, Option<&Buffer>)],
+        ctx: &LspContext,
+    ) -> anyhow::Result<()> {
+        for (path, buffer) in documents {
+            self.document_changed(path.clone(), *buffer, ctx)?;
+        }
+        Ok(())
+    }
     fn files_changed(&mut self, paths: Vec<PathBuf>, ctx: &LspContext) -> anyhow::Result<()>;
     fn check(&mut self, path: PathBuf, ctx: &LspContext) -> anyhow::Result<()>;
     fn change_workspace_folders(
@@ -2072,7 +2088,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_changes_apply_incrementally_and_rebuild_once_per_uri() {
+    fn queued_changes_apply_incrementally_and_rebuild_once_per_batch() {
         let (mut server, client) = memory_server();
         let events = record_changes(&mut server);
         server.watch_files = true;
@@ -2114,8 +2130,8 @@ mod tests {
             *events.borrow(),
             [
                 "change:éAC!est:Some(3)",
-                "watchers",
                 "change:second:Some(2)",
+                // The whole batch produces a single watcher refresh.
                 "watchers",
             ]
         );
