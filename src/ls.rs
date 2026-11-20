@@ -1,10 +1,8 @@
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use hashbrown::{HashMap, HashSet};
@@ -58,7 +56,7 @@ pub struct RedscriptLanguageServer {
     reported_missing_roots: BTreeSet<PathBuf>,
     warned_extensions: HashSet<PathBuf>,
     diagnostics: DiagnosticTracker,
-    completion_cache: RefCell<Option<CachedCompletion>>,
+    completion_cache: Mutex<Option<CachedCompletion>>,
 }
 
 struct CachedCompletion {
@@ -66,7 +64,7 @@ struct CachedCompletion {
     receiver_end: usize,
     source_without_member: String,
     other_overlays: BTreeMap<PathBuf, Arc<str>>,
-    response: Rc<lsp::CompletionResponse>,
+    response: Arc<lsp::CompletionResponse>,
 }
 
 impl RedscriptLanguageServer {
@@ -137,7 +135,7 @@ impl RedscriptLanguageServer {
             reported_missing_roots: BTreeSet::new(),
             warned_extensions: HashSet::new(),
             diagnostics,
-            completion_cache: RefCell::new(None),
+            completion_cache: Mutex::new(None),
         })
     }
 
@@ -238,7 +236,7 @@ impl RedscriptLanguageServer {
         let started = std::time::Instant::now();
         self.invalidate();
         let mut read_diagnostics = if reload {
-            self.completion_cache.borrow_mut().take();
+            self.completion_cache.lock().unwrap().take();
             BTreeMap::new()
         } else {
             self.diagnostics
@@ -463,9 +461,9 @@ impl RedscriptLanguageServer {
         &self,
         loc: CodeLocation<'_>,
         ctx: &LspContext,
-    ) -> anyhow::Result<Rc<lsp::CompletionResponse>> {
+    ) -> anyhow::Result<Arc<lsp::CompletionResponse>> {
         if Dialect::of(loc.doc().path()).is_none() {
-            return Ok(Rc::new(lsp::CompletionResponse::Array(vec![])));
+            return Ok(Arc::new(lsp::CompletionResponse::Array(vec![])));
         }
         let contents = loc.doc().buffer().contents().to_string();
         let Some(member) = member_completion_range(&contents, loc.pos()) else {
@@ -474,7 +472,7 @@ impl RedscriptLanguageServer {
                 loc.doc().path().display(),
                 loc.pos(),
             ));
-            return Ok(Rc::new(lsp::CompletionResponse::Array(vec![])));
+            return Ok(Arc::new(lsp::CompletionResponse::Array(vec![])));
         };
         ctx.logger().info(format!(
             "Completion receiver path={} byte_offset={} erased_member_range={member:?}",
@@ -490,7 +488,7 @@ impl RedscriptLanguageServer {
             .filter(|(other, _)| **other != path)
             .map(|(path, overlay)| (path.clone(), overlay.text.clone()))
             .collect();
-        if let Some(cached) = self.completion_cache.borrow().as_ref()
+        if let Some(cached) = self.completion_cache.lock().unwrap().as_ref()
             && cached.path == path
             && cached.receiver_end == member.start
             && cached.source_without_member == source_without_member
@@ -508,8 +506,8 @@ impl RedscriptLanguageServer {
             |at| generate_completions(at, dialect),
             ctx,
         )?;
-        let response = Rc::new(lsp::CompletionResponse::Array(completions));
-        *self.completion_cache.borrow_mut() = Some(CachedCompletion {
+        let response = Arc::new(lsp::CompletionResponse::Array(completions));
+        *self.completion_cache.lock().unwrap() = Some(CachedCompletion {
             path,
             receiver_end,
             source_without_member,
@@ -1363,7 +1361,7 @@ impl LanguageServer for RedscriptLanguageServer {
         &self,
         loc: CodeLocation<'_>,
         _ctx: &LspContext,
-    ) -> anyhow::Result<Rc<lsp_types::CompletionResponse>> {
+    ) -> anyhow::Result<Arc<lsp_types::CompletionResponse>> {
         self.completion_at(loc, _ctx)
     }
 
@@ -1673,7 +1671,7 @@ mod tests {
             };
             assert!(items.iter().any(|item| item.label.starts_with("Value")));
             if let Some(previous) = previous {
-                assert!(Rc::ptr_eq(&previous, &response));
+                assert!(Arc::ptr_eq(&previous, &response));
             }
             previous = Some(response);
         }
@@ -1687,10 +1685,10 @@ mod tests {
             text.rfind("; }").unwrap() as u32,
         );
         let changed = server.completion_at(loc.clone(), &ctx).unwrap();
-        assert!(!Rc::ptr_eq(&previous.unwrap(), &changed));
+        assert!(!Arc::ptr_eq(&previous.unwrap(), &changed));
         server.files_changed(vec![dependency], &ctx).unwrap();
         let refreshed = server.completion_at(loc, &ctx).unwrap();
-        assert!(!Rc::ptr_eq(&changed, &refreshed));
+        assert!(!Arc::ptr_eq(&changed, &refreshed));
     }
 
     #[test]
@@ -2841,7 +2839,7 @@ mod tests {
         path: &Path,
         text: &str,
         version: i32,
-    ) -> Rc<lsp::CompletionResponse> {
+    ) -> Arc<lsp::CompletionResponse> {
         let buffers = open(server, ctx, path, text, version);
         let buffer = buffers.get(&ctx.uri(path).unwrap()).unwrap();
         let pos = text.rfind('.').unwrap() as u32 + 1;
@@ -3458,7 +3456,7 @@ mod tests {
             reported_missing_roots: BTreeSet::new(),
             warned_extensions: HashSet::new(),
             diagnostics: DiagnosticTracker::default(),
-            completion_cache: RefCell::new(None),
+            completion_cache: Mutex::new(None),
         }
     }
 

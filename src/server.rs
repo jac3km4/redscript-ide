@@ -1,8 +1,8 @@
 use std::fmt::Display;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
@@ -665,7 +665,7 @@ fn response_value<R: Serialize>(result: anyhow::Result<R>) -> Result<Value, Resp
         .map_err(|err| response_error(ErrorCode::InternalError, err))
 }
 
-pub trait LanguageServer {
+pub trait LanguageServer: Send {
     fn watch_roots(&self) -> Vec<PathBuf>;
     fn document_changed(
         &mut self,
@@ -699,7 +699,7 @@ pub trait LanguageServer {
         &self,
         doc: CodeLocation<'_>,
         ctx: &LspContext,
-    ) -> anyhow::Result<Rc<lsp::CompletionResponse>>;
+    ) -> anyhow::Result<Arc<lsp::CompletionResponse>>;
     fn goto_definition(
         &self,
         doc: CodeLocation<'_>,
@@ -1184,7 +1184,7 @@ fn capabilities() -> lsp::ServerCapabilities {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::*;
@@ -1195,7 +1195,7 @@ mod tests {
         completion: Option<lsp::CompletionResponse>,
         document_symbols: Option<lsp::DocumentSymbolResponse>,
         allow_document_changes: bool,
-        events: Option<Rc<RefCell<Vec<String>>>>,
+        events: Option<Arc<Mutex<Vec<String>>>>,
         watch_roots: Vec<PathBuf>,
         code_actions: Vec<lsp::CodeAction>,
     }
@@ -1203,7 +1203,7 @@ mod tests {
     impl LanguageServer for StubServer {
         fn watch_roots(&self) -> Vec<PathBuf> {
             if let Some(events) = &self.events {
-                events.borrow_mut().push("watchers".into());
+                events.lock().unwrap().push("watchers".into());
             }
             self.watch_roots.clone()
         }
@@ -1217,7 +1217,7 @@ mod tests {
             assert!(self.allow_document_changes, "unexpected document change");
             if let Some(events) = &self.events {
                 let buffer = buffer.unwrap();
-                events.borrow_mut().push(format!(
+                events.lock().unwrap().push(format!(
                     "change:{}:{:?}",
                     buffer.contents(),
                     buffer.version(),
@@ -1229,7 +1229,7 @@ mod tests {
         fn files_changed(&mut self, paths: Vec<PathBuf>, _ctx: &LspContext) -> anyhow::Result<()> {
             assert!(self.allow_document_changes, "unexpected file change");
             if let Some(events) = &self.events {
-                events.borrow_mut().push(format!("files:{}", paths.len()));
+                events.lock().unwrap().push(format!("files:{}", paths.len()));
             }
             Ok(())
         }
@@ -1237,7 +1237,7 @@ mod tests {
         fn check(&mut self, _path: PathBuf, _ctx: &LspContext) -> anyhow::Result<()> {
             assert!(self.allow_document_changes, "unexpected check");
             if let Some(events) = &self.events {
-                events.borrow_mut().push("save".into());
+                events.lock().unwrap().push("save".into());
             }
             Ok(())
         }
@@ -1250,7 +1250,7 @@ mod tests {
         ) -> anyhow::Result<()> {
             if let Some(events) = &self.events {
                 events
-                    .borrow_mut()
+                    .lock().unwrap()
                     .push(format!("folders:{}:{}", added.len(), removed.len()));
             }
             self.watch_roots.retain(|root| !removed.contains(root));
@@ -1265,7 +1265,7 @@ mod tests {
         ) -> anyhow::Result<Option<lsp::Hover>> {
             if let Some(events) = &self.events {
                 events
-                    .borrow_mut()
+                    .lock().unwrap()
                     .push(format!("hover:{}", doc.doc().buffer().contents()));
             }
             self.hover.clone().context("stub handler failed")
@@ -1275,8 +1275,8 @@ mod tests {
             &self,
             _doc: CodeLocation<'_>,
             _ctx: &LspContext,
-        ) -> anyhow::Result<Rc<lsp::CompletionResponse>> {
-            Ok(Rc::new(
+        ) -> anyhow::Result<Arc<lsp::CompletionResponse>> {
+            Ok(Arc::new(
                 self.completion
                     .clone()
                     .unwrap_or_else(|| lsp::CompletionResponse::Array(vec![])),
@@ -1298,7 +1298,7 @@ mod tests {
         ) -> anyhow::Result<lsp::DocumentSymbolResponse> {
             if let Some(events) = &self.events {
                 events
-                    .borrow_mut()
+                    .lock().unwrap()
                     .push(format!("document_symbols:{}", doc.buffer().contents()));
             }
             Ok(self
@@ -1332,7 +1332,7 @@ mod tests {
             ctx: &LspContext,
         ) -> anyhow::Result<lsp::CodeActionResponse> {
             if let Some(events) = &self.events {
-                events.borrow_mut().push(format!(
+                events.lock().unwrap().push(format!(
                     "code_action:{span:?}:{}",
                     serde_json::to_string(&context)?
                 ));
@@ -1691,7 +1691,7 @@ mod tests {
             {"name": "top", "kind": 12, "location": {"uri": uri, "range": selection}}
         ]);
         let (mut server, _client) = memory_server();
-        let events = Rc::new(RefCell::new(vec![]));
+        let events = Arc::new(Mutex::new(vec![]));
         server.server = Box::new(StubServer {
             document_symbols: Some(serde_json::from_value(source.clone()).unwrap()),
             events: Some(events.clone()),
@@ -1723,7 +1723,7 @@ mod tests {
             assert_eq!(&result, expected);
         }
         assert_eq!(
-            &*events.borrow(),
+            &*events.lock().unwrap(),
             &vec!["document_symbols:é😀test".to_owned(); 5]
         );
         let capabilities = serde_json::to_value(capabilities()).unwrap();
@@ -1747,7 +1747,7 @@ mod tests {
     #[test]
     fn code_action_dispatch_preserves_context_and_converts_utf16_range() {
         let (mut server, _client) = memory_server();
-        let events = Rc::new(RefCell::new(vec![]));
+        let events = Arc::new(Mutex::new(vec![]));
         server.server = Box::new(StubServer {
             events: Some(events.clone()),
             ..Default::default()
@@ -1765,7 +1765,7 @@ mod tests {
         assert_eq!(result, json!([]));
         let expected: lsp::CodeActionContext = serde_json::from_value(context).unwrap();
         assert_eq!(
-            &*events.borrow(),
+            &*events.lock().unwrap(),
             &[format!(
                 "code_action:2..6:{}",
                 serde_json::to_string(&expected).unwrap()
@@ -2059,8 +2059,8 @@ mod tests {
         })
     }
 
-    fn record_changes(server: &mut LspServer<'_>) -> Rc<RefCell<Vec<String>>> {
-        let events = Rc::new(RefCell::new(Vec::new()));
+    fn record_changes(server: &mut LspServer<'_>) -> Arc<Mutex<Vec<String>>> {
+        let events = Arc::new(Mutex::new(Vec::new()));
         server.server = Box::new(StubServer {
             allow_document_changes: true,
             events: Some(events.clone()),
@@ -2127,7 +2127,7 @@ mod tests {
         server.run().unwrap();
 
         assert_eq!(
-            *events.borrow(),
+            *events.lock().unwrap(),
             [
                 "change:éAC!est:Some(3)",
                 "change:second:Some(2)",
@@ -2171,7 +2171,7 @@ mod tests {
         server.run().unwrap();
 
         assert_eq!(
-            *events.borrow(),
+            *events.lock().unwrap(),
             [
                 "change:before request:Some(2)",
                 "hover:before request",
@@ -2211,7 +2211,7 @@ mod tests {
 
         server.run().unwrap();
 
-        assert_eq!(*events.borrow(), ["change:accepted!:Some(4)"]);
+        assert_eq!(*events.lock().unwrap(), ["change:accepted!:Some(4)"]);
         let buffer = server.buffers.get(&uri.parse().unwrap()).unwrap();
         assert_eq!(buffer.contents().to_string(), "accepted!");
         assert_eq!(buffer.version(), Some(4));
@@ -2252,7 +2252,7 @@ mod tests {
 
         // The rejected version is logged but must not stop the batch, and the
         // URI still rebuilds exactly once with the last accepted contents.
-        assert_eq!(*events.borrow(), ["change:fourth:Some(4)"]);
+        assert_eq!(*events.lock().unwrap(), ["change:fourth:Some(4)"]);
         let buffer = server.buffers.get(&uri.parse().unwrap()).unwrap();
         assert_eq!(buffer.contents().to_string(), "fourth");
         assert_eq!(buffer.version(), Some(4));
@@ -2286,7 +2286,7 @@ mod tests {
         // Any queued notification is a barrier: the first two changes coalesce,
         // and the third rebuilds separately.
         assert_eq!(
-            *events.borrow(),
+            *events.lock().unwrap(),
             ["change:second:Some(3)", "files:0", "change:third:Some(4)"]
         );
     }
@@ -2304,7 +2304,7 @@ mod tests {
         // Keep the log receiver alive while disconnecting the incoming channel.
         drop(client.sender);
         server.run().unwrap();
-        assert_eq!(*events.borrow(), ["change:final:Some(2)"]);
+        assert_eq!(*events.lock().unwrap(), ["change:final:Some(2)"]);
     }
 
     #[test]
@@ -2558,7 +2558,7 @@ mod tests {
                 }),
             )))
             .unwrap();
-        assert_eq!(*events.borrow(), ["files:1"]);
+        assert_eq!(*events.lock().unwrap(), ["files:1"]);
         assert!(client.receiver.try_recv().is_err());
     }
 
@@ -2591,7 +2591,7 @@ mod tests {
             "{popup}"
         );
         assert!(popup.contains("reopen or save"), "{popup}");
-        assert!(events.borrow().is_empty());
+        assert!(events.lock().unwrap().is_empty());
         let buffer = server.buffers.get(&uri.parse().unwrap()).unwrap();
         assert_eq!(buffer.contents().to_string(), "é😀test");
         assert_eq!(buffer.version(), Some(1));

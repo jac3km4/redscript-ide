@@ -4,10 +4,9 @@
 // warning-free.
 #![allow(dead_code)]
 
-use std::cell::LazyCell;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::{Arc, LazyLock};
 
 use hashbrown::HashMap;
 use ouroboros::self_referencing;
@@ -26,7 +25,7 @@ const DIAGNOSTIC_PASSES: &[&'static (dyn DiagnosticPass + 'static)] = &[&UnusedL
 #[derive(Clone)]
 pub(crate) enum CacheBytes {
     Embedded(&'static [u8]),
-    Owned(Rc<[u8]>),
+    Owned(Arc<[u8]>),
 }
 
 impl Deref for CacheBytes {
@@ -42,7 +41,7 @@ impl Deref for CacheBytes {
 
 impl From<Vec<u8>> for CacheBytes {
     fn from(bytes: Vec<u8>) -> Self {
-        Self::Owned(Rc::from(bytes))
+        Self::Owned(Arc::from(bytes))
     }
 }
 
@@ -137,8 +136,10 @@ pub(crate) struct CompilationCache {
     pub(crate) analysis: DeferredAnalysis<'this>,
 }
 
-pub(crate) type DeferredAnalysis<'ctx> =
-    LazyCell<AnalyzedSources<'ctx>, Box<dyn FnOnce() -> AnalyzedSources<'ctx> + 'ctx>>;
+pub(crate) type DeferredAnalysis<'ctx> = LazyLock<
+    AnalyzedSources<'ctx>,
+    Box<dyn FnOnce() -> AnalyzedSources<'ctx> + Send + Sync + 'ctx>,
+>;
 
 pub(crate) struct AnalyzedSources<'ctx> {
     pub(crate) parsed: ParsedSources<'ctx>,
@@ -153,7 +154,7 @@ impl<'ctx> AnalyzedSources<'ctx> {
         symbols: Symbols<'ctx>,
         interner: &'ctx TypeInterner,
     ) -> DeferredAnalysis<'ctx> {
-        LazyCell::new(Box::new(move || {
+        LazyLock::new(Box::new(move || {
             Self::new(dialect::parse(sources), symbols, interner)
         }))
     }
@@ -241,7 +242,7 @@ impl Default for CompilationCache {
             ast::SourceMap::default(),
             HashMap::default(),
             |_, interner, _| {
-                LazyCell::new(Box::new(move || {
+                LazyLock::new(Box::new(move || {
                     AnalyzedSources::new(
                         ParsedSources {
                             modules: vec![],
@@ -253,5 +254,21 @@ impl Default for CompilationCache {
                 }))
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    /// The analysis worker thread requires the compiler cache and its lazily
+    /// built analysis to cross the thread boundary, so both must stay `Send`
+    /// and `Sync` as upstream `redscript` changes land.
+    #[test]
+    fn compilation_cache_and_analysis_are_send_and_sync() {
+        assert_send_sync::<CompilationCache>();
+        assert_send_sync::<AnalyzedSources<'static>>();
     }
 }
