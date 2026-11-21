@@ -538,9 +538,18 @@ impl LspServer<'_> {
         event_rx: &Receiver<WorkerEvent>,
     ) -> anyhow::Result<bool> {
         if self.shutdown {
-            // Synchronous path: logs the request and answers `InvalidRequest`
-            // without ever touching the worker.
-            self.handle(Message::Request(request))?;
+            // Answer `InvalidRequest` without touching the worker, keeping the
+            // same request metadata log the active path emits.
+            log_request_metadata(&self.context, &request);
+            let error = response_error(ErrorCode::InvalidRequest, "Server is shut down");
+            self.context.logger().error(format!(
+                "Request failed method={} id={} code={} message={} elapsed_ms={:.3}",
+                request.method, request.id, error.code, error.message, 0.0,
+            ));
+            self.connection.sender.send(Message::Response(Response {
+                id: request.id,
+                response_result: Err(error),
+            }))?;
             return Ok(false);
         }
         if request.method == lsp::request::Shutdown::METHOD {
@@ -1204,6 +1213,7 @@ impl LspServer<'_> {
         Ok(())
     }
 
+    #[cfg(test)]
     fn dispatch(&mut self, method: &str, params: Value) -> Result<Value, ResponseError> {
         if self.shutdown {
             return Err(response_error(
@@ -1317,6 +1327,7 @@ impl LspServer<'_> {
         }
     }
 
+    #[cfg(test)]
     fn handle(&mut self, message: Message) -> anyhow::Result<()> {
         match message {
             Message::Request(request) => {
@@ -1573,6 +1584,7 @@ impl LspServer<'_> {
         Ok(Document::new(path, content))
     }
 
+    #[cfg(test)]
     fn document_location(
         &self,
         uri: &lsp::Uri,
