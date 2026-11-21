@@ -33,6 +33,9 @@ mod document_symbols;
 const EMBEDDED_CACHE: &[u8] = include_bytes!("../assets/api.redscripts.zlib");
 const REDMOD_SUBSET_DOCS_URL: &str =
     "https://github.com/jac3km4/redscript/blob/v1.0.0/crates/compiler/redmod/adapter/README.md";
+/// Disabled-action reason shared by stale single fixes and fix-all actions.
+const STALE_FIX_REASON: &str =
+    "This fix is stale because workspace files changed; save to refresh diagnostics";
 
 /// Fails fast when the analysis worker's current request was cancelled.
 ///
@@ -82,6 +85,28 @@ struct CachedCompletion {
     source_without_member: String,
     other_overlays: BTreeMap<PathBuf, Arc<str>>,
     response: Arc<lsp::CompletionResponse>,
+}
+
+/// Orders a file's edits by position so `TextEdit` ordering is deterministic.
+/// The LSP applies edits in array order, and diagnostic-span iteration order
+/// (hash-map backed) is otherwise unspecified.
+fn sort_text_edits(edits: &mut [lsp::TextEdit]) {
+    edits.sort_by(|a, b| {
+        (
+            a.range.start.line,
+            a.range.start.character,
+            a.range.end.line,
+            a.range.end.character,
+            a.new_text.as_str(),
+        )
+            .cmp(&(
+                b.range.start.line,
+                b.range.start.character,
+                b.range.end.line,
+                b.range.end.character,
+                b.new_text.as_str(),
+            ))
+    });
 }
 
 impl RedscriptLanguageServer {
@@ -974,30 +999,37 @@ impl RedscriptLanguageServer {
                     }
                 }
 
-                action.edit = Some(self.workspace_edit(edits.into_iter().collect(), ctx));
+                if edits.is_empty() {
+                    self.disable_action(&mut action, STALE_FIX_REASON, ctx);
+                } else {
+                    action.edit = Some(self.workspace_edit(edits.into_iter().collect(), ctx));
+                }
             }
             other => {
-                action.edit = None;
-                if ctx.supports_code_action_disabled() {
-                    let reason = match other {
-                        FixRequest::FixOne(fix)
-                            if crate::server::path_from_uri(&fix.uri).is_ok_and(|path| {
-                                Dialect::of(&path) != Some(Dialect::Community)
-                            }) =>
-                        {
-                            "Quick fixes are only supported for community REDscript (.reds) files"
-                        }
-                        _ => {
-                            "This fix is stale because workspace files changed; save to refresh diagnostics"
-                        }
-                    };
-                    action.disabled = Some(lsp::CodeActionDisabled {
-                        reason: reason.into(),
-                    });
-                }
+                let reason = match &other {
+                    FixRequest::FixOne(fix)
+                        if crate::server::path_from_uri(&fix.uri)
+                            .is_ok_and(|path| Dialect::of(&path) != Some(Dialect::Community)) =>
+                    {
+                        "Quick fixes are only supported for community REDscript (.reds) files"
+                    }
+                    _ => STALE_FIX_REASON,
+                };
+                self.disable_action(&mut action, reason, ctx);
             }
         }
         Ok(action)
+    }
+
+    /// Marks an action whose edits are no longer applicable, using the
+    /// disabled-action capability the client negotiated when supported.
+    fn disable_action(&self, action: &mut lsp::CodeAction, reason: &'static str, ctx: &LspContext) {
+        action.edit = None;
+        if ctx.supports_code_action_disabled() {
+            action.disabled = Some(lsp::CodeActionDisabled {
+                reason: reason.into(),
+            });
+        }
     }
 
     fn workspace_edit(
@@ -1007,6 +1039,9 @@ impl RedscriptLanguageServer {
     ) -> lsp::WorkspaceEdit {
         let mut edits = edits;
         edits.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+        for (_, file_edits) in &mut edits {
+            sort_text_edits(file_edits);
+        }
         if ctx.supports_workspace_edit_document_changes() {
             lsp::WorkspaceEdit {
                 document_changes: Some(lsp::DocumentChanges::Edits(
@@ -3853,7 +3888,9 @@ mod tests {
             ..Default::default()
         };
         let resolved = server.code_action_resolve(action, &ctx).unwrap();
-        assert!(matches!(resolved.edit.unwrap().changes, Some(changes) if changes.is_empty()));
+        // Every candidate fix is stale or from another dialect, so the fix-all
+        // resolves to no edit rather than an empty workspace edit.
+        assert!(resolved.edit.is_none());
     }
 
     #[test]
@@ -4642,6 +4679,75 @@ mod tests {
                 .edit
                 .is_some()
         );
+    }
+
+    #[test]
+    fn workspace_edit_sorts_text_edits_per_file() {
+        let server = server();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let ctx = LspContext::new(sender);
+        let uri: lsp::Uri = "file:///C:/scripts/a.reds".parse().unwrap();
+        let edit = |line: u32, text: &str| {
+            lsp::TextEdit::new(
+                lsp::Range::new(lsp::Position::new(line, 0), lsp::Position::new(line, 1)),
+                text.to_owned(),
+            )
+        };
+        let edits = vec![(uri.clone(), vec![edit(5, "e"), edit(1, "a"), edit(3, "c")])];
+        #[allow(clippy::mutable_key_type)]
+        let changes = server.workspace_edit(edits, &ctx).changes.unwrap();
+        let lines: Vec<_> = changes
+            .get(&uri)
+            .unwrap()
+            .iter()
+            .map(|edit| edit.range.start.line)
+            .collect();
+        assert_eq!(lines, [1, 3, 5]);
+    }
+
+    #[test]
+    fn fix_all_disables_when_every_fix_is_stale() {
+        let mut server = server();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut ctx = LspContext::new(sender);
+        ctx.set_code_action_capabilities(
+            &serde_json::from_value(serde_json::json!({
+                "textDocument": {"codeAction": {"disabledSupport": true}}
+            }))
+            .unwrap(),
+        );
+        let uri: lsp::Uri = "file:///C:/scripts/a.reds".parse().unwrap();
+        let path = dialect::identity(&crate::server::path_from_uri(&uri).unwrap());
+        // The cached fix is stale: its expected source no longer matches the
+        // current overlay text.
+        insert_cached_fix(
+            &mut server,
+            path.clone(),
+            uri.clone(),
+            "public class Test {}",
+        );
+        server.overlays.insert(
+            path.clone(),
+            Overlay {
+                text: "public class Other {}".into(),
+                version: 1,
+            },
+        );
+
+        let action = lsp::CodeAction {
+            data: Some(
+                serde_json::to_value(FixRequest::FixAll(
+                    FixKind::MakeFieldPublic,
+                    0,
+                    FixScope::Standalone(path),
+                ))
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let resolved = server.code_action_resolve(action, &ctx).unwrap();
+        assert!(resolved.edit.is_none());
+        assert!(resolved.disabled.is_some());
     }
 
     #[test]
