@@ -1055,7 +1055,7 @@ impl RedscriptLanguageServer {
                 }
             }
             other => {
-                let reason = match &other {
+                let reason = match other {
                     FixRequest::FixOne(fix)
                         if crate::server::path_from_uri(&fix.uri)
                             .is_ok_and(|path| Dialect::of(&path) != Some(Dialect::Community)) =>
