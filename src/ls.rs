@@ -109,6 +109,20 @@ fn sort_text_edits(edits: &mut [lsp::TextEdit]) {
     });
 }
 
+/// Whether `cached` matches the current overlays excluding `path`, without
+/// allocating a comparison map on cache hits.
+fn overlays_match(
+    cached: &BTreeMap<PathBuf, Arc<str>>,
+    overlays: &HashMap<PathBuf, Overlay>,
+    path: &Path,
+) -> bool {
+    let expected = overlays.len() - usize::from(overlays.contains_key(path));
+    expected == cached.len()
+        && overlays.iter().all(|(other, overlay)| {
+            other == path || cached.get(other).is_some_and(|text| text == &overlay.text)
+        })
+}
+
 impl RedscriptLanguageServer {
     pub fn new(
         cache_path: &Path,
@@ -639,6 +653,24 @@ impl RedscriptLanguageServer {
             )
         });
         let path = dialect::identity(loc.doc().path());
+        let receiver_end = member.start;
+        if let Some(cached) = self.completion_cache.lock().unwrap().as_ref()
+            && cached.path == path
+            && cached.receiver_end == receiver_end
+            && cached.source_without_member.len() == contents.len() - member.len()
+            && cached
+                .source_without_member
+                .starts_with(&contents[..receiver_end])
+            && cached
+                .source_without_member
+                .ends_with(&contents[member.end..])
+            && overlays_match(&cached.other_overlays, &self.overlays, &path)
+        {
+            ctx.logger()
+                .verbose(|| "Completion analysis=reused member results".to_owned());
+            return Ok(cached.response.clone());
+        }
+        // Only allocate the stripped source and overlay snapshot on a miss.
         let source_without_member = {
             let mut stripped = contents.clone();
             stripped.replace_range(member.clone(), "");
@@ -650,17 +682,6 @@ impl RedscriptLanguageServer {
             .filter(|(other, _)| **other != path)
             .map(|(path, overlay)| (path.clone(), overlay.text.clone()))
             .collect();
-        if let Some(cached) = self.completion_cache.lock().unwrap().as_ref()
-            && cached.path == path
-            && cached.receiver_end == member.start
-            && cached.source_without_member == source_without_member
-            && cached.other_overlays == other_overlays
-        {
-            ctx.logger()
-                .verbose(|| "Completion analysis=reused member results".to_owned());
-            return Ok(cached.response.clone());
-        }
-        let receiver_end = member.start;
         let dialect = Dialect::of(loc.doc().path());
         let completions = self.expr_at_with(
             loc.with_pos(member.start as u32),
