@@ -762,37 +762,7 @@ impl LspServer<'_> {
                 // A save makes the on-disk content authoritative. Reload a
                 // buffer left desynced by a rejected change so diagnostics and
                 // queries stop using stale text.
-                if self.buffers.is_desynced(&doc.uri) {
-                    let reloaded = match text {
-                        Some(text) => Ok(text),
-                        None => std::fs::read_to_string(&path),
-                    };
-                    let documents = match reloaded {
-                        Ok(text) => {
-                            self.buffers.replace(&doc.uri, text);
-                            self.context.logger().verbose(|| {
-                                format!(
-                                    "Document save resynchronized uri={} version={:?}",
-                                    doc.uri.as_str(),
-                                    self.buffers.get(&doc.uri).and_then(Buffer::version),
-                                )
-                            });
-                            vec![(path.clone(), self.buffers.get(&doc.uri).cloned())]
-                        }
-                        Err(error) => {
-                            self.context.logger().warn(format!(
-                                "Could not reload desynced document from disk uri={} ({error}); dropping the buffer",
-                                doc.uri.as_str(),
-                            ));
-                            self.buffers.remove(&doc.uri);
-                            vec![(path.clone(), None)]
-                        }
-                    };
-                    self.state_rev += 1;
-                    self.latest_state_rev
-                        .store(self.state_rev, Ordering::Release);
-                    cmd_tx.send(WorkerCmd::DocumentsChanged { documents }).ok();
-                }
+                self.resync_desynced_buffer(&doc.uri, &path, text, cmd_tx);
                 let version = self.buffers.get(&doc.uri).and_then(Buffer::version);
                 self.diag_rev += 1;
                 self.latest_diag_rev.store(self.diag_rev, Ordering::Release);
@@ -905,6 +875,50 @@ impl LspServer<'_> {
             }
         }
         Ok(false)
+    }
+
+    /// Reloads a buffer left desynced by a rejected change, because a save makes
+    /// the on-disk content authoritative. Removes the buffer when the reload
+    /// fails so stale text is never trusted again.
+    fn resync_desynced_buffer(
+        &mut self,
+        uri: &lsp::Uri,
+        path: &Path,
+        text: Option<String>,
+        cmd_tx: &Sender<WorkerCmd>,
+    ) {
+        if !self.buffers.is_desynced(uri) {
+            return;
+        }
+        let reloaded = match text {
+            Some(text) => Ok(text),
+            None => std::fs::read_to_string(path),
+        };
+        let documents = match reloaded {
+            Ok(text) => {
+                self.buffers.replace(uri, text);
+                self.context.logger().verbose(|| {
+                    format!(
+                        "Document save resynchronized uri={} version={:?}",
+                        uri.as_str(),
+                        self.buffers.get(uri).and_then(Buffer::version),
+                    )
+                });
+                vec![(path.to_path_buf(), self.buffers.get(uri).cloned())]
+            }
+            Err(error) => {
+                self.context.logger().warn(format!(
+                    "Could not reload desynced document from disk uri={} ({error}); dropping the buffer",
+                    uri.as_str(),
+                ));
+                self.buffers.remove(uri);
+                vec![(path.to_path_buf(), None)]
+            }
+        };
+        self.state_rev += 1;
+        self.latest_state_rev
+            .store(self.state_rev, Ordering::Release);
+        cmd_tx.send(WorkerCmd::DocumentsChanged { documents }).ok();
     }
 
     fn handle_worker_event(
