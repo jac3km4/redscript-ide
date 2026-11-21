@@ -240,9 +240,7 @@ impl CompilationCache {
     pub(crate) fn analysis_is_forced(&self) -> bool {
         self.with(|cache| LazyLock::get(cache.analysis).is_some())
     }
-}
 
-impl CompilationCache {
     pub(crate) fn analyze<A>(
         &self,
         mut cb: impl for<'ctx> FnMut(
