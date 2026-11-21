@@ -11,10 +11,18 @@ Prioritized follow-ups from the LSP/code review. Keep fixes focused and add regr
 - Isolate non-missing-root discovery/read failures so healthy files keep updating (missing roots
   are handled).
 
+## Performance
+
+- Reuse validated startup symbols for the initial `CompilationCache` snapshot and explore sharing
+  or pooling base-game symbol loading across edit/save/speculative-query snapshots (`src/analysis.rs`,
+  `src/ls.rs`) instead of re-decoding `ScriptBundle` and re-interning ~30k base-game symbols into a
+  fresh `TypeInterner` on every snapshot.
+
 ## LSP correctness
 
-- Negotiate remaining client-dependent response features (for example, workspace edit document
-  changes and disabled code actions).
+- Negotiate remaining client-dependent response features (for example, falling back to `Command`
+  in `code_action` when `codeActionLiteralSupport` is absent; `workspaceEdit.documentChanges`,
+  `disabled` code actions, and presentation capabilities are now negotiated).
 - Preserve generic specialization in full hover/completion signatures. Receiver-bound instance
   methods, static methods with derivable type arguments, and generic field types are
   specialized; static-method completions without derivable type arguments still fall back to
