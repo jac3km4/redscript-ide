@@ -354,12 +354,8 @@ impl LspServer<'_> {
             .and_then(|workspace| workspace.did_change_watched_files.as_ref())
             .and_then(|watch| watch.dynamic_registration)
             .unwrap_or(false);
-        let workspace_folders = init_params
-            .workspace_folders
-            .unwrap_or_default()
-            .into_iter()
-            .map(|folder| path_from_uri(&folder.uri))
-            .collect::<Result<Vec<PathBuf>, _>>()?;
+        let workspace_folders =
+            workspace_folder_paths(init_params.workspace_folders.unwrap_or_default(), &context)?;
         let options = Options::new(workspace_folders, init_params.initialization_options);
         let props = create_props(options, &context).inspect_err(|err| {
             context
@@ -824,18 +820,8 @@ impl LspServer<'_> {
             lsp::notification::DidChangeWorkspaceFolders::METHOD => {
                 let lsp::DidChangeWorkspaceFoldersParams { event } =
                     serde_json::from_value(notif.params)?;
-                let added = event
-                    .added
-                    .into_iter()
-                    .filter(|folder| is_file_uri(&folder.uri))
-                    .map(|folder| path_from_uri(&folder.uri))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let removed = event
-                    .removed
-                    .into_iter()
-                    .filter(|folder| is_file_uri(&folder.uri))
-                    .map(|uri| path_from_uri(&uri.uri))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let added = workspace_folder_paths(event.added, &self.context)?;
+                let removed = workspace_folder_paths(event.removed, &self.context)?;
                 if !added.is_empty() || !removed.is_empty() {
                     self.state_rev += 1;
                     self.roots_rev += 1;
@@ -1487,18 +1473,8 @@ impl LspServer<'_> {
                 lsp::notification::DidChangeWorkspaceFolders::METHOD => {
                     let lsp::DidChangeWorkspaceFoldersParams { event } =
                         serde_json::from_value(notif.params)?;
-                    let added = event
-                        .added
-                        .into_iter()
-                        .filter(|folder| is_file_uri(&folder.uri))
-                        .map(|folder| path_from_uri(&folder.uri))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let removed = event
-                        .removed
-                        .into_iter()
-                        .filter(|folder| is_file_uri(&folder.uri))
-                        .map(|uri| path_from_uri(&uri.uri))
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let added = workspace_folder_paths(event.added, &self.context)?;
+                    let removed = workspace_folder_paths(event.removed, &self.context)?;
                     if !added.is_empty() || !removed.is_empty() {
                         self.server
                             .change_workspace_folders(added, removed, &self.context)?;
@@ -2471,6 +2447,31 @@ pub(crate) fn path_from_uri(uri: &lsp::Uri) -> anyhow::Result<PathBuf> {
         }
     };
     Ok(path)
+}
+
+/// Resolves workspace folder URIs to paths, skipping folders that do not use the
+/// `file` scheme. Clients may advertise virtual or untitled folders, which have
+/// no filesystem path; ignoring them keeps initialization from aborting.
+fn workspace_folder_paths(
+    folders: impl IntoIterator<Item = lsp::WorkspaceFolder>,
+    context: &LspContext,
+) -> anyhow::Result<Vec<PathBuf>> {
+    folders
+        .into_iter()
+        .filter(|folder| {
+            let is_file = is_file_uri(&folder.uri);
+            if !is_file {
+                context.logger().verbose(|| {
+                    format!(
+                        "Ignoring workspace folder with unsupported URI scheme uri={}",
+                        folder.uri.as_str(),
+                    )
+                });
+            }
+            is_file
+        })
+        .map(|folder| path_from_uri(&folder.uri))
+        .collect()
 }
 
 fn uri_from_path(path: &Path) -> anyhow::Result<lsp::Uri> {
@@ -4432,6 +4433,30 @@ mod tests {
         let uri = lsp::Uri::from_str("file:///some/path/r6").unwrap();
         let path = path_from_uri(&uri).unwrap();
         assert_eq!(path, PathBuf::from("/some/path/r6"));
+    }
+
+    #[test]
+    fn workspace_folder_paths_skip_non_file_schemes() {
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let context = LspContext::new(sender);
+        let folders = vec![
+            lsp::WorkspaceFolder {
+                uri: "file:///C:/workspace".parse().unwrap(),
+                name: "workspace".into(),
+            },
+            lsp::WorkspaceFolder {
+                uri: "untitled:Untitled-1".parse().unwrap(),
+                name: "untitled".into(),
+            },
+            lsp::WorkspaceFolder {
+                uri: "file:///C:/other".parse().unwrap(),
+                name: "other".into(),
+            },
+        ];
+        assert_eq!(
+            workspace_folder_paths(folders, &context).unwrap(),
+            [PathBuf::from("C:/workspace"), PathBuf::from("C:/other")]
+        );
     }
 
     /// A stub whose `hover` and `check` block until released, so tests can drive
