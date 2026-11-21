@@ -173,7 +173,7 @@ impl RedscriptLanguageServer {
 
     fn make_edit_snapshot(&self) -> anyhow::Result<CompilationCache> {
         let sources = ast::SourceMap::new();
-        let mut files: BTreeMap<PathBuf, Arc<str>> = BTreeMap::new();
+        let mut files: BTreeMap<PathBuf, String> = BTreeMap::new();
         self.compilation_cache.with_sources(|active| {
             for (_, file) in active.files() {
                 if self
@@ -181,21 +181,21 @@ impl RedscriptLanguageServer {
                     .borrow_file_ids()
                     .contains_key(file.path())
                 {
-                    let text = self
-                        .overlays
-                        .get(file.path())
-                        .map_or_else(|| Arc::from(file.source()), |overlay| overlay.text.clone());
+                    let text = self.overlays.get(file.path()).map_or_else(
+                        || file.source().to_owned(),
+                        |overlay| overlay.text.to_string(),
+                    );
                     files.insert(file.path().to_owned(), text);
                 }
             }
         });
         for (path, overlay) in &self.overlays {
             if self.resolve_file(path).as_workspace().is_some() {
-                files.insert(path.clone(), overlay.text.clone());
+                files.insert(path.clone(), overlay.text.to_string());
             }
         }
         for (path, text) in files {
-            sources.push_back(path, text.to_string());
+            sources.push_back(path, text);
         }
         CompilationCache::from_sources(
             self.compilation_cache.borrow_cache_bytes().clone(),
@@ -607,8 +607,11 @@ impl RedscriptLanguageServer {
             )
         });
         let path = dialect::identity(loc.doc().path());
-        let mut source_without_member = contents;
-        source_without_member.replace_range(member.clone(), "");
+        let source_without_member = {
+            let mut stripped = contents.clone();
+            stripped.replace_range(member.clone(), "");
+            stripped
+        };
         let other_overlays: BTreeMap<_, _> = self
             .overlays
             .iter()
@@ -630,6 +633,7 @@ impl RedscriptLanguageServer {
         let completions = self.expr_at_with(
             loc.with_pos(member.start as u32),
             Some(member),
+            Some(contents),
             |at| generate_completions(at, dialect),
             ctx,
         )?;
@@ -1276,7 +1280,7 @@ impl RedscriptLanguageServer {
         cb: impl Fn(ExprAt<'_, '_>) -> anyhow::Result<A>,
         ctx: &LspContext,
     ) -> anyhow::Result<A> {
-        self.expr_at_with(loc, None, cb, ctx)
+        self.expr_at_with(loc, None, None, cb, ctx)
     }
 
     #[cfg(test)]
@@ -1292,13 +1296,14 @@ impl RedscriptLanguageServer {
             .get(pos..)
             .and_then(|suffix| suffix.chars().next())
             .map_or(pos, |ch| pos + ch.len_utf8());
-        self.expr_at_with(loc, Some(pos..end), cb, ctx)
+        self.expr_at_with(loc, Some(pos..end), None, cb, ctx)
     }
 
     fn expr_at_with<A>(
         &self,
         loc: CodeLocation<'_>,
         patch: Option<Range<usize>>,
+        source: Option<String>,
         cb: impl Fn(ExprAt<'_, '_>) -> anyhow::Result<A>,
         ctx: &LspContext,
     ) -> anyhow::Result<A> {
@@ -1345,17 +1350,18 @@ impl RedscriptLanguageServer {
         // A query owns its storage; speculative sources never enter the active cache.
         let sources = ast::SourceMap::new();
         if workspace {
+            // Every active file path was canonicalized when it entered the
+            // cache, so skip the current file by id instead of re-resolving it.
+            let skip = base.borrow_file_ids().get(&path).copied();
             base.with_sources(|active| {
-                for (_, file) in active.files() {
-                    if dialect::identity(file.path()) != path
-                        && base.borrow_file_ids().contains_key(file.path())
-                    {
+                for (id, file) in active.files() {
+                    if Some(id) != skip && base.borrow_file_ids().contains_key(file.path()) {
                         sources.push_back(file.path(), file.source());
                     }
                 }
             });
         }
-        let mut contents = loc.doc().buffer().contents().to_string();
+        let mut contents = source.unwrap_or_else(|| loc.doc().buffer().contents().to_string());
         if let Some(range) = patch {
             contents.replace_range(range.clone(), &" ".repeat(range.len()));
             if Dialect::of(&path) == Some(Dialect::Redmod)
@@ -2424,7 +2430,7 @@ mod tests {
                     server.expr_at(loc.clone(), check, &ctx).unwrap();
                     let pos = loc.pos() as usize;
                     server
-                        .expr_at_with(loc, Some(pos..pos), check, &ctx)
+                        .expr_at_with(loc, Some(pos..pos), None, check, &ctx)
                         .unwrap();
                 }
             }
@@ -2442,7 +2448,7 @@ mod tests {
             server.expr_at(loc.clone(), check, &ctx).unwrap();
             let pos = loc.pos() as usize;
             server
-                .expr_at_with(loc, Some(pos..pos), check, &ctx)
+                .expr_at_with(loc, Some(pos..pos), None, check, &ctx)
                 .unwrap();
         }
     }
@@ -2750,6 +2756,7 @@ mod tests {
                 .expr_at_with(
                     query_loc,
                     Some(start..start + ".unfinished".len()),
+                    None,
                     |at| {
                         assert_eq!(at.func().unwrap().locals.len(), 1);
                         assert!(at.func().unwrap().locals[0].name.is_none());
@@ -4645,8 +4652,18 @@ mod tests {
         // A file outside every workspace root is analyzed standalone.
         let external = tempdir();
         let standalone_path = external.path().join("solo.reds");
-        let _buffers = open(&mut server, &ctx, &standalone_path, "public class Solo {}", 1);
-        assert!(server.standalone.contains_key(&dialect::identity(&standalone_path)));
+        let _buffers = open(
+            &mut server,
+            &ctx,
+            &standalone_path,
+            "public class Solo {}",
+            1,
+        );
+        assert!(
+            server
+                .standalone
+                .contains_key(&dialect::identity(&standalone_path))
+        );
         assert_eq!(
             server.workspace_rebuilds, before,
             "a standalone edit must not rebuild the workspace snapshot"
