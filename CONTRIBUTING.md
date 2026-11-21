@@ -26,7 +26,7 @@ Keep `--all-targets` in the Clippy command so test code is linted too.
 ## Working across repositories
 
 All redscript dependencies use the same Git revision pinned in `Cargo.toml`:
-`e1c44e801e46ce076a0b0bad64349313067cb5b3`. Cargo fetches that revision for local
+`ab77364`. Cargo fetches that revision for local
 builds and CI; no sibling checkout or `REDSCRIPT_REF` repository variable is needed.
 Transitive AST/compiler packages come from the same Git workspace, and
 `Cargo.lock` records the resulting graph.

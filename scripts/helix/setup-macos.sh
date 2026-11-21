@@ -97,7 +97,7 @@ fi
 if [ -f "$0" ] && [ -f "$(dirname -- "$0")/languages.toml" ]; then
     cat "$(dirname -- "$0")/languages.toml" > "$work/languages.toml"
 else
-    curl -fsSL https://raw.githubusercontent.com/jac3km4/redscript-ide/0.2.x/scripts/helix/languages.toml > "$work/languages.toml"
+    curl -fsSL https://raw.githubusercontent.com/jac3km4/redscript-ide/main/scripts/helix/languages.toml > "$work/languages.toml"
 fi
 mkdir -p "$config_dir/bin"
 config_dir=$(CDPATH= cd -- "$config_dir" && pwd)

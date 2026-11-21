@@ -48,7 +48,7 @@ use the same `source_roots` configuration.
 REDmod support is partial, not a replacement for the official compiler:
 
 - Diagnostics, hover, go-to-definition, workspace symbols, and member completion
-  work for the [supported language subset](https://github.com/jac3km4/redscript/blob/e1c44e801e46ce076a0b0bad64349313067cb5b3/crates/compiler/redmod/adapter/README.md).
+  work for the [supported language subset](https://github.com/jac3km4/redscript/blob/ab77364/crates/compiler/redmod/adapter/README.md).
 - Array completions include operations such as `Size`, `PushBack`, and `Last`.
   Completion tolerates a missing semicolon in the current statement; other syntax
   or unsupported-feature errors can prevent semantic features from working.
@@ -161,12 +161,12 @@ and refresh the workspace. Analysis can be slow in large workspaces.
 
      **Windows ([PowerShell script](scripts/helix/setup-windows.ps1)):**
      ```powershell
-     Invoke-RestMethod https://raw.githubusercontent.com/jac3km4/redscript-ide/0.2.x/scripts/helix/setup-windows.ps1 | Invoke-Expression
+     Invoke-RestMethod https://raw.githubusercontent.com/jac3km4/redscript-ide/main/scripts/helix/setup-windows.ps1 | Invoke-Expression
      ```
 
      **macOS ([shell script](scripts/helix/setup-macos.sh)):**
      ```sh
-     curl -fsSL https://raw.githubusercontent.com/jac3km4/redscript-ide/0.2.x/scripts/helix/setup-macos.sh | sh
+     curl -fsSL https://raw.githubusercontent.com/jac3km4/redscript-ide/main/scripts/helix/setup-macos.sh | sh
      ```
 
      The scripts build the pinned [REDscript](https://github.com/jac3km4/tree-sitter-reds)

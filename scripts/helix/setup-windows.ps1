@@ -96,7 +96,7 @@ try {
     if ($PSScriptRoot) {
         $languages = Get-Content -Raw (Join-Path $PSScriptRoot 'languages.toml')
     } else {
-        $languages = (Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/jac3km4/redscript-ide/0.2.x/scripts/helix/languages.toml').Content
+        $languages = (Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/jac3km4/redscript-ide/main/scripts/helix/languages.toml').Content
     }
     Write-Host 'Downloading the latest redscript-ide release from GitHub...'
     Invoke-WebRequest -UseBasicParsing 'https://github.com/jac3km4/redscript-ide/releases/latest/download/redscript-ide.exe' -OutFile "$work\redscript-ide.exe"
