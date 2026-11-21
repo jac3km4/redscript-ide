@@ -234,6 +234,15 @@ impl CompilationCache {
 }
 
 impl CompilationCache {
+    /// Test-only: whether this snapshot's analysis has already been forced. Used
+    /// to assert that an unchanged snapshot is reused rather than rebuilt.
+    #[cfg(test)]
+    pub(crate) fn analysis_is_forced(&self) -> bool {
+        self.with(|cache| LazyLock::get(cache.analysis).is_some())
+    }
+}
+
+impl CompilationCache {
     pub(crate) fn analyze<A>(
         &self,
         mut cb: impl for<'ctx> FnMut(

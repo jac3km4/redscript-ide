@@ -123,6 +123,14 @@ fn overlays_match(
         })
 }
 
+/// Whether a standalone `CompilationCache` was built from exactly `text` at
+/// `path`, so its already-forced analysis can be reused as-is.
+fn standalone_matches(cache: &CompilationCache, path: &Path, text: &str) -> bool {
+    cache.borrow_file_ids().get(path).is_some_and(|&id| {
+        cache.with_sources(|sources| sources.get(id).is_some_and(|file| file.source() == text))
+    })
+}
+
 impl RedscriptLanguageServer {
     pub fn new(
         cache_path: &Path,
@@ -393,7 +401,6 @@ impl RedscriptLanguageServer {
         }
 
         if standalone_dirty {
-            standalone_reads.clear();
             ctx.logger()
                 .verbose(|| "Rebuild phase=standalone analysis".to_owned());
             let paths: HashSet<_> = self
@@ -404,7 +411,11 @@ impl RedscriptLanguageServer {
                 .filter(|path| self.resolve_file(path).as_workspace().is_none())
                 .cloned()
                 .collect();
-            let mut standalone = HashMap::new();
+            // Take the previous caches so an unchanged standalone file keeps its
+            // already-analyzed snapshot instead of re-interning the base-game
+            // symbols into a fresh snapshot.
+            let mut reusable = std::mem::take(&mut self.standalone);
+            let mut standalone = HashMap::with_capacity(paths.len());
             let mut active_standalone_paths = HashSet::new();
             for path in paths {
                 let text = self
@@ -415,6 +426,14 @@ impl RedscriptLanguageServer {
                 match text {
                     Ok(text) => {
                         active_standalone_paths.insert(path.clone());
+                        // A successful read supersedes any prior read error.
+                        standalone_reads.remove(&path);
+                        if let Some(cache) = reusable.remove(&path)
+                            && standalone_matches(&cache, &path, &text)
+                        {
+                            standalone.insert(path, cache);
+                            continue;
+                        }
                         let sources = ast::SourceMap::new();
                         sources.push_back(&path, text.to_string());
                         standalone.insert(
@@ -438,6 +457,8 @@ impl RedscriptLanguageServer {
                     }
                 }
             }
+            // Drop read errors for paths that are no longer active.
+            standalone_reads.retain(|path, _| active_standalone_paths.contains(path));
             self.standalone = standalone;
             self.standalone_paths = active_standalone_paths;
         }
@@ -4808,6 +4829,48 @@ mod tests {
         // Editing the workspace file still rebuilds the workspace.
         let _buffers = open(&mut server, &ctx, &workspace_path, "public class Ws2 {}", 2);
         assert_eq!(server.workspace_rebuilds, before + 1);
+    }
+
+    #[test]
+    fn standalone_caches_are_reused_across_reloads_and_edits() {
+        let (_temp, mut server, ctx, _receiver) = fixture();
+        let external = tempdir();
+        let first = external.path().join("first.reds");
+        let second = external.path().join("second.reds");
+        let _buffers = open(&mut server, &ctx, &first, "public class First {}", 1);
+        let _buffers = open(&mut server, &ctx, &second, "public class Second {}", 1);
+        // Force both snapshots so reuse can be observed without re-analysis.
+        server.collect_diagnostic_batch(&ctx, || false).unwrap();
+
+        let forced = |server: &RedscriptLanguageServer, path: &Path| {
+            server
+                .standalone
+                .get(&dialect::identity(path))
+                .expect("standalone cache present")
+                .analysis_is_forced()
+        };
+        assert!(forced(&server, &first));
+        assert!(forced(&server, &second));
+
+        // A reload, as every save triggers, must reuse untouched standalone
+        // caches instead of re-interning the base-game symbols.
+        server.rebuild_scoped(&ctx, true, true, true).unwrap();
+        assert!(
+            forced(&server, &first),
+            "unchanged standalone cache was discarded on reload"
+        );
+        assert!(forced(&server, &second));
+
+        // Editing one standalone file rebuilds only that file's cache.
+        let _buffers = open(&mut server, &ctx, &first, "public class First2 {}", 2);
+        assert!(
+            !forced(&server, &first),
+            "edited standalone cache must be rebuilt"
+        );
+        assert!(
+            forced(&server, &second),
+            "untouched standalone cache was discarded on edit"
+        );
     }
 
     #[test]
