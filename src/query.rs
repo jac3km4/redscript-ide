@@ -5,6 +5,7 @@ use std::fmt::Display;
 use redscript_compiler_api::ast::{SourceMap, Span};
 use redscript_compiler_api::types::{Type, TypeApp};
 use redscript_compiler_api::{FunctionType, LoweredFunction, PolyType, Symbols, TypeId, ir};
+use redscript_compiler_frontend::utils::ScopedMap;
 
 use crate::display::ExprAtDisplay;
 
@@ -313,7 +314,7 @@ pub fn specialize_function_type<'ctx>(
 fn specialize_function_type_with_env<'ctx>(
     func_type: &FunctionType<'ctx>,
     call_type_args: &[Type<'ctx>],
-    declaring_env: &[(&'ctx str, PolyType<'ctx>)],
+    declaring_env: &ReceiverEnv<'ctx>,
     symbols: &Symbols<'ctx>,
 ) -> Option<SpecializedFunctionType<'ctx>> {
     // A non-generic declaration at a call site without explicit type arguments
@@ -356,7 +357,7 @@ fn specialize_function_type_with_env<'ctx>(
 }
 
 /// Receiver arguments for one declaring type, keyed by parameter name.
-type ReceiverEnv<'ctx> = Vec<(&'ctx str, PolyType<'ctx>)>;
+type ReceiverEnv<'ctx> = ScopedMap<'ctx, &'ctx str, PolyType<'ctx>>;
 
 /// Memoizes receiver environments for one receiver type.
 ///
@@ -378,12 +379,19 @@ impl<'ctx, 'a> ReceiverTypeEnvs<'ctx, 'a> {
         }
     }
 
-    fn env(&self, declaring_type: TypeId<'ctx>) -> Option<ReceiverEnv<'ctx>> {
-        self.envs
-            .borrow_mut()
+    /// Resolves and memoizes the environment for `declaring_type`, then invokes
+    /// `f` with a borrow of it. Borrowing rather than cloning keeps enumerating
+    /// a receiver's members allocation free.
+    fn with_env<A>(
+        &self,
+        declaring_type: TypeId<'ctx>,
+        f: impl FnOnce(&ReceiverEnv<'ctx>) -> A,
+    ) -> Option<A> {
+        let mut envs = self.envs.borrow_mut();
+        let env = envs
             .entry(declaring_type)
-            .or_insert_with(|| receiver_type_env(self.receiver, declaring_type, self.symbols))
-            .clone()
+            .or_insert_with(|| receiver_type_env(self.receiver, declaring_type, self.symbols));
+        env.as_ref().map(f)
     }
 
     /// Instantiate a method declaration at the cached receiver.
@@ -393,12 +401,9 @@ impl<'ctx, 'a> ReceiverTypeEnvs<'ctx, 'a> {
         func_type: &FunctionType<'ctx>,
         call_type_args: &[Type<'ctx>],
     ) -> Option<SpecializedFunctionType<'ctx>> {
-        specialize_function_type_with_env(
-            func_type,
-            call_type_args,
-            &self.env(declaring_type)?,
-            self.symbols,
-        )
+        self.with_env(declaring_type, |env| {
+            specialize_function_type_with_env(func_type, call_type_args, env, self.symbols)
+        })?
     }
 
     /// Instantiate a field declaration at the cached receiver.
@@ -407,13 +412,14 @@ impl<'ctx, 'a> ReceiverTypeEnvs<'ctx, 'a> {
         declaring_type: TypeId<'ctx>,
         field_type: &Type<'ctx>,
     ) -> Option<Type<'ctx>> {
-        let env = self.env(declaring_type)?;
-        // A non-generic declaring type contributes nothing; the declared field
-        // type is already concrete.
-        if env.is_empty() {
-            return None;
-        }
-        substitute(field_type, &env, self.symbols)
+        self.with_env(declaring_type, |env| {
+            // A non-generic declaring type contributes nothing; the declared
+            // field type is already concrete.
+            if env.is_empty() {
+                return None;
+            }
+            substitute(field_type, env, self.symbols)
+        })?
     }
 }
 
@@ -429,7 +435,7 @@ fn receiver_type_env<'ctx>(
     // there is nothing to map onto its members. This is the overwhelmingly
     // common case and it avoids walking the receiver's base chain per member.
     if declaring.vars().next().is_none() {
-        return Some(Vec::new());
+        return Some(ReceiverEnv::default());
     }
     let mut current = receiver.clone();
     for _ in 0..MAX_BASE_DEPTH {
@@ -443,11 +449,11 @@ fn receiver_type_env<'ctx>(
             );
         }
         let base = def.schema().as_aggregate()?.base()?;
-        let env = def
+        let env: ReceiverEnv<'ctx> = def
             .vars()
             .zip(current.args().iter())
             .map(|(name, arg)| (name, PolyType::from_type(arg)))
-            .collect::<Vec<_>>();
+            .collect();
         let args = base
             .args()
             .iter()
@@ -462,11 +468,10 @@ fn receiver_type_env<'ctx>(
 /// result to a concrete type.
 fn substitute<'ctx>(
     typ: &Type<'ctx>,
-    env: &[(&'ctx str, PolyType<'ctx>)],
+    env: &ReceiverEnv<'ctx>,
     symbols: &Symbols<'ctx>,
 ) -> Option<Type<'ctx>> {
-    let scoped = env.iter().map(|(name, poly)| (*name, poly.clone()));
-    PolyType::from_type_with_env(typ, &scoped.collect())
+    PolyType::from_type_with_env(typ, env)
         .ok()?
         .coalesce(symbols)
         .ok()

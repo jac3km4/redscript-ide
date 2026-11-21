@@ -65,12 +65,12 @@ redscript-redmod-adapter.workspace = true
 redscript-community-formatter.workspace = true
 redscript-community-parser.workspace = true
 redscript-compiler-api.workspace = true
+redscript-compiler-frontend.workspace = true
 redscript-dotfile.workspace = true
 redscript-code-edit.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-redscript-compiler-frontend.workspace = true
 
 [patch.crates-io]
 stable_deref_trait = { git = "https://github.com/Storyyeller/stable_deref_trait", rev = "59a35e0a40041133c6b8744f2b62f922e7d18d5b" }
