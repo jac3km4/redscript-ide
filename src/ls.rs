@@ -24,7 +24,7 @@ use crate::query::ExprAt;
 use crate::server::{CodeLocation, Document, LanguageServer, LspContext};
 use crate::workspace::{
     FileResolution, LoadedWorkspace, Overlay, WorkspaceDir, collect_workspace_sources,
-    record_source_read_error,
+    content_hash, record_source_read_error,
 };
 
 #[path = "document_symbols.rs"]
@@ -798,6 +798,7 @@ impl RedscriptLanguageServer {
 
         let mut actions = Vec::new();
         let mut fix_all_kinds = Vec::new();
+        let mut fix_hashes = HashMap::new();
         for (&(start, end), slot_fixes) in
             fixes.get(&path).into_iter().flat_map(|fixes| fixes.iter())
         {
@@ -812,7 +813,7 @@ impl RedscriptLanguageServer {
                 continue;
             }
             for fix in slot_fixes {
-                if !self.valid_fix(fix) {
+                if !self.valid_fix_cached(fix, &mut fix_hashes) {
                     continue;
                 }
                 let matched_diagnostics = fix.matching_diagnostics(&context.diagnostics);
@@ -903,9 +904,11 @@ impl RedscriptLanguageServer {
                         }
                     }
                 }
+                let mut file_hashes = HashMap::new();
                 for fix in selected
                     .into_iter()
-                    .filter(|f| f.kind == kind && self.valid_fix(f))
+                    .filter(|f| f.kind == kind)
+                    .filter(|f| self.valid_fix_cached(f, &mut file_hashes))
                 {
                     if unique.insert((fix.uri.clone(), fix.edit.range)) {
                         edits
@@ -981,6 +984,13 @@ impl RedscriptLanguageServer {
     }
 
     fn valid_fix(&self, fix: &Fix) -> bool {
+        let mut hashes = HashMap::new();
+        self.valid_fix_cached(fix, &mut hashes)
+    }
+
+    /// Like [`valid_fix`], but memoizes the on-disk content hash per path so a
+    /// fix-all over many fixes in the same unchanged file reads it once.
+    fn valid_fix_cached(&self, fix: &Fix, hashes: &mut HashMap<PathBuf, Option<u64>>) -> bool {
         let Ok(path) = crate::server::path_from_uri(&fix.uri) else {
             return false;
         };
@@ -989,10 +999,12 @@ impl RedscriptLanguageServer {
         }
         let path = dialect::identity(&path);
         if let Some(overlay) = self.overlays.get(&path) {
-            overlay.text.as_ref() == fix.expected_source
-        } else {
-            fs::read_to_string(&path).is_ok_and(|text| text == fix.expected_source)
+            return content_hash(overlay.text.as_bytes()) == fix.expected_source_hash;
         }
+        let hash = *hashes
+            .entry(path.clone())
+            .or_insert_with(|| fs::read(&path).ok().map(|bytes| content_hash(&bytes)));
+        hash == Some(fix.expected_source_hash)
     }
 
     pub fn log_missing_roots(&mut self, ctx: &LspContext) {
@@ -3717,7 +3729,7 @@ mod tests {
             diagnostic_code: None,
             uri: ctx.uri(&path).unwrap(),
             edit: lsp::TextEdit::new(lsp::Range::default(), "public ".into()),
-            expected_source: "class Native {}".into(),
+            expected_source_hash: content_hash(b"class Native {}"),
         };
         assert!(!server.valid_fix(&fix));
         let community = temp.path().join("test.reds");
@@ -3729,9 +3741,9 @@ mod tests {
             1,
         );
         fix.uri = ctx.uri(&community).unwrap();
-        fix.expected_source = "public class Community {}".into();
+        fix.expected_source_hash = content_hash(b"public class Community {}");
         assert!(server.valid_fix(&fix));
-        fix.expected_source.clear();
+        fix.expected_source_hash = content_hash(b"");
         assert!(!server.valid_fix(&fix));
         let action = lsp::CodeAction {
             title: "stale".into(),
@@ -3753,7 +3765,7 @@ mod tests {
             diagnostic_code: None,
             uri: ctx.uri(&path).unwrap(),
             edit: lsp::TextEdit::new(lsp::Range::default(), "public ".into()),
-            expected_source: "class Native {}".into(),
+            expected_source_hash: content_hash(b"class Native {}"),
         };
         server
             .cached_fixes
@@ -3785,7 +3797,7 @@ mod tests {
             diagnostic_code: Some("INACCESSIBLE_FIELD".into()),
             uri: "file:///C:/scripts/test.reds".parse().unwrap(),
             edit: lsp::TextEdit::new(lsp::Range::default(), String::new()),
-            expected_source: String::new(),
+            expected_source_hash: content_hash(b""),
         };
         let coded = |code: &str| lsp::Diagnostic {
             code: Some(lsp::NumberOrString::String(code.into())),
@@ -4141,10 +4153,10 @@ mod tests {
                         diagnostic_code: None,
                         uri: uri.clone(),
                         edit: lsp::TextEdit::new(lsp::Range::default(), format!("fix {start}")),
-                        expected_source: if start == 12 {
-                            "stale".into()
+                        expected_source_hash: if start == 12 {
+                            content_hash(b"stale")
                         } else {
-                            text.into()
+                            content_hash(text.as_bytes())
                         },
                     }],
                 )
@@ -4344,7 +4356,7 @@ mod tests {
                         diagnostic_range: None,
                         diagnostic_code: None,
                         uri: uri.clone(),
-                        expected_source: String::new(),
+                        expected_source_hash: content_hash(b""),
                         edit: lsp::TextEdit::new(
                             lsp::Range::new(
                                 lsp::Position::new(0, start),
@@ -4416,7 +4428,7 @@ mod tests {
             diagnostic_code: None,
             uri,
             edit: lsp::TextEdit::new(lsp::Range::default(), "public ".into()),
-            expected_source: expected_source.into(),
+            expected_source_hash: content_hash(expected_source.as_bytes()),
         }
     }
 

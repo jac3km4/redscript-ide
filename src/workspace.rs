@@ -233,6 +233,19 @@ pub(crate) fn record_source_read_error(
     );
 }
 
+/// A fast, non-cryptographic 64-bit hash of source text.
+///
+/// Cached quick fixes compare against this instead of retaining a full copy of
+/// the file contents, keeping both memory and `codeAction` payloads small.
+pub(crate) fn content_hash(bytes: &[u8]) -> u64 {
+    // FNV-1a, 64-bit.
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes.iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
+}
+
 pub(crate) fn config_diagnostic(range: lsp::Range, message: String) -> lsp::Diagnostic {
     lsp::Diagnostic {
         range,

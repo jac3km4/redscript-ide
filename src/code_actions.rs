@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::diagnostics::range;
 use crate::dialect::Dialect;
 use crate::server::LspContext;
+use crate::workspace::content_hash;
 
 pub(crate) type FixMap = HashMap<PathBuf, BTreeMap<(u32, u32), Vec<Fix>>>;
 
@@ -52,7 +53,7 @@ pub(crate) fn generate_fix<'ctx>(
         diagnostic_code: Some(diag.code().into()),
         uri: ctx.uri(file.path()).ok()?,
         edit: lsp::TextEdit::new(edit_range, edit.content.to_string()),
-        expected_source: file.source().to_owned(),
+        expected_source_hash: content_hash(file.source().as_bytes()),
     })
 }
 
@@ -173,7 +174,7 @@ fn generate_ide_fix<'ctx>(
         diagnostic_code: Some(diag.code().into()),
         uri: ctx.uri(diag_file.path()).ok()?,
         edit: lsp::TextEdit::new(edit_range, replacement),
-        expected_source: source.to_owned(),
+        expected_source_hash: content_hash(source.as_bytes()),
     })
 }
 
@@ -208,7 +209,9 @@ pub(crate) struct Fix {
     pub(crate) diagnostic_code: Option<String>,
     pub(crate) uri: lsp::Uri,
     pub(crate) edit: lsp::TextEdit,
-    pub(crate) expected_source: String,
+    /// Hash of the source the fix was computed against, used to reject stale
+    /// fixes without retaining a copy of the whole file.
+    pub(crate) expected_source_hash: u64,
 }
 
 impl Fix {
