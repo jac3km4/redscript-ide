@@ -744,7 +744,8 @@ impl LspServer<'_> {
             }
             lsp::notification::DidSaveTextDocument::METHOD => {
                 let lsp::DidSaveTextDocumentParams {
-                    text_document: doc, ..
+                    text_document: doc,
+                    text,
                 } = serde_json::from_value(notif.params)?;
                 if !is_file_uri(&doc.uri) {
                     self.context.logger().verbose(|| {
@@ -758,6 +759,40 @@ impl LspServer<'_> {
                 // Resolve the path before advancing revisions so a malformed
                 // URI cannot request a check that is never queued.
                 let path = path_from_uri(&doc.uri)?;
+                // A save makes the on-disk content authoritative. Reload a
+                // buffer left desynced by a rejected change so diagnostics and
+                // queries stop using stale text.
+                if self.buffers.is_desynced(&doc.uri) {
+                    let reloaded = match text {
+                        Some(text) => Ok(text),
+                        None => std::fs::read_to_string(&path),
+                    };
+                    let documents = match reloaded {
+                        Ok(text) => {
+                            self.buffers.replace(&doc.uri, text);
+                            self.context.logger().verbose(|| {
+                                format!(
+                                    "Document save resynchronized uri={} version={:?}",
+                                    doc.uri.as_str(),
+                                    self.buffers.get(&doc.uri).and_then(Buffer::version),
+                                )
+                            });
+                            vec![(path.clone(), self.buffers.get(&doc.uri).cloned())]
+                        }
+                        Err(error) => {
+                            self.context.logger().warn(format!(
+                                "Could not reload desynced document from disk uri={} ({error}); dropping the buffer",
+                                doc.uri.as_str(),
+                            ));
+                            self.buffers.remove(&doc.uri);
+                            vec![(path.clone(), None)]
+                        }
+                    };
+                    self.state_rev += 1;
+                    self.latest_state_rev
+                        .store(self.state_rev, Ordering::Release);
+                    cmd_tx.send(WorkerCmd::DocumentsChanged { documents }).ok();
+                }
                 let version = self.buffers.get(&doc.uri).and_then(Buffer::version);
                 self.diag_rev += 1;
                 self.latest_diag_rev.store(self.diag_rev, Ordering::Release);
@@ -5270,6 +5305,109 @@ mod tests {
             }
         };
         assert!(!published.diagnostics.is_empty(), "{published:?}");
+
+        queue_shutdown(&client);
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn save_resynchronizes_a_desynced_buffer() {
+        use redscript_compiler_api::ScriptBundle;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache.bin");
+        std::fs::write(
+            &cache,
+            ScriptBundle::default().into_writeable().to_bytes().unwrap(),
+        )
+        .unwrap();
+        // A standalone file: it is not part of the (empty) startup workspace, so
+        // the only diagnostics publication comes from the save-triggered check.
+        let external = tempfile::tempdir().unwrap();
+        let path = external.path().join("solo.reds");
+        std::fs::write(&path, "public class Solo {").unwrap();
+        let uri = uri_from_path(&path).unwrap();
+
+        let real = crate::ls::RedscriptLanguageServer::new(&cache, [temp.path()]).unwrap();
+        let (mut server, client) = LspServer::for_test(Box::new(real), Buffers::default(), false);
+        let handle = std::thread::spawn(move || server.run());
+
+        let notify = |method: &str, params: Value| {
+            client
+                .sender
+                .send(Message::Notification(lsp_server::Notification::new(
+                    method.into(),
+                    params,
+                )))
+                .unwrap();
+        };
+        let wait_for_diagnostics = || -> lsp::PublishDiagnosticsParams {
+            loop {
+                match client
+                    .receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                {
+                    Message::Notification(notification)
+                        if notification.method == lsp::notification::PublishDiagnostics::METHOD =>
+                    {
+                        let params: lsp::PublishDiagnosticsParams =
+                            serde_json::from_value(notification.params).unwrap();
+                        if params.uri == uri {
+                            return params;
+                        }
+                    }
+                    Message::Notification(_) => {}
+                    message => panic!("expected diagnostics, got {message:?}"),
+                }
+            }
+        };
+
+        notify(
+            lsp::notification::DidOpenTextDocument::METHOD,
+            json!({
+                "textDocument": {
+                    "uri": uri.as_str(),
+                    "languageId": "redscript",
+                    "version": 1,
+                    "text": "public class Solo {",
+                }
+            }),
+        );
+        // Save the broken contents so the client has a diagnostic to clear.
+        notify(
+            lsp::notification::DidSaveTextDocument::METHOD,
+            json!({ "textDocument": { "uri": uri.as_str() } }),
+        );
+        assert!(!wait_for_diagnostics().diagnostics.is_empty());
+
+        // Reject an out-of-range incremental change: the buffer becomes desynced
+        // while its stale (syntactically broken) contents stay active.
+        notify(
+            lsp::notification::DidChangeTextDocument::METHOD,
+            json!({
+                "textDocument": { "uri": uri.as_str(), "version": 2 },
+                "contentChanges": [{
+                    "range": {
+                        "start": {"line": 99, "character": 0},
+                        "end": {"line": 99, "character": 1}
+                    },
+                    "text": "x"
+                }]
+            }),
+        );
+
+        // The user fixes the file on disk and saves; the desynced buffer must be
+        // reloaded so the stale error is cleared.
+        std::fs::write(&path, "public class Solo {}").unwrap();
+        notify(
+            lsp::notification::DidSaveTextDocument::METHOD,
+            json!({ "textDocument": { "uri": uri.as_str() } }),
+        );
+        assert!(
+            wait_for_diagnostics().diagnostics.is_empty(),
+            "save must resynchronize the buffer from disk"
+        );
 
         queue_shutdown(&client);
         handle.join().unwrap().unwrap();

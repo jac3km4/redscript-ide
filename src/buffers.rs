@@ -26,6 +26,21 @@ impl Buffers {
         self.map.insert(url, buffer);
     }
 
+    /// Whether `url`'s buffer is out of sync with the client after a rejected
+    /// incremental change, so a later save must reload it from disk.
+    pub fn is_desynced(&self, url: &lsp::Uri) -> bool {
+        self.map.get(url).is_some_and(|buffer| buffer.desynced)
+    }
+
+    /// Replaces `url`'s contents with `content`, clearing any desync while
+    /// preserving the tracked version.
+    pub fn replace(&mut self, url: &lsp::Uri, content: String) {
+        if let Some(buffer) = self.map.get_mut(url) {
+            buffer.contents = Rope::from_str(&content);
+            buffer.desynced = false;
+        }
+    }
+
     #[cfg(test)]
     pub fn change(
         &mut self,
@@ -54,10 +69,12 @@ impl Buffers {
         for change in changes {
             if let Some(range) = change.range {
                 if !staged.update_range(range, change.text) {
+                    buffer.desynced = true;
                     return Err(ChangeError::InvalidRange(range));
                 }
             } else {
                 staged.contents = Rope::from_str(&change.text);
+                staged.desynced = false;
             }
         }
         staged.version = Some(version);
@@ -74,6 +91,9 @@ impl Buffers {
 pub struct Buffer {
     contents: Rope,
     version: Option<i32>,
+    /// Set when an incremental change was rejected, so the buffer may no longer
+    /// match the client's view and must be reloaded before it is trusted again.
+    desynced: bool,
 }
 
 impl Buffer {
@@ -81,6 +101,7 @@ impl Buffer {
         Self {
             contents: Rope::from_str(&contents),
             version: None,
+            desynced: false,
         }
     }
 
@@ -190,5 +211,60 @@ mod tests {
             assert_eq!(buffer.contents().to_string(), "hello world");
             assert_eq!(buffer.version(), Some(1));
         }
+    }
+
+    #[test]
+    fn desync_flag_is_set_on_invalid_range_and_cleared_on_resync() {
+        let uri: lsp::Uri = "file:///test.reds".parse().unwrap();
+        let mut buffers = Buffers::default();
+        buffers.open(uri.clone(), "hello world".into(), 1);
+        let bad = lsp::Range::new(lsp::Position::new(9, 0), lsp::Position::new(9, 1));
+        assert_eq!(
+            buffers.try_change(
+                &uri,
+                2,
+                vec![lsp::TextDocumentContentChangeEvent {
+                    range: Some(bad),
+                    range_length: None,
+                    text: "x".into(),
+                }],
+            ),
+            Err(ChangeError::InvalidRange(bad)),
+        );
+        assert!(buffers.is_desynced(&uri));
+
+        // A full-document change resynchronizes the buffer.
+        assert!(buffers.change(
+            &uri,
+            3,
+            vec![lsp::TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "synced".into(),
+            }],
+        ));
+        assert!(!buffers.is_desynced(&uri));
+        assert_eq!(buffers.get(&uri).unwrap().contents().to_string(), "synced");
+
+        // An explicit replacement (used by the save-time resync) also clears the
+        // flag and preserves the tracked version.
+        assert_eq!(
+            buffers.try_change(
+                &uri,
+                4,
+                vec![lsp::TextDocumentContentChangeEvent {
+                    range: Some(bad),
+                    range_length: None,
+                    text: "x".into(),
+                }],
+            ),
+            Err(ChangeError::InvalidRange(bad)),
+        );
+        assert!(buffers.is_desynced(&uri));
+        buffers.replace(&uri, "from disk".into());
+        assert!(!buffers.is_desynced(&uri));
+        let buffer = buffers.get(&uri).unwrap();
+        assert_eq!(buffer.contents().to_string(), "from disk");
+        assert_eq!(buffer.version(), Some(3));
     }
 }
