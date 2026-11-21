@@ -10,7 +10,7 @@ use lsp_types as lsp;
 use redscript_community_formatter::{FormatSettings, format_document};
 use redscript_compiler_api::ast::Span;
 use redscript_compiler_api::{
-    Diagnostic, LoweredCompilationUnit, Symbols, TypeInterner, TypeSchema, ast,
+    Diagnostic, LoweredCompilationUnit, Symbols, TypeId, TypeInterner, TypeSchema, ast,
 };
 
 use crate::analysis::{AnalysisMode, CacheBytes, CompilationCache};
@@ -703,21 +703,23 @@ impl RedscriptLanguageServer {
                     TypeSchema::Enum(_) => lsp::SymbolKind::ENUM,
                     TypeSchema::Primitive => continue,
                 };
-                let mut push = |name: &str, kind, span: Option<Span>, container_name| {
-                    if name.contains(query)
-                        && let Some(location) = span.and_then(|span| location(span, sources, ctx))
-                    {
-                        #[allow(deprecated)]
-                        results.push(lsp::SymbolInformation {
-                            name: name.to_owned(),
-                            kind,
-                            tags: None,
-                            deprecated: None,
-                            location,
-                            container_name,
-                        });
-                    }
-                };
+                let mut push =
+                    |name: &str, kind, span: Option<Span>, container: Option<TypeId<'_>>| {
+                        if name.contains(query)
+                            && let Some(location) =
+                                span.and_then(|span| location(span, sources, ctx))
+                        {
+                            #[allow(deprecated)]
+                            results.push(lsp::SymbolInformation {
+                                name: name.to_owned(),
+                                kind,
+                                tags: None,
+                                deprecated: None,
+                                location,
+                                container_name: container.map(|id| id.to_string()),
+                            });
+                        }
+                    };
                 push(&id.as_str(), kind, def.span(), None);
                 if let TypeSchema::Aggregate(agg) = def.schema() {
                     for method in agg.methods().iter() {
@@ -725,7 +727,7 @@ impl RedscriptLanguageServer {
                             method.name(),
                             lsp::SymbolKind::METHOD,
                             method.func().span(),
-                            Some(id.to_string()),
+                            Some(id),
                         );
                     }
                     for field in agg.fields().iter() {
@@ -733,7 +735,7 @@ impl RedscriptLanguageServer {
                             field.name(),
                             lsp::SymbolKind::FIELD,
                             field.field().span(),
-                            Some(id.to_string()),
+                            Some(id),
                         );
                     }
                 }
