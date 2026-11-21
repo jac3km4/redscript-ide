@@ -115,7 +115,9 @@ impl RedscriptLanguageServer {
         workspace_folders: impl IntoIterator<Item = impl Into<PathBuf>>,
     ) -> anyhow::Result<Self> {
         let cache_bytes = fs::read(cache_path)?;
-        Self::from_bytes(cache_bytes.into(), workspace_folders)
+        // A user-supplied cache must be validated so `main` can fall back to the
+        // embedded cache when it is corrupt.
+        Self::from_bytes(cache_bytes.into(), workspace_folders, true)
     }
 
     pub fn embedded(
@@ -123,12 +125,15 @@ impl RedscriptLanguageServer {
     ) -> anyhow::Result<Self> {
         let cache_bytes = miniz_oxide::inflate::decompress_to_vec_zlib(EMBEDDED_CACHE)
             .map_err(|err| anyhow::anyhow!("failed to decompress embedded cache: {err:?}"))?;
-        Self::from_bytes(cache_bytes.into(), workspace_folders)
+        // The compiled-in cache is trusted and its zlib stream is already
+        // checksummed, so skip the redundant eager decode.
+        Self::from_bytes(cache_bytes.into(), workspace_folders, false)
     }
 
     fn from_bytes(
         cache_bytes: CacheBytes,
         workspace_folders: impl IntoIterator<Item = impl Into<PathBuf>>,
+        validate: bool,
     ) -> anyhow::Result<Self> {
         let mut workspaces = HashMap::new();
         let mut config_diagnostics = BTreeMap::new();
@@ -158,10 +163,12 @@ impl RedscriptLanguageServer {
         let mut diagnostics = DiagnosticTracker::default();
         diagnostics.set_reads(read_diagnostics);
         diagnostics.set_configs(config_diagnostics);
-        // Loading the deferred snapshot now checks the configured cache once, so
-        // a corrupt file is reported at startup (and `main` can fall back to the
-        // embedded cache) instead of on the first analysis.
-        CompilationCache::validate_cache_bytes(&cache_bytes)?;
+        // Validate a configured cache once, so a corrupt file is reported at
+        // startup (and `main` can fall back to the embedded cache) instead of on
+        // the first analysis. The trusted embedded cache skips this decode.
+        if validate {
+            CompilationCache::validate_cache_bytes(&cache_bytes)?;
+        }
         Ok(Self {
             compilation_cache: CompilationCache::from_sources(
                 cache_bytes,
@@ -4807,6 +4814,16 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn only_configured_caches_are_validated_eagerly() {
+        let dir = tempdir();
+        // Corrupt bytes are accepted without validation (analysis is deferred)
+        // but rejected when eager validation is requested.
+        let corrupt: CacheBytes = vec![0, 1, 2, 3].into();
+        assert!(RedscriptLanguageServer::from_bytes(corrupt.clone(), [dir.path()], false).is_ok());
+        assert!(RedscriptLanguageServer::from_bytes(corrupt, [dir.path()], true).is_err());
     }
 
     #[test]
