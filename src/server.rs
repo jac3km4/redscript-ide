@@ -1802,7 +1802,25 @@ fn worker_main<'a>(
                         }
                     }
                 }
-                let borrowed: Vec<(PathBuf, Option<&Buffer>)> = documents
+                // Keep only the newest buffer for each path: a burst of edits to
+                // one document would otherwise re-apply the same overlay for
+                // every queued command before the single rebuild.
+                let mut latest: HashMap<PathBuf, usize> = HashMap::new();
+                let mut deduped: Vec<(PathBuf, Option<Buffer>)> =
+                    Vec::with_capacity(documents.len());
+                for (path, buffer) in documents {
+                    match latest.entry(path) {
+                        std::collections::hash_map::Entry::Occupied(slot) => {
+                            deduped[*slot.get()].1 = buffer;
+                        }
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            let path = slot.key().clone();
+                            slot.insert(deduped.len());
+                            deduped.push((path, buffer));
+                        }
+                    }
+                }
+                let borrowed: Vec<(PathBuf, Option<&Buffer>)> = deduped
                     .iter()
                     .map(|(path, buffer)| (path.clone(), buffer.as_ref()))
                     .collect();
@@ -4796,7 +4814,9 @@ mod tests {
             1,
             "queued changes must produce a single rebuild: {events:?}"
         );
-        assert!(events.iter().any(|event| event == "batch:2"), "{events:?}");
+        // Both queued batches target the same document, so only its newest
+        // buffer may reach the server.
+        assert!(events.iter().any(|event| event == "batch:1"), "{events:?}");
     }
 
     #[test]
