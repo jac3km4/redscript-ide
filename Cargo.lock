@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "redscript-ide"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
