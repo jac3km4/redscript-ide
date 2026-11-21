@@ -126,17 +126,18 @@ enum WorkerCmd {
         documents: Vec<(PathBuf, Option<Buffer>)>,
     },
     FilesChanged {
-        state_rev: u64,
+        roots_rev: u64,
         paths: Vec<PathBuf>,
     },
     ChangeWorkspaceFolders {
-        state_rev: u64,
+        roots_rev: u64,
         added: Vec<PathBuf>,
         removed: Vec<PathBuf>,
     },
     Check {
         state_rev: u64,
         diag_rev: u64,
+        roots_rev: u64,
         path: PathBuf,
     },
     StartupDiagnostics {
@@ -172,7 +173,7 @@ enum WorkerEvent {
         batch: Option<DiagnosticBatch>,
     },
     WatchRoots {
-        state_rev: u64,
+        roots_rev: u64,
         roots: Vec<PathBuf>,
     },
     Error(String),
@@ -301,6 +302,12 @@ pub struct LspServer<'a> {
     /// Monotonic revision of the document/workspace state. Diagnostics computed
     /// for an older revision are rejected before they reach the client.
     state_rev: u64,
+    /// Monotonic revision of the watch-root state, tracked separately from
+    /// `state_rev`. Document edits bump `state_rev` without changing roots, so a
+    /// `WatchRoots` result must be validated against this revision instead; a
+    /// root-changing command only supersedes an earlier one when its own
+    /// `WatchRoots` event arrives later.
+    roots_rev: u64,
     /// Monotonic revision of save-triggered checks, independent of `state_rev`
     /// so back-to-back saves only publish the latest batch.
     diag_rev: u64,
@@ -385,6 +392,7 @@ impl LspServer<'_> {
             shutdown: false,
             in_flight: HashMap::new(),
             state_rev: 0,
+            roots_rev: 0,
             diag_rev: 0,
             pending_check: None,
             latest_state_rev: Arc::new(AtomicU64::new(0)),
@@ -420,6 +428,7 @@ impl LspServer<'_> {
                 shutdown: false,
                 in_flight: HashMap::new(),
                 state_rev: 0,
+                roots_rev: 0,
                 diag_rev: 0,
                 pending_check: None,
                 latest_state_rev: Arc::new(AtomicU64::new(0)),
@@ -758,10 +767,12 @@ impl LspServer<'_> {
                 self.latest_diag_rev.store(self.diag_rev, Ordering::Release);
                 self.startup_edited = true;
                 self.pending_check = Some(path.clone());
+                self.roots_rev += 1;
                 cmd_tx
                     .send(WorkerCmd::Check {
                         state_rev: self.state_rev,
                         diag_rev: self.diag_rev,
+                        roots_rev: self.roots_rev,
                         path,
                     })
                     .ok();
@@ -787,11 +798,12 @@ impl LspServer<'_> {
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 if !paths.is_empty() {
                     self.state_rev += 1;
+                    self.roots_rev += 1;
                     self.latest_state_rev
                         .store(self.state_rev, Ordering::Release);
                     cmd_tx
                         .send(WorkerCmd::FilesChanged {
-                            state_rev: self.state_rev,
+                            roots_rev: self.roots_rev,
                             paths,
                         })
                         .ok();
@@ -799,11 +811,12 @@ impl LspServer<'_> {
             }
             lsp::notification::DidChangeConfiguration::METHOD => {
                 self.state_rev += 1;
+                self.roots_rev += 1;
                 self.latest_state_rev
                     .store(self.state_rev, Ordering::Release);
                 cmd_tx
                     .send(WorkerCmd::FilesChanged {
-                        state_rev: self.state_rev,
+                        roots_rev: self.roots_rev,
                         paths: vec![],
                     })
                     .ok();
@@ -825,11 +838,12 @@ impl LspServer<'_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 if !added.is_empty() || !removed.is_empty() {
                     self.state_rev += 1;
+                    self.roots_rev += 1;
                     self.latest_state_rev
                         .store(self.state_rev, Ordering::Release);
                     cmd_tx
                         .send(WorkerCmd::ChangeWorkspaceFolders {
-                            state_rev: self.state_rev,
+                            roots_rev: self.roots_rev,
                             added,
                             removed,
                         })
@@ -981,13 +995,14 @@ impl LspServer<'_> {
                         .send(WorkerCmd::Check {
                             state_rev: self.state_rev,
                             diag_rev: self.diag_rev,
+                            roots_rev: self.roots_rev,
                             path,
                         })
                         .ok();
                 }
             }
-            WorkerEvent::WatchRoots { state_rev, roots } => {
-                if state_rev == self.state_rev {
+            WorkerEvent::WatchRoots { roots_rev, roots } => {
+                if roots_rev == self.roots_rev {
                     self.update_watchers_with(roots)?;
                 }
             }
@@ -1774,11 +1789,11 @@ fn worker_main<'a>(
     watch_files: bool,
 ) {
     let publish_roots =
-        |state_rev: u64, server: &dyn LanguageServer, event_tx: &Sender<WorkerEvent>| {
+        |roots_rev: u64, server: &dyn LanguageServer, event_tx: &Sender<WorkerEvent>| {
             if watch_files {
                 event_tx
                     .send(WorkerEvent::WatchRoots {
-                        state_rev,
+                        roots_rev,
                         roots: server.watch_roots(),
                     })
                     .ok();
@@ -1842,25 +1857,29 @@ fn worker_main<'a>(
                 // Overlays never change the watched roots, so unlike the other
                 // state commands this one does not re-publish them.
             }
-            WorkerCmd::FilesChanged { state_rev, paths } => {
+            WorkerCmd::FilesChanged {
+                roots_rev, paths, ..
+            } => {
                 if let Err(err) = server.files_changed(paths, &context) {
                     event_tx.send(WorkerEvent::Error(format!("{err:#}"))).ok();
                 }
-                publish_roots(state_rev, &*server, &event_tx);
+                publish_roots(roots_rev, &*server, &event_tx);
             }
             WorkerCmd::ChangeWorkspaceFolders {
-                state_rev,
+                roots_rev,
                 added,
                 removed,
+                ..
             } => {
                 if let Err(err) = server.change_workspace_folders(added, removed, &context) {
                     event_tx.send(WorkerEvent::Error(format!("{err:#}"))).ok();
                 }
-                publish_roots(state_rev, &*server, &event_tx);
+                publish_roots(roots_rev, &*server, &event_tx);
             }
             WorkerCmd::Check {
                 state_rev,
                 diag_rev,
+                roots_rev,
                 path,
             } => {
                 // Abort only when a save has already superseded this check; a
@@ -1887,7 +1906,7 @@ fn worker_main<'a>(
                         event_tx.send(WorkerEvent::Error(format!("{err:#}"))).ok();
                     }
                 }
-                publish_roots(state_rev, &*server, &event_tx);
+                publish_roots(roots_rev, &*server, &event_tx);
             }
             WorkerCmd::StartupDiagnostics {
                 state_rev,
@@ -2784,6 +2803,7 @@ mod tests {
                 shutdown: false,
                 in_flight: HashMap::new(),
                 state_rev: 0,
+                roots_rev: 0,
                 diag_rev: 0,
                 pending_check: None,
                 latest_state_rev: Arc::new(AtomicU64::new(0)),
@@ -4208,6 +4228,50 @@ mod tests {
             Value::Null
         );
         assert!(server.shutdown);
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn watch_roots_apply_after_intervening_document_state_changes() {
+        let (mut server, client) = memory_server();
+        server.watch_files = true;
+        // A root-changing command queued at `roots_rev = 1` stays current even
+        // after intervening edits advance `state_rev`, which only governs
+        // diagnostics and must not drop the watcher update.
+        server.roots_rev = 1;
+        server.state_rev = 7;
+        server
+            .handle_worker_event(
+                WorkerEvent::WatchRoots {
+                    roots_rev: 1,
+                    roots: vec![PathBuf::from("C:/workspace")],
+                },
+                None,
+            )
+            .unwrap();
+        let register = receive_request(&client);
+        assert_eq!(register.id, RequestId::from("source-watchers".to_owned()));
+        assert_eq!(
+            register_watcher_globs(&register.params),
+            [
+                "C:/workspace/**/*.reds",
+                "C:/workspace/**/*.[sS][cC][rR][iI][pP][tT]",
+                "C:/workspace/.redscript",
+            ]
+        );
+
+        // A superseded root update (a newer root-changing command was queued) is
+        // dropped instead of clobbering the newer watchers.
+        server.roots_rev = 2;
+        server
+            .handle_worker_event(
+                WorkerEvent::WatchRoots {
+                    roots_rev: 1,
+                    roots: vec![PathBuf::from("C:/stale")],
+                },
+                None,
+            )
+            .unwrap();
         assert!(client.receiver.try_recv().is_err());
     }
 
