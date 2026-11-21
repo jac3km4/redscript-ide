@@ -70,6 +70,10 @@ pub struct RedscriptLanguageServer {
     warned_extensions: HashSet<PathBuf>,
     diagnostics: DiagnosticTracker,
     completion_cache: Mutex<Option<CachedCompletion>>,
+    /// Test-only count of workspace snapshot rebuilds, used to assert that a
+    /// standalone edit leaves the workspace snapshot alone.
+    #[cfg(test)]
+    workspace_rebuilds: usize,
 }
 
 struct CachedCompletion {
@@ -154,6 +158,8 @@ impl RedscriptLanguageServer {
             warned_extensions: HashSet::new(),
             diagnostics,
             completion_cache: Mutex::new(None),
+            #[cfg(test)]
+            workspace_rebuilds: 0,
         })
     }
 
@@ -225,10 +231,33 @@ impl RedscriptLanguageServer {
     }
 
     fn rebuild_with_reload(&mut self, ctx: &LspContext, reload: bool) -> anyhow::Result<()> {
+        self.rebuild_scoped(ctx, reload, true, true)
+    }
+
+    /// Whether `path` belongs to a loaded workspace, and so dirties the
+    /// workspace snapshot rather than a standalone analysis.
+    fn is_workspace_document(&self, path: &Path) -> bool {
+        self.resolve_file(path).as_workspace().is_some()
+    }
+
+    /// Rebuilds the workspace and/or standalone snapshots, logging progress.
+    ///
+    /// `workspace`/`standalone` select which partition is recomputed; a document
+    /// edit only dirties one of them. A `reload` always dirties both, because it
+    /// re-reads the workspace from disk and can move files between partitions.
+    fn rebuild_scoped(
+        &mut self,
+        ctx: &LspContext,
+        reload: bool,
+        workspace: bool,
+        standalone: bool,
+    ) -> anyhow::Result<()> {
+        let workspace = workspace || reload;
+        let standalone = standalone || reload;
         let started = std::time::Instant::now();
         ctx.logger().verbose(|| {
             format!(
-                "Rebuild started reload={reload} overlays={} versions={:?}",
+                "Rebuild started reload={reload} workspace={workspace} standalone={standalone} overlays={} versions={:?}",
                 self.overlays.len(),
                 self.overlays
                     .iter()
@@ -236,7 +265,7 @@ impl RedscriptLanguageServer {
                     .collect::<Vec<_>>(),
             )
         });
-        let result = self.rebuild_inner(ctx, reload);
+        let result = self.rebuild_inner(ctx, reload, workspace, standalone);
         match &result {
             Ok(()) => ctx.logger().verbose(|| {
                 format!(
@@ -254,103 +283,124 @@ impl RedscriptLanguageServer {
         result
     }
 
-    fn rebuild_inner(&mut self, ctx: &LspContext, reload: bool) -> anyhow::Result<()> {
+    fn rebuild_inner(
+        &mut self,
+        ctx: &LspContext,
+        reload: bool,
+        workspace_dirty: bool,
+        standalone_dirty: bool,
+    ) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
         self.invalidate();
-        let mut read_diagnostics = if reload {
-            self.completion_cache.lock().unwrap().take();
-            BTreeMap::new()
-        } else {
-            self.diagnostics
-                .reads()
-                .iter()
-                .filter(|(path, _)| {
-                    self.resolve_file(path).as_workspace().is_some()
-                        && !self.overlays.contains_key(*path)
-                })
-                .map(|(path, diag)| (path.clone(), diag.clone()))
-                .collect()
-        };
-        let mut io_warnings = if reload {
-            BTreeSet::new()
-        } else {
-            self.io_warnings.clone()
-        };
+
+        // Read diagnostics are partitioned so only the dirty partition is
+        // recomputed; the other keeps its entries.
+        let (mut workspace_reads, mut standalone_reads): (
+            BTreeMap<PathBuf, lsp::Diagnostic>,
+            BTreeMap<PathBuf, lsp::Diagnostic>,
+        ) = self
+            .diagnostics
+            .reads()
+            .iter()
+            .map(|(path, diag)| (path.clone(), diag.clone()))
+            .partition(|(path, _)| self.resolve_file(path).as_workspace().is_some());
+        let mut io_warnings = self.io_warnings.clone();
         let mut missing_roots = BTreeSet::new();
-        let workspace = if reload {
-            ctx.logger()
-                .verbose(|| "Rebuild phase=workspace discovery, parsing and analysis".to_owned());
-            self.make_snapshot(
-                self.workspaces
-                    .values()
-                    .flat_map(|workspace| workspace.roots.clone()),
-                &mut missing_roots,
-                &mut read_diagnostics,
-                &mut io_warnings,
-            )?
-        } else {
+
+        if workspace_dirty {
+            #[cfg(test)]
+            {
+                self.workspace_rebuilds += 1;
+            }
+            if reload {
+                self.completion_cache.lock().unwrap().take();
+                workspace_reads.clear();
+                io_warnings.clear();
+            }
             ctx.logger().verbose(|| {
-                "Rebuild phase=cached sources, overlays and analysis (no workspace scan)".to_owned()
-            });
-            self.make_edit_snapshot()?
-        };
-        ctx.logger().verbose(|| {
-            format!(
-                "Rebuild workspace ready elapsed_ms={:.3}",
-                started.elapsed().as_secs_f64() * 1000.0,
-            )
-        });
-        ctx.logger()
-            .verbose(|| "Rebuild phase=standalone analysis".to_owned());
-        let paths: HashSet<_> = self
-            .standalone
-            .keys()
-            .chain(self.standalone_paths.iter())
-            .chain(self.overlays.keys())
-            .filter(|path| self.resolve_file(path).as_workspace().is_none())
-            .cloned()
-            .collect();
-        let mut standalone = HashMap::new();
-        let mut active_standalone_paths = HashSet::new();
-        for path in paths {
-            let text = self
-                .overlays
-                .get(&path)
-                .map(|overlay| Ok(overlay.text.clone()))
-                .unwrap_or_else(|| fs::read_to_string(&path).map(Arc::from));
-            match text {
-                Ok(text) => {
-                    active_standalone_paths.insert(path.clone());
-                    let sources = ast::SourceMap::new();
-                    sources.push_back(&path, text.to_string());
-                    standalone.insert(
-                        path,
-                        CompilationCache::from_sources(
-                            self.compilation_cache.borrow_cache_bytes().clone(),
-                            sources,
-                            TypeInterner::default(),
-                        )?,
-                    );
+                if reload {
+                    "Rebuild phase=workspace discovery, parsing and analysis".to_owned()
+                } else {
+                    "Rebuild phase=cached sources, overlays and analysis (no workspace scan)"
+                        .to_owned()
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    active_standalone_paths.insert(path.clone());
-                    record_source_read_error(
-                        &path,
-                        &error,
-                        &mut read_diagnostics,
-                        &mut io_warnings,
-                    );
+            });
+            let workspace = if reload {
+                self.make_snapshot(
+                    self.workspaces
+                        .values()
+                        .flat_map(|workspace| workspace.roots.clone()),
+                    &mut missing_roots,
+                    &mut workspace_reads,
+                    &mut io_warnings,
+                )?
+            } else {
+                self.make_edit_snapshot()?
+            };
+            self.compilation_cache = workspace;
+            ctx.logger().verbose(|| {
+                format!(
+                    "Rebuild workspace ready elapsed_ms={:.3}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                )
+            });
+        }
+
+        if standalone_dirty {
+            standalone_reads.clear();
+            ctx.logger()
+                .verbose(|| "Rebuild phase=standalone analysis".to_owned());
+            let paths: HashSet<_> = self
+                .standalone
+                .keys()
+                .chain(self.standalone_paths.iter())
+                .chain(self.overlays.keys())
+                .filter(|path| self.resolve_file(path).as_workspace().is_none())
+                .cloned()
+                .collect();
+            let mut standalone = HashMap::new();
+            let mut active_standalone_paths = HashSet::new();
+            for path in paths {
+                let text = self
+                    .overlays
+                    .get(&path)
+                    .map(|overlay| Ok(overlay.text.clone()))
+                    .unwrap_or_else(|| fs::read_to_string(&path).map(Arc::from));
+                match text {
+                    Ok(text) => {
+                        active_standalone_paths.insert(path.clone());
+                        let sources = ast::SourceMap::new();
+                        sources.push_back(&path, text.to_string());
+                        standalone.insert(
+                            path,
+                            CompilationCache::from_sources(
+                                self.compilation_cache.borrow_cache_bytes().clone(),
+                                sources,
+                                TypeInterner::default(),
+                            )?,
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        active_standalone_paths.insert(path.clone());
+                        record_source_read_error(
+                            &path,
+                            &error,
+                            &mut standalone_reads,
+                            &mut io_warnings,
+                        );
+                    }
                 }
             }
+            self.standalone = standalone;
+            self.standalone_paths = active_standalone_paths;
         }
-        self.compilation_cache = workspace;
-        self.standalone = standalone;
-        self.standalone_paths = active_standalone_paths;
+
         if reload {
             self.missing_roots = missing_roots;
         }
-        self.diagnostics.set_reads(read_diagnostics);
+        workspace_reads.extend(standalone_reads);
+        self.diagnostics.set_reads(workspace_reads);
         self.io_warnings = io_warnings;
         if reload {
             self.log_missing_roots(ctx);
@@ -1401,10 +1451,13 @@ impl LanguageServer for RedscriptLanguageServer {
         buffer: Option<&crate::buffers::Buffer>,
         ctx: &LspContext,
     ) -> anyhow::Result<()> {
-        // Closing must restore disk contents (or remove an unsaved file).
-        // Open/change use known sources; filesystem notifications refresh discovery.
-        if let Some(reload) = self.apply_document(&path, buffer, ctx) {
-            self.rebuild_with_reload(ctx, reload)?;
+        // Closing a workspace document must restore disk contents; closing a
+        // standalone document just drops it. Open/change use known sources;
+        // filesystem notifications refresh discovery.
+        let workspace = self.is_workspace_document(&path);
+        if self.apply_document(&path, buffer, ctx).is_some() {
+            let reload = buffer.is_none() && workspace;
+            self.rebuild_scoped(ctx, reload, workspace, !workspace)?;
         }
         Ok(())
     }
@@ -1415,17 +1468,23 @@ impl LanguageServer for RedscriptLanguageServer {
         ctx: &LspContext,
     ) -> anyhow::Result<()> {
         // Apply every overlay first so a batch of edits sharing sources rebuilds
-        // the workspace exactly once instead of once per changed document.
+        // exactly once instead of once per changed document, and only rebuild the
+        // partitions the batch actually touched.
+        let mut workspace_dirty = false;
+        let mut standalone_dirty = false;
         let mut reload = false;
         let mut applied = false;
         for (path, buffer) in documents {
-            if let Some(document_reload) = self.apply_document(path, *buffer, ctx) {
+            let workspace = self.is_workspace_document(path);
+            if self.apply_document(path, *buffer, ctx).is_some() {
                 applied = true;
-                reload |= document_reload;
+                reload |= buffer.is_none() && workspace;
+                workspace_dirty |= workspace;
+                standalone_dirty |= !workspace;
             }
         }
         if applied {
-            self.rebuild_with_reload(ctx, reload)?;
+            self.rebuild_scoped(ctx, reload, workspace_dirty, standalone_dirty)?;
         }
         Ok(())
     }
@@ -3833,6 +3892,7 @@ mod tests {
             warned_extensions: HashSet::new(),
             diagnostics: DiagnosticTracker::default(),
             completion_cache: Mutex::new(None),
+            workspace_rebuilds: 0,
         }
     }
 
@@ -4573,6 +4633,28 @@ mod tests {
                 .edit
                 .is_some()
         );
+    }
+
+    #[test]
+    fn standalone_edits_leave_the_workspace_snapshot_alone() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let workspace_path = temp.path().join("ws.reds");
+        let _buffers = open(&mut server, &ctx, &workspace_path, "public class Ws {}", 1);
+        let before = server.workspace_rebuilds;
+
+        // A file outside every workspace root is analyzed standalone.
+        let external = tempdir();
+        let standalone_path = external.path().join("solo.reds");
+        let _buffers = open(&mut server, &ctx, &standalone_path, "public class Solo {}", 1);
+        assert!(server.standalone.contains_key(&dialect::identity(&standalone_path)));
+        assert_eq!(
+            server.workspace_rebuilds, before,
+            "a standalone edit must not rebuild the workspace snapshot"
+        );
+
+        // Editing the workspace file still rebuilds the workspace.
+        let _buffers = open(&mut server, &ctx, &workspace_path, "public class Ws2 {}", 2);
+        assert_eq!(server.workspace_rebuilds, before + 1);
     }
 
     #[test]
