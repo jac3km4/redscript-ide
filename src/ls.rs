@@ -3969,6 +3969,54 @@ mod tests {
         assert!(stale.documentation.is_none());
     }
 
+    /// Prints end-to-end member-completion latency for a multi-file workspace.
+    ///
+    /// Run explicitly with
+    /// `cargo test --bin redscript-ide -- --ignored completion_latency`.
+    #[test]
+    #[ignore = "timing benchmark; run explicitly"]
+    fn completion_latency_benchmark() {
+        use std::time::Instant;
+
+        let (temp, mut server, ctx, _receiver) = fixture();
+        // A workspace large enough that parsing and lowering dominate a cold
+        // speculative query.
+        for index in 0..30 {
+            let path = temp.path().join(format!("mod{index}.reds"));
+            let text = format!(
+                "public class Host{index} {{ public func Value() -> Int32 {{ return {index}; }} }}"
+            );
+            fs::write(&path, text).unwrap();
+        }
+        let path = temp.path().join("bench.reds");
+        let text = "public class Bench { public func Value() -> Int32 { return 1; } } \
+                    public func Test(host: ref<Bench>) { host.Val; }";
+        let buffers = open(&mut server, &ctx, &path, text, 1);
+        let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+        let loc = CodeLocation::new(
+            Document::new(path.clone(), buffer),
+            text.rfind("; }").unwrap() as u32,
+        );
+
+        let mut samples = Vec::new();
+        for _ in 0..20 {
+            // Force the cold speculative path, as typing `.` does.
+            server.completion_cache.lock().unwrap().take();
+            let started = Instant::now();
+            server.completion_at(loc.clone(), &ctx).unwrap();
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "completion latency: n={} p50={:.3}ms p95={:.3}ms min={:.3}ms max={:.3}ms",
+            samples.len(),
+            samples[samples.len() / 2],
+            samples[(samples.len() * 95 / 100).min(samples.len() - 1)],
+            samples[0],
+            samples[samples.len() - 1],
+        );
+    }
+
     #[test]
     fn redmod_array_completion_is_not_offered_in_community_sources() {
         let (temp, mut server, ctx, _receiver) = fixture();

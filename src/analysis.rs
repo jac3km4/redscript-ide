@@ -101,7 +101,7 @@ impl CompilationCache {
                 };
                 ctx.logger().verbose(|| {
                     format!(
-                        "Query result lookup_byte_offset={preceding_pos} parsed_module={} ast_match={} function={} expression={} named_type={} receiver_type={} context={query_context:?} parse_diagnostics={} semantic_diagnostics={}",
+                        "Query result lookup_byte_offset={preceding_pos} parsed_module={} ast_match={} function={} expression={} named_type={} receiver_type={} context={query_context:?} parse_diagnostics={} semantic_diagnostics={} phases({})",
                         analysis.parsed.modules.iter().any(|(file, _)| *file == id),
                         match_.is_some(),
                         func.is_some(),
@@ -110,6 +110,7 @@ impl CompilationCache {
                         at.expr_type().is_some(),
                         analysis.parsed.diagnostics.len(),
                         analysis.diagnostics.len(),
+                        analysis.timings.summary(),
                     )
                 });
                 cb(at)
@@ -151,6 +152,44 @@ pub(crate) struct AnalyzedSources<'ctx> {
     pub(crate) unit: LoweredCompilationUnit<'ctx>,
     pub(crate) symbols: Symbols<'ctx>,
     pub(crate) diagnostics: Vec<Diagnostic<'ctx>>,
+    pub(crate) timings: AnalysisTimings,
+}
+
+/// Per-phase timings for one deferred analysis, in milliseconds.
+///
+/// [`AnalysisTimings::phase`] only reads the clock when verbose logging is
+/// enabled, so release builds record nothing (every field stays zero) and the
+/// query log closure that reads them is never called.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AnalysisTimings {
+    pub(crate) bundle_ms: f64,
+    pub(crate) symbols_ms: f64,
+    pub(crate) parse_ms: f64,
+    pub(crate) lower_ms: f64,
+    pub(crate) diagnostics_ms: f64,
+}
+
+impl AnalysisTimings {
+    #[cfg(any(test, feature = "verbose-logs"))]
+    fn phase<T>(slot: &mut f64, body: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let value = body();
+        *slot = started.elapsed().as_secs_f64() * 1000.0;
+        value
+    }
+
+    #[cfg(not(any(test, feature = "verbose-logs")))]
+    fn phase<T>(_slot: &mut f64, body: impl FnOnce() -> T) -> T {
+        body()
+    }
+
+    /// Renders the phases for the verbose query log.
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "bundle_ms={:.3} symbols_ms={:.3} parse_ms={:.3} lower_ms={:.3} diagnostics_ms={:.3}",
+            self.bundle_ms, self.symbols_ms, self.parse_ms, self.lower_ms, self.diagnostics_ms,
+        )
+    }
 }
 
 /// Narrows the work a [`CompilationCache`] performs when its analysis is first
@@ -183,15 +222,20 @@ impl<'ctx> AnalyzedSources<'ctx> {
         // paid when this snapshot is actually analyzed. Snapshots that are
         // replaced by a newer edit before they are forced stay free.
         LazyLock::new(Box::new(move || {
-            let bundle = ScriptBundle::from_bytes(bytes)
-                .expect("cache bytes were validated before analysis");
-            let symbols = CompilationInputs::load_without_mapping(
-                &bundle,
-                interner,
-                &TypeFlagRegistry::default(),
-            )
-            .expect("cache bytes were validated before analysis");
-            Self::new(dialect::parse(sources), symbols, interner, mode)
+            let mut timings = AnalysisTimings::default();
+            let bundle = AnalysisTimings::phase(&mut timings.bundle_ms, || {
+                ScriptBundle::from_bytes(bytes).expect("cache bytes were validated before analysis")
+            });
+            let symbols = AnalysisTimings::phase(&mut timings.symbols_ms, || {
+                CompilationInputs::load_without_mapping(
+                    &bundle,
+                    interner,
+                    &TypeFlagRegistry::default(),
+                )
+                .expect("cache bytes were validated before analysis")
+            });
+            let parsed = AnalysisTimings::phase(&mut timings.parse_ms, || dialect::parse(sources));
+            Self::new(parsed, symbols, interner, mode, timings)
         }))
     }
 
@@ -200,17 +244,23 @@ impl<'ctx> AnalyzedSources<'ctx> {
         symbols: Symbols<'ctx>,
         interner: &'ctx TypeInterner,
         mode: AnalysisMode,
+        mut timings: AnalysisTimings,
     ) -> Self {
         let mut reporter = CompileErrorReporter::default();
-        let (unit, symbols) = parsed.process(symbols, &mut reporter, interner);
+        let (unit, symbols) = AnalysisTimings::phase(&mut timings.lower_ms, || {
+            parsed.process(symbols, &mut reporter, interner)
+        });
         if mode.run_diagnostics() {
-            unit.run_diagnostics(DIAGNOSTIC_PASSES, &mut reporter);
+            AnalysisTimings::phase(&mut timings.diagnostics_ms, || {
+                unit.run_diagnostics(DIAGNOSTIC_PASSES, &mut reporter);
+            });
         }
         Self {
             parsed,
             unit,
             symbols,
             diagnostics: reporter.into_reported(),
+            timings,
         }
     }
 }
@@ -325,6 +375,7 @@ impl Default for CompilationCache {
                         Symbols::with_default_types(),
                         interner,
                         AnalysisMode::Diagnostics,
+                        AnalysisTimings::default(),
                     )
                 }))
             },
