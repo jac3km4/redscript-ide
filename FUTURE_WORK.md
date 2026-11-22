@@ -35,6 +35,13 @@ Prioritized follow-ups from the LSP/code review. Keep fixes focused and add regr
 
 ## Completed
 
+- Cut member-completion latency: skip the wasted REDmod recovery parse for
+  already-terminated statements, reuse the capability-adapted response across prefix
+  edits, resolve documentation lazily through `completionItem/resolve`, poll
+  cancellation while formatting members, abort a cancelled speculative query before
+  parsing, and run queued interactive requests ahead of background diagnostics.
+  Per-phase analysis timings log under `--features verbose-logs`, and the ignored
+  `completion_latency_benchmark` test prints end-to-end latency.
 - Moved analysis off the protocol loop: workspace parsing/lowering/diagnostics now run on a
   dedicated worker thread (enabled by the upstream `redscript` `sync`/`parallel` features), so the
   protocol loop never blocks. `$/cancelRequest` cancels in-flight and queued requests cooperatively,
