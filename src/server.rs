@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -1810,8 +1810,49 @@ fn execute_request(
     }
 }
 
+/// Whether a command computes background diagnostics, which interactive
+/// requests may run ahead of.
+fn is_background_diagnostics(cmd: &WorkerCmd) -> bool {
+    matches!(
+        cmd,
+        WorkerCmd::StartupDiagnostics { .. } | WorkerCmd::Check { .. }
+    )
+}
+
+/// Promotes the first queued interactive request ahead of the background
+/// diagnostic commands in front of it.
+///
+/// Only requests are moved, and only past other background diagnostics or
+/// already-cancelled requests. A state mutation or the `Flush` barrier keeps its
+/// position relative to the diagnostics, so causal ordering and the shutdown
+/// barrier are preserved.
+fn promote_request(queue: &mut VecDeque<WorkerCmd>) -> bool {
+    if !queue.front().is_some_and(is_background_diagnostics) {
+        return false;
+    }
+    let mut promoted = None;
+    for (index, cmd) in queue.iter().enumerate().skip(1) {
+        match cmd {
+            cmd if is_background_diagnostics(cmd) => {}
+            // The protocol thread already answered the cancellation.
+            WorkerCmd::Request { cancel, .. } if cancel.is_cancelled() => {}
+            WorkerCmd::Request { .. } => {
+                promoted = Some(index);
+                break;
+            }
+            _ => break,
+        }
+    }
+    let Some(index) = promoted else {
+        return false;
+    };
+    let cmd = queue.remove(index).expect("index came from the queue");
+    queue.push_front(cmd);
+    true
+}
+
 /// The analysis worker thread. It owns the language server exclusively and
-/// processes commands in FIFO order, emitting results as [`WorkerEvent`]s.
+/// processes commands in order, emitting results as [`WorkerEvent`]s.
 fn worker_main<'a>(
     mut server: Box<dyn LanguageServer + 'a>,
     context: LspContext,
@@ -1833,33 +1874,40 @@ fn worker_main<'a>(
             }
         };
 
-    let mut deferred: Option<WorkerCmd> = None;
+    let mut queue: VecDeque<WorkerCmd> = VecDeque::new();
     loop {
-        let cmd = match deferred.take() {
-            Some(cmd) => cmd,
-            None => match cmd_rx.recv() {
-                Ok(cmd) => cmd,
+        if queue.is_empty() {
+            match cmd_rx.recv() {
+                Ok(cmd) => queue.push_back(cmd),
                 Err(_) => break,
-            },
-        };
+            }
+        }
+        // Pull in everything already queued so a request can be promoted and a
+        // burst of edits coalesced before the next command runs.
+        queue.extend(cmd_rx.try_iter());
+        promote_request(&mut queue);
+        let cmd = queue.pop_front().expect("the queue is non-empty");
         match cmd {
             WorkerCmd::DocumentsChanged { mut documents, .. } => {
                 // The protocol thread coalesces edits already buffered in the
                 // connection, but edits arriving while the worker is busy enqueue
                 // separate commands. Merge them so a burst triggers one rebuild.
-                while let Ok(next) = cmd_rx.try_recv() {
-                    match next {
-                        WorkerCmd::DocumentsChanged {
-                            documents: more, ..
-                        } => {
+                // A cancelled request is dropped rather than splitting the burst.
+                loop {
+                    match queue.front() {
+                        Some(WorkerCmd::DocumentsChanged { .. }) => {
+                            let Some(WorkerCmd::DocumentsChanged {
+                                documents: more, ..
+                            }) = queue.pop_front()
+                            else {
+                                unreachable!("the front is a DocumentsChanged command");
+                            };
                             documents.extend(more);
                         }
-                        // The protocol thread already answered the cancellation.
-                        WorkerCmd::Request { cancel, .. } if cancel.is_cancelled() => {}
-                        other => {
-                            deferred = Some(other);
-                            break;
+                        Some(WorkerCmd::Request { cancel, .. }) if cancel.is_cancelled() => {
+                            queue.pop_front();
                         }
+                        _ => break,
                     }
                 }
                 // Keep only the newest buffer for each path: a burst of edits to
@@ -5041,6 +5089,129 @@ mod tests {
         // Both queued batches target the same document, so only its newest
         // buffer may reach the server.
         assert!(events.iter().any(|event| event == "batch:1"), "{events:?}");
+    }
+
+    #[test]
+    fn promote_request_moves_only_requests_past_background_diagnostics() {
+        let request = || WorkerCmd::Request {
+            id: RequestId::from("1".to_owned()),
+            method: lsp::request::WorkspaceSymbolRequest::METHOD.to_owned(),
+            kind: Box::new(WorkerRequest::WorkspaceSymbol(String::new())),
+            started: Instant::now(),
+            cancel: CancelToken::default(),
+        };
+        let startup = || WorkerCmd::StartupDiagnostics {
+            state_rev: 0,
+            diag_rev: 0,
+        };
+        let check = || WorkerCmd::Check {
+            state_rev: 0,
+            diag_rev: 0,
+            roots_rev: 0,
+            path: PathBuf::from("C:/test.reds"),
+        };
+        let documents = || WorkerCmd::DocumentsChanged { documents: vec![] };
+
+        // A request is promoted past the background diagnostics in front of it.
+        let mut queue = VecDeque::from([startup(), check(), request()]);
+        assert!(promote_request(&mut queue));
+        assert!(matches!(queue.front(), Some(WorkerCmd::Request { .. })));
+
+        // A state mutation keeps its position, so nothing is promoted past it.
+        let mut queue = VecDeque::from([startup(), documents(), request()]);
+        assert!(!promote_request(&mut queue));
+        assert!(matches!(
+            queue.front(),
+            Some(WorkerCmd::StartupDiagnostics { .. })
+        ));
+
+        // The shutdown barrier is never crossed.
+        let (ack, _rx) = crossbeam_channel::unbounded();
+        let mut queue = VecDeque::from([startup(), WorkerCmd::Flush(ack), request()]);
+        assert!(!promote_request(&mut queue));
+
+        // Nothing to promote when no request is queued, or the head is not a
+        // background diagnostic.
+        assert!(!promote_request(&mut VecDeque::from([startup(), check()])));
+        assert!(!promote_request(&mut VecDeque::from([
+            request(),
+            startup()
+        ])));
+    }
+
+    #[test]
+    fn worker_runs_a_queued_request_before_background_diagnostics() {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let server = Box::new(StubServer {
+            events: Some(events.clone()),
+            startup_entered: Some(entered.clone()),
+            startup_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || {
+            worker_main(
+                server,
+                LspContext::new(sender),
+                cmd_rx,
+                event_tx,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                false,
+            );
+        });
+
+        // The first diagnostics blocks the worker; a newer diagnostics and an
+        // interactive request queue up behind it.
+        cmd_tx
+            .send(WorkerCmd::StartupDiagnostics {
+                state_rev: 0,
+                diag_rev: 0,
+            })
+            .unwrap();
+        entered.wait();
+        cmd_tx
+            .send(WorkerCmd::StartupDiagnostics {
+                state_rev: 0,
+                diag_rev: 0,
+            })
+            .unwrap();
+        cmd_tx
+            .send(WorkerCmd::Request {
+                id: RequestId::from("1".to_owned()),
+                method: lsp::request::DocumentSymbolRequest::METHOD.to_owned(),
+                kind: Box::new(WorkerRequest::DocumentSymbols(OwnedDocument {
+                    path: PathBuf::from("C:/test.reds"),
+                    buffer: Buffer::new(String::new()),
+                })),
+                started: Instant::now(),
+                cancel: CancelToken::default(),
+            })
+            .unwrap();
+        release.wait();
+        let (ack, ack_rx) = crossbeam_channel::unbounded();
+        cmd_tx.send(WorkerCmd::Flush(ack)).unwrap();
+        ack_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop(cmd_tx);
+        handle.join().unwrap();
+
+        let events = events.lock().unwrap();
+        let request = events
+            .iter()
+            .position(|event| event.starts_with("document_symbols:"))
+            .unwrap_or_else(|| panic!("the request must run: {events:?}"));
+        let last_startup = events
+            .iter()
+            .rposition(|event| event == "startup")
+            .expect("both diagnostics run");
+        assert!(
+            request < last_startup,
+            "a queued request must run before the later diagnostics: {events:?}"
+        );
     }
 
     #[test]
