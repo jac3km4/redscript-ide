@@ -13,10 +13,10 @@ Prioritized follow-ups from the LSP/code review. Keep fixes focused and add regr
 
 ## Performance
 
-- Reuse validated startup symbols for the initial `CompilationCache` snapshot and explore sharing
-  or pooling base-game symbol loading across edit/save/speculative-query snapshots (`src/analysis.rs`,
-  `src/ls.rs`) instead of re-decoding `ScriptBundle` and re-interning ~30k base-game symbols into a
-  fresh `TypeInterner` on every snapshot.
+- The base symbol table is now reused (see Completed), but each snapshot still clones it: the clone
+  is proportional to the number of base type definitions (~3k `HashMap` entries, each with a
+  `Box<[Shared<CtxVar>]>`/`Box<[&str]>`), which profiling has not yet shown to matter. Pooling the
+  table would remove even that clone.
 
 ## LSP correctness
 
@@ -35,6 +35,12 @@ Prioritized follow-ups from the LSP/code review. Keep fixes focused and add regr
 
 ## Completed
 
+- Reused the decoded base-game bundle, its shared `TypeInterner`, and the whole base `Symbols` table
+  across snapshots (`BaseEnv`), eliminating both the per-snapshot `ScriptBundle` decode and the
+  ~30k-entry base symbol rebuild on every edit and speculative query. Enabled by the upstream
+  forkable `TypeInterner` and covariant, copy-on-write `Symbols`.
+- Lower only the function enclosing an IDE query in speculative query snapshots, skipping every
+  unrelated function body and the whole-program validation passes.
 - Cut member-completion latency: skip the wasted REDmod recovery parse for
   already-terminated statements, reuse the capability-adapted response across prefix
   edits, resolve documentation lazily through `completionItem/resolve`, poll
