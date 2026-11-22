@@ -280,10 +280,30 @@ pub(crate) fn member_completion_range(source: &str, pos: u32) -> Option<Range<us
     Some(dot..end)
 }
 
+/// Completion items plus the documentation deferred out of them.
+///
+/// When the client resolves documentation lazily, the items carry an index into
+/// `docs` instead of the rendered Markdown, so the initial response stays small
+/// for receivers with hundreds of inherited members.
+pub(crate) struct GeneratedCompletions {
+    pub(crate) items: Vec<lsp_types::CompletionItem>,
+    pub(crate) docs: Vec<String>,
+}
+
+/// Payload attached to a completion item so `completionItem/resolve` can find
+/// the documentation omitted from the initial response. `generation` rejects a
+/// resolve that arrives after the completion cache moved on.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct CompletionResolveData {
+    pub(crate) generation: u64,
+    pub(crate) id: usize,
+}
+
 pub(crate) fn generate_completions(
     at: ExprAt<'_, '_>,
     dialect: Option<Dialect>,
-) -> Result<Vec<lsp_types::CompletionItem>, anyhow::Error> {
+    resolve: Option<u64>,
+) -> Result<GeneratedCompletions, anyhow::Error> {
     let mut completions = vec![];
 
     if let Some(typ) = at.type_()
@@ -357,7 +377,29 @@ pub(crate) fn generate_completions(
         completions.extend(fields);
     };
 
-    Ok(completions)
+    // A client that resolves documentation lazily gets it omitted here and
+    // looked up from the cache on `completionItem/resolve`.
+    let mut docs = Vec::new();
+    let items = match resolve {
+        Some(generation) => completions
+            .into_iter()
+            .map(|mut item| {
+                let Some(lsp::Documentation::MarkupContent(content)) = item.documentation.take()
+                else {
+                    return item;
+                };
+                if content.value.is_empty() {
+                    return item;
+                }
+                let id = docs.len();
+                docs.push(content.value);
+                item.data = Some(serde_json::json!({ "generation": generation, "id": id }));
+                item
+            })
+            .collect(),
+        None => completions,
+    };
+    Ok(GeneratedCompletions { items, docs })
 }
 
 #[cfg(test)]

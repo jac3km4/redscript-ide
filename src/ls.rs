@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -16,7 +17,8 @@ use redscript_compiler_api::{
 use crate::analysis::{AnalysisMode, CacheBytes, CompilationCache};
 use crate::code_actions::{Fix, FixMap, FixRequest, FixScope, generate_fix};
 use crate::completions::{
-    generate_completions, member_completion_range, repair_completion_terminator,
+    CompletionResolveData, generate_completions, member_completion_range,
+    repair_completion_terminator,
 };
 use crate::diagnostics::{DiagnosticBatch, DiagnosticTracker, diagnostic_tags, location, range};
 use crate::dialect::{self, Dialect};
@@ -73,6 +75,9 @@ pub struct RedscriptLanguageServer {
     warned_extensions: HashSet<PathBuf>,
     diagnostics: DiagnosticTracker,
     completion_cache: Mutex<Option<CachedCompletion>>,
+    /// Monotonic id of the completion response currently cached, so a stale
+    /// `completionItem/resolve` is rejected instead of returning a wrong doc.
+    completion_generation: AtomicU64,
     /// Test-only count of workspace snapshot rebuilds, used to assert that a
     /// standalone edit leaves the workspace snapshot alone.
     #[cfg(test)]
@@ -85,6 +90,12 @@ struct CachedCompletion {
     source_without_member: String,
     other_overlays: BTreeMap<PathBuf, Arc<str>>,
     response: Arc<lsp::CompletionResponse>,
+    /// Documentation deferred out of `response` when the client resolves it
+    /// lazily, indexed by each item's `data.id`.
+    docs: Vec<String>,
+    /// Identifies this cached response's `docs` so a resolve against a newer
+    /// response is not answered with the wrong documentation.
+    generation: u64,
     /// The response adapted to a client's completion presentation capabilities,
     /// produced on first use. Capabilities are fixed after `initialize`, so this
     /// normally holds one entry that every later request reuses.
@@ -216,6 +227,7 @@ impl RedscriptLanguageServer {
             warned_extensions: HashSet::new(),
             diagnostics,
             completion_cache: Mutex::new(None),
+            completion_generation: AtomicU64::new(0),
             #[cfg(test)]
             workspace_rebuilds: 0,
         })
@@ -708,20 +720,28 @@ impl RedscriptLanguageServer {
             .map(|(path, overlay)| (path.clone(), overlay.text.clone()))
             .collect();
         let dialect = Dialect::of(loc.doc().path());
-        let completions = self.expr_at_with(
+        // A client that can resolve documentation lazily gets it omitted from
+        // the response and looked up again from the cache on
+        // `completionItem/resolve`.
+        let resolve = ctx
+            .supports_lazy_completion_documentation()
+            .then(|| self.completion_generation.fetch_add(1, Ordering::Relaxed));
+        let generated = self.expr_at_with(
             loc.with_pos(member.start as u32),
             Some(member),
             Some(contents),
-            |at| generate_completions(at, dialect),
+            |at| generate_completions(at, dialect, resolve),
             ctx,
         )?;
-        let response = Arc::new(lsp::CompletionResponse::Array(completions));
+        let response = Arc::new(lsp::CompletionResponse::Array(generated.items));
         *self.completion_cache.lock().unwrap() = Some(CachedCompletion {
             path,
             receiver_end,
             source_without_member,
             other_overlays,
             response: response.clone(),
+            docs: generated.docs,
+            generation: resolve.unwrap_or(0),
             adapted: None,
         });
         Ok(response)
@@ -757,6 +777,41 @@ impl RedscriptLanguageServer {
             cached.adapted = Some((presentation, adapted.clone()));
         }
         Ok(adapted)
+    }
+
+    /// Populates the documentation deferred out of a completion item.
+    ///
+    /// The item's `data` carries the generation of the response it came from and
+    /// an index into that response's deferred docs. A resolve against a
+    /// superseded generation (the cache moved on) leaves the item untouched
+    /// rather than returning the wrong documentation.
+    fn completion_resolve(
+        &self,
+        mut item: lsp::CompletionItem,
+        ctx: &LspContext,
+    ) -> anyhow::Result<lsp::CompletionItem> {
+        let Some(data) = item.data.take() else {
+            return Ok(item);
+        };
+        let Ok(resolve) = serde_json::from_value::<CompletionResolveData>(data) else {
+            return Ok(item);
+        };
+        let cache = self.completion_cache.lock().unwrap();
+        let Some(cached) = cache.as_ref() else {
+            return Ok(item);
+        };
+        if cached.generation != resolve.generation {
+            return Ok(item);
+        }
+        let Some(doc) = cached.docs.get(resolve.id) else {
+            return Ok(item);
+        };
+        item.documentation = Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
+            kind: lsp::MarkupKind::Markdown,
+            value: doc.clone(),
+        }));
+        ctx.adapt_completion_item(&mut item);
+        Ok(item)
     }
 
     fn definition_at(
@@ -1731,6 +1786,14 @@ impl LanguageServer for RedscriptLanguageServer {
         ctx: &LspContext,
     ) -> anyhow::Result<Arc<lsp_types::CompletionResponse>> {
         RedscriptLanguageServer::completion_for_client(self, loc, ctx)
+    }
+
+    fn completion_resolve(
+        &self,
+        item: lsp::CompletionItem,
+        ctx: &LspContext,
+    ) -> anyhow::Result<lsp::CompletionItem> {
+        RedscriptLanguageServer::completion_resolve(self, item, ctx)
     }
 
     fn goto_definition(
@@ -3866,6 +3929,47 @@ mod tests {
     }
 
     #[test]
+    fn completion_resolve_restores_deferred_documentation() {
+        let (temp, mut server, mut ctx, _receiver) = fixture();
+        ctx.set_presentation_capabilities(
+            &serde_json::from_value(serde_json::json!({
+                "textDocument": {"completion": {"completionItem": {
+                    "snippetSupport": true,
+                    "labelDetailsSupport": true,
+                    "documentationFormat": ["markdown"],
+                    "resolveSupport": {"properties": ["documentation"]},
+                }}},
+            }))
+            .unwrap(),
+        );
+        assert!(ctx.supports_lazy_completion_documentation());
+        let path = temp.path().join("arrays.script");
+        let text = "function Test(values: array<String>) { values.; }";
+        let response = dot_completions(&mut server, &ctx, &path, text, 1);
+        let lsp::CompletionResponse::Array(items) = &*response else {
+            panic!("expected completion items");
+        };
+        let push = items.iter().find(|item| item.label == "PushBack").unwrap();
+        assert!(
+            push.documentation.is_none(),
+            "documentation should be deferred: {push:?}"
+        );
+        let data = push.data.clone().expect("deferred doc payload");
+        assert!(data.get("generation").is_some());
+        assert!(data.get("id").is_some());
+
+        let resolved = server.completion_resolve(push.clone(), &ctx).unwrap();
+        assert!(resolved.documentation.is_some());
+        assert!(resolved.data.is_none(), "resolve must consume the payload");
+
+        // A resolve against a superseded response must not attach stale docs.
+        let text = "function Test(values: array<Int32>) { values.; }";
+        dot_completions(&mut server, &ctx, &path, text, 2);
+        let stale = server.completion_resolve(push.clone(), &ctx).unwrap();
+        assert!(stale.documentation.is_none());
+    }
+
+    #[test]
     fn redmod_array_completion_is_not_offered_in_community_sources() {
         let (temp, mut server, ctx, _receiver) = fixture();
         let community = temp.path().join("community.reds");
@@ -4101,6 +4205,7 @@ mod tests {
             warned_extensions: HashSet::new(),
             diagnostics: DiagnosticTracker::default(),
             completion_cache: Mutex::new(None),
+            completion_generation: AtomicU64::new(0),
             workspace_rebuilds: 0,
         }
     }

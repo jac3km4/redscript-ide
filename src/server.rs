@@ -116,6 +116,7 @@ enum WorkerRequest {
         context: lsp::CodeActionContext,
     },
     CodeActionResolve(Box<lsp::CodeAction>),
+    CompletionResolve(Box<lsp::CompletionItem>),
 }
 
 /// Commands sent from the protocol thread to the analysis worker. The worker
@@ -1203,6 +1204,10 @@ impl LspServer<'_> {
                 let action = serde_json::from_value(params).map_err(invalid_params)?;
                 Ok(WorkerRequest::CodeActionResolve(Box::new(action)))
             }
+            lsp::request::ResolveCompletionItem::METHOD => {
+                let item = serde_json::from_value(params).map_err(invalid_params)?;
+                Ok(WorkerRequest::CompletionResolve(Box::new(item)))
+            }
             _ => Err(response_error(
                 ErrorCode::MethodNotFound,
                 format!("Unknown request: {method}"),
@@ -1355,6 +1360,10 @@ impl LspServer<'_> {
             lsp::request::CodeActionResolveRequest::METHOD => {
                 let action = serde_json::from_value(params).map_err(invalid_params)?;
                 response_value(self.server.code_action_resolve(action, &self.context))
+            }
+            lsp::request::ResolveCompletionItem::METHOD => {
+                let item = serde_json::from_value(params).map_err(invalid_params)?;
+                response_value(self.server.completion_resolve(item, &self.context))
             }
             lsp::request::Shutdown::METHOD => {
                 let () = serde_json::from_value(params).map_err(invalid_params)?;
@@ -1795,6 +1804,9 @@ fn execute_request(
         WorkerRequest::CodeActionResolve(action) => {
             response_value(server.code_action_resolve(*action, context))
         }
+        WorkerRequest::CompletionResolve(item) => {
+            response_value(server.completion_resolve(*item, context))
+        }
     }
 }
 
@@ -2066,6 +2078,15 @@ pub trait LanguageServer: Send {
         ctx.adapt_completion(&mut response);
         Ok(Arc::new(response))
     }
+    /// Resolves the deferred properties of a completion item. The default
+    /// returns the item unchanged; servers that defer documentation override it.
+    fn completion_resolve(
+        &self,
+        item: lsp::CompletionItem,
+        _ctx: &LspContext,
+    ) -> anyhow::Result<lsp::CompletionItem> {
+        Ok(item)
+    }
     fn goto_definition(
         &self,
         doc: CodeLocation<'_>,
@@ -2174,6 +2195,9 @@ pub struct LspContext {
     completion_snippets: bool,
     completion_label_details: bool,
     completion_documentation_format: lsp::MarkupKind,
+    /// Whether the client resolves completion documentation lazily, so the
+    /// server may omit it from the initial response.
+    completion_resolve_documentation: bool,
     hover_format: lsp::MarkupKind,
     hierarchical_document_symbols: bool,
 }
@@ -2191,6 +2215,7 @@ impl LspContext {
             completion_snippets: false,
             completion_label_details: false,
             completion_documentation_format: lsp::MarkupKind::PlainText,
+            completion_resolve_documentation: false,
             hover_format: lsp::MarkupKind::PlainText,
             hierarchical_document_symbols: false,
         }
@@ -2243,6 +2268,9 @@ impl LspContext {
             .unwrap_or(false);
         self.completion_documentation_format =
             preferred_markup(completion.and_then(|item| item.documentation_format.as_deref()));
+        self.completion_resolve_documentation = completion
+            .and_then(|item| item.resolve_support.as_ref())
+            .is_some_and(|support| support.properties.iter().any(|p| p == "documentation"));
         self.hover_format = preferred_markup(
             doc.and_then(|doc| doc.hover.as_ref())
                 .and_then(|hover| hover.content_format.as_deref()),
@@ -2326,23 +2354,40 @@ impl LspContext {
             lsp::CompletionResponse::List(list) => &mut list.items,
         };
         for item in items {
-            if !self.completion_snippets
-                && item.insert_text_format == Some(lsp::InsertTextFormat::SNIPPET)
-            {
-                item.insert_text = Some(item.label.clone());
-                item.insert_text_format = Some(lsp::InsertTextFormat::PLAIN_TEXT);
-            }
-            if !self.completion_label_details {
-                item.label_details = None;
-            }
-            if self.completion_documentation_format == lsp::MarkupKind::PlainText
-                && let Some(lsp::Documentation::MarkupContent(content)) = &mut item.documentation
-                && content.kind == lsp::MarkupKind::Markdown
-            {
-                content.value = plaintext_markup(&content.value);
-                content.kind = lsp::MarkupKind::PlainText;
-            }
+            self.adapt_completion_item(item);
         }
+    }
+
+    /// Adapts one item to the negotiated completion presentation. Used for the
+    /// items of a response and for a single item returned by
+    /// `completionItem/resolve`.
+    pub(crate) fn adapt_completion_item(&self, item: &mut lsp::CompletionItem) {
+        if !self.completion_snippets
+            && item.insert_text_format == Some(lsp::InsertTextFormat::SNIPPET)
+        {
+            item.insert_text = Some(item.label.clone());
+            item.insert_text_format = Some(lsp::InsertTextFormat::PLAIN_TEXT);
+        }
+        if !self.completion_label_details {
+            item.label_details = None;
+        }
+        self.adapt_completion_documentation(item);
+    }
+
+    /// Converts an item's Markdown documentation to plaintext when the client
+    /// does not accept Markdown.
+    pub(crate) fn adapt_completion_documentation(&self, item: &mut lsp::CompletionItem) {
+        if self.completion_documentation_format == lsp::MarkupKind::PlainText
+            && let Some(lsp::Documentation::MarkupContent(content)) = &mut item.documentation
+            && content.kind == lsp::MarkupKind::Markdown
+        {
+            content.value = plaintext_markup(&content.value);
+            content.kind = lsp::MarkupKind::PlainText;
+        }
+    }
+
+    pub fn supports_lazy_completion_documentation(&self) -> bool {
+        self.completion_resolve_documentation
     }
 
     pub fn supports_code_action_resolve_edit(&self) -> bool {
@@ -2585,6 +2630,7 @@ fn capabilities() -> lsp::ServerCapabilities {
             completion_item: Some(lsp::CompletionOptionsCompletionItem {
                 label_details_support: Some(true),
             }),
+            resolve_provider: Some(true),
             ..Default::default()
         }),
         hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
