@@ -1295,16 +1295,7 @@ impl LspServer<'_> {
                 let doc = self
                     .document_location(&params.text_document.uri, params.position)
                     .map_err(invalid_params)?;
-                response_value(
-                    self.server
-                        .completion(doc, &self.context)
-                        .map(|completion| {
-                            // Keep cached completions independent of client presentation capabilities.
-                            let mut completion = completion.as_ref().clone();
-                            self.context.adapt_completion(&mut completion);
-                            completion
-                        }),
-                )
+                response_value_shared(self.server.completion_for_client(doc, &self.context))
             }
             lsp::request::GotoDefinition::METHOD => {
                 let lsp::GotoDefinitionParams {
@@ -1704,6 +1695,16 @@ fn response_value<R: Serialize>(result: anyhow::Result<R>) -> Result<Value, Resp
         .map_err(|err| response_error(ErrorCode::InternalError, err))
 }
 
+/// Like [`response_value`], but serializes a shared response in place instead of
+/// cloning it first.
+fn response_value_shared<R: Serialize>(
+    result: anyhow::Result<Arc<R>>,
+) -> Result<Value, ResponseError> {
+    result
+        .and_then(|value| Ok(serde_json::to_value(&*value)?))
+        .map_err(|err| response_error(ErrorCode::InternalError, err))
+}
+
 /// Requests whose logs summarize the response shape instead of echoing it.
 fn is_summary_method(method: &str) -> bool {
     matches!(
@@ -1767,12 +1768,7 @@ fn execute_request(
             }))
         }
         WorkerRequest::Completion(loc) => {
-            response_value(server.completion(loc.as_loc(), context).map(|completion| {
-                // Keep cached completions independent of client presentation capabilities.
-                let mut completion = completion.as_ref().clone();
-                context.adapt_completion(&mut completion);
-                completion
-            }))
+            response_value_shared(server.completion_for_client(loc.as_loc(), context))
         }
         WorkerRequest::GotoDefinition(loc) => {
             response_value(server.goto_definition(loc.as_loc(), context))
@@ -2057,6 +2053,19 @@ pub trait LanguageServer: Send {
         doc: CodeLocation<'_>,
         ctx: &LspContext,
     ) -> anyhow::Result<Arc<lsp::CompletionResponse>>;
+    /// Returns the completion response adapted to the client's presentation
+    /// capabilities. The default clones the response and adapts it; servers that
+    /// cache their completion responses should override this to reuse the
+    /// adapted form instead of re-cloning and re-adapting it per request.
+    fn completion_for_client(
+        &self,
+        doc: CodeLocation<'_>,
+        ctx: &LspContext,
+    ) -> anyhow::Result<Arc<lsp::CompletionResponse>> {
+        let mut response = self.completion(doc, ctx)?.as_ref().clone();
+        ctx.adapt_completion(&mut response);
+        Ok(Arc::new(response))
+    }
     fn goto_definition(
         &self,
         doc: CodeLocation<'_>,
@@ -2142,6 +2151,17 @@ fn plaintext_markup(markdown: &str) -> String {
     lines.join("\n").trim().to_owned()
 }
 
+/// The client capabilities that shape a completion response's presentation.
+///
+/// Fixed after `initialize`, so a server can cache the response it adapted for
+/// these flags and reuse it across prefix edits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletionPresentation {
+    pub(crate) snippets: bool,
+    pub(crate) label_details: bool,
+    pub(crate) documentation: lsp::MarkupKind,
+}
+
 #[derive(Debug, Clone)]
 pub struct LspContext {
     sender: Sender<Message>,
@@ -2206,7 +2226,7 @@ impl LspContext {
             .unwrap_or(false);
     }
 
-    fn set_presentation_capabilities(&mut self, capabilities: &lsp::ClientCapabilities) {
+    pub(crate) fn set_presentation_capabilities(&mut self, capabilities: &lsp::ClientCapabilities) {
         let doc = capabilities.text_document.as_ref();
         self.hierarchical_document_symbols = doc
             .and_then(|doc| doc.document_symbol.as_ref())
@@ -2292,7 +2312,15 @@ impl LspContext {
         }
     }
 
-    fn adapt_completion(&self, completion: &mut lsp::CompletionResponse) {
+    pub(crate) fn completion_presentation(&self) -> CompletionPresentation {
+        CompletionPresentation {
+            snippets: self.completion_snippets,
+            label_details: self.completion_label_details,
+            documentation: self.completion_documentation_format.clone(),
+        }
+    }
+
+    pub(crate) fn adapt_completion(&self, completion: &mut lsp::CompletionResponse) {
         let items = match completion {
             lsp::CompletionResponse::Array(items) => items,
             lsp::CompletionResponse::List(list) => &mut list.items,

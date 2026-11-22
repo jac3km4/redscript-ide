@@ -21,7 +21,7 @@ use crate::completions::{
 use crate::diagnostics::{DiagnosticBatch, DiagnosticTracker, diagnostic_tags, location, range};
 use crate::dialect::{self, Dialect};
 use crate::query::ExprAt;
-use crate::server::{CodeLocation, Document, LanguageServer, LspContext};
+use crate::server::{CodeLocation, CompletionPresentation, Document, LanguageServer, LspContext};
 use crate::workspace::{
     FileResolution, LoadedWorkspace, Overlay, WorkspaceDir, collect_workspace_sources,
     content_hash, record_source_read_error,
@@ -85,6 +85,10 @@ struct CachedCompletion {
     source_without_member: String,
     other_overlays: BTreeMap<PathBuf, Arc<str>>,
     response: Arc<lsp::CompletionResponse>,
+    /// The response adapted to a client's completion presentation capabilities,
+    /// produced on first use. Capabilities are fixed after `initialize`, so this
+    /// normally holds one entry that every later request reuses.
+    adapted: Option<(CompletionPresentation, Arc<lsp::CompletionResponse>)>,
 }
 
 /// Orders a file's edits by position so `TextEdit` ordering is deterministic.
@@ -718,8 +722,41 @@ impl RedscriptLanguageServer {
             source_without_member,
             other_overlays,
             response: response.clone(),
+            adapted: None,
         });
         Ok(response)
+    }
+
+    /// Returns the completion response adapted to the client's presentation
+    /// capabilities, reusing the adapted form across prefix edits at the same
+    /// receiver. The raw response stays cached so the trait's [`completion`]
+    /// remains independent of client capabilities.
+    ///
+    /// [`completion`]: LanguageServer::completion
+    fn completion_for_client(
+        &self,
+        loc: CodeLocation<'_>,
+        ctx: &LspContext,
+    ) -> anyhow::Result<Arc<lsp::CompletionResponse>> {
+        let response = self.completion_at(loc, ctx)?;
+        let presentation = ctx.completion_presentation();
+        let mut cache = self.completion_cache.lock().unwrap();
+        if let Some(cached) = cache.as_mut()
+            && Arc::ptr_eq(&cached.response, &response)
+            && let Some((key, adapted)) = &cached.adapted
+            && *key == presentation
+        {
+            return Ok(adapted.clone());
+        }
+        let mut adapted = response.as_ref().clone();
+        ctx.adapt_completion(&mut adapted);
+        let adapted = Arc::new(adapted);
+        if let Some(cached) = cache.as_mut()
+            && Arc::ptr_eq(&cached.response, &response)
+        {
+            cached.adapted = Some((presentation, adapted.clone()));
+        }
+        Ok(adapted)
     }
 
     fn definition_at(
@@ -1688,6 +1725,14 @@ impl LanguageServer for RedscriptLanguageServer {
         self.completion_at(loc, _ctx)
     }
 
+    fn completion_for_client(
+        &self,
+        loc: CodeLocation<'_>,
+        ctx: &LspContext,
+    ) -> anyhow::Result<Arc<lsp_types::CompletionResponse>> {
+        RedscriptLanguageServer::completion_for_client(self, loc, ctx)
+    }
+
     fn goto_definition(
         &self,
         loc: CodeLocation<'_>,
@@ -2087,6 +2132,75 @@ mod tests {
         server.files_changed(vec![dependency], &ctx).unwrap();
         let refreshed = server.completion_at(loc, &ctx).unwrap();
         assert!(!Arc::ptr_eq(&changed, &refreshed));
+    }
+
+    #[test]
+    fn adapted_completions_are_reused_across_prefix_edits() {
+        let (temp, mut server, mut ctx, _receiver) = fixture();
+        ctx.set_presentation_capabilities(
+            &serde_json::from_value(serde_json::json!({
+                "textDocument": {"completion": {"completionItem": {
+                    "snippetSupport": true,
+                    "labelDetailsSupport": true,
+                    "documentationFormat": ["markdown"],
+                }}},
+            }))
+            .unwrap(),
+        );
+        let path = temp.path().join("completion.reds");
+        let text = |prefix: &str| {
+            format!(
+                "public class Host {{ public func Value() -> Int32 {{ return 1; }} }} \
+                 public func Test(host: ref<Host>) {{ host.{prefix}; }}"
+            )
+        };
+        let mut previous = None;
+        for (version, prefix) in [(1, ""), (2, "V"), (3, "Val")] {
+            let text = text(prefix);
+            let buffers = open(&mut server, &ctx, &path, &text, version);
+            let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+            let loc = CodeLocation::new(
+                Document::new(path.clone(), buffer),
+                text.rfind("; }").unwrap() as u32,
+            );
+            let response = server.completion_for_client(loc, &ctx).unwrap();
+            let lsp::CompletionResponse::Array(items) = &*response else {
+                panic!("expected completion items");
+            };
+            let value = items.iter().find(|item| item.label == "Value").unwrap();
+            assert!(value.label_details.is_some());
+            assert_eq!(
+                value.insert_text_format,
+                Some(lsp::InsertTextFormat::SNIPPET)
+            );
+            if let Some(previous) = &previous {
+                assert!(Arc::ptr_eq(previous, &response));
+            }
+            previous = Some(response);
+        }
+
+        // A different presentation must adapt the cached raw response afresh
+        // rather than reuse the one adapted for the negotiated capabilities.
+        let adapted = previous.unwrap();
+        ctx.set_presentation_capabilities(&lsp::ClientCapabilities::default());
+        let text = text("Val");
+        let buffers = open(&mut server, &ctx, &path, &text, 4);
+        let buffer = buffers.get(&ctx.uri(&path).unwrap()).unwrap();
+        let loc = CodeLocation::new(
+            Document::new(path.clone(), buffer),
+            text.rfind("; }").unwrap() as u32,
+        );
+        let plain = server.completion_for_client(loc, &ctx).unwrap();
+        assert!(!Arc::ptr_eq(&adapted, &plain));
+        let lsp::CompletionResponse::Array(items) = &*plain else {
+            panic!("expected completion items");
+        };
+        let value = items.iter().find(|item| item.label == "Value").unwrap();
+        assert!(value.label_details.is_none());
+        assert_eq!(
+            value.insert_text_format,
+            Some(lsp::InsertTextFormat::PLAIN_TEXT)
+        );
     }
 
     #[test]
