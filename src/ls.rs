@@ -773,18 +773,20 @@ impl RedscriptLanguageServer {
     /// The item's `data` carries the generation of the response it came from and
     /// an index into that response's deferred docs. A resolve against a
     /// superseded generation (the cache moved on) leaves the item untouched
-    /// rather than returning the wrong documentation.
+    /// rather than returning the wrong documentation. Payloads this server did
+    /// not attach are preserved so a client or proxy relying on them keeps them.
     fn completion_resolve(
         &self,
         mut item: lsp::CompletionItem,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp::CompletionItem> {
-        let Some(data) = item.data.take() else {
+        let Some(data) = item.data.as_ref() else {
             return Ok(item);
         };
-        let Ok(resolve) = serde_json::from_value::<CompletionResolveData>(data) else {
+        let Ok(resolve) = <CompletionResolveData as serde::Deserialize>::deserialize(data) else {
             return Ok(item);
         };
+        item.data = None;
         let cache = self.completion_cache.lock().unwrap();
         let Some(cached) = cache.as_ref() else {
             return Ok(item);
