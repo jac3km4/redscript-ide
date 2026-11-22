@@ -35,10 +35,13 @@ Prioritized follow-ups from the LSP/code review. Keep fixes focused and add regr
 
 ## Completed
 
-- Reused the decoded base-game bundle, its shared `TypeInterner`, and the whole base `Symbols` table
-  across snapshots (`BaseEnv`), eliminating both the per-snapshot `ScriptBundle` decode and the
-  ~30k-entry base symbol rebuild on every edit and speculative query. Enabled by the upstream
-  forkable `TypeInterner` and covariant, copy-on-write `Symbols`.
+- Reused the decoded base-game bundle and the whole base `Symbols` table across snapshots
+  (`BaseEnv`), eliminating both the per-snapshot `ScriptBundle` decode and the ~30k-entry base
+  symbol rebuild on every edit and speculative query. Each snapshot forks a disposable child
+  `TypeInterner` from the shared base, so its own user-defined types and typos stay out of the
+  base and off its lock, and `BaseEnv` now owns its bytes and interner in a self-referential
+  value instead of leaking them. Enabled by the upstream forkable `TypeInterner` and covariant,
+  copy-on-write `Symbols`.
 - Lower only the function enclosing an IDE query in speculative query snapshots, skipping every
   unrelated function body and the whole-program validation passes.
 - Cut member-completion latency: skip the wasted REDmod recovery parse for
