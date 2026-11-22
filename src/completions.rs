@@ -160,6 +160,17 @@ const REDMOD_MISSING_SEMICOLON: &str = "expected ';' after statement in statemen
 /// The adapter deliberately rejects recovered trees, so reparse the temporary
 /// source strictly instead of allowing invalid modules into normal analysis.
 pub(crate) fn repair_completion_terminator(source: &mut String, member: Range<usize>) -> bool {
+    // A statement that already ends with `;` cannot be missing a terminator, so
+    // skip the adapter's recovery parse entirely. `completion_statement_boundary`
+    // applies the same trivia rules as the repair below, so this never hides a
+    // repair the parser would have requested.
+    let terminated = source
+        .get(member.end..)
+        .and_then(completion_statement_boundary)
+        .is_some_and(|(_, follower)| follower == Some(';'));
+    if terminated {
+        return false;
+    }
     let sources = ast::SourceMap::new();
     let id = sources.push_back("completion.script", "");
     let insertion = {
@@ -199,13 +210,23 @@ pub(crate) fn repair_completion_terminator(source: &mut String, member: Range<us
 
 // Only traverse closing delimiters and trivia, including nested block comments.
 // Return the end of the expression, before trailing comments.
-fn completion_statement_end(mut tail: &str) -> Option<usize> {
+fn completion_statement_end(tail: &str) -> Option<usize> {
+    completion_statement_boundary(tail)
+        .and_then(|(end, follower)| follower.is_none().then_some(end))
+}
+
+// Traverse the closing delimiters and trivia that may separate the completion
+// expression from its statement terminator, returning the expression end
+// (before trailing comments) and the first character that is neither trivia nor
+// a closing delimiter. `None` means an unterminated construct was reached before
+// the end of input, so the expression cannot be repaired from here.
+fn completion_statement_boundary(mut tail: &str) -> Option<(usize, Option<char>)> {
     let length = tail.len();
     let mut end = 0;
     loop {
         tail = tail.trim_start();
         if tail.is_empty() {
-            return Some(end);
+            return Some((end, None));
         }
         if tail.starts_with([')', ']']) {
             tail = &tail[1..];
@@ -216,8 +237,8 @@ fn completion_statement_end(mut tail: &str) -> Option<usize> {
                     '\n', '\r', '\u{000B}', '\u{000C}', '\u{0085}', '\u{2028}', '\u{2029}',
                 ])
                 .map_or("", |newline| &tail[newline..]);
-        } else {
-            tail = tail.strip_prefix("/*")?;
+        } else if let Some(rest) = tail.strip_prefix("/*") {
+            tail = rest;
             let mut depth = 1;
             while depth != 0 {
                 if let Some(rest) = tail.strip_prefix("/*") {
@@ -230,6 +251,8 @@ fn completion_statement_end(mut tail: &str) -> Option<usize> {
                     tail = tail.get(tail.chars().next()?.len_utf8()..)?;
                 }
             }
+        } else {
+            return Some((end, tail.chars().next()));
         }
     }
 }
@@ -352,5 +375,25 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// The repair short-circuit relies on this helper seeing a `;` through the
+    /// same closing delimiters and trivia that the repair path traverses.
+    #[test]
+    fn statement_boundary_reports_the_follower_after_delimiters_and_trivia() {
+        for (tail, expected) in [
+            (";", Some((0, Some(';')))),
+            (");", Some((1, Some(';')))),
+            ("] ;", Some((1, Some(';')))),
+            (" // comment\n;", Some((0, Some(';')))),
+            ("/* a /* nested */ b */;", Some((0, Some(';')))),
+            ("  ", Some((0, None))),
+            (")", Some((1, None))),
+            ("+", Some((0, Some('+')))),
+        ] {
+            assert_eq!(completion_statement_boundary(tail), expected, "{tail:?}");
+        }
+        // An unterminated block comment has no boundary.
+        assert_eq!(completion_statement_boundary("/* unterminated"), None);
     }
 }
