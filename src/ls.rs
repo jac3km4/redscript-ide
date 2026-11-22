@@ -4483,6 +4483,72 @@ mod tests {
         }
     }
 
+    /// LSP clients keep `CodeAction.data` as parsed JSON, where numbers are
+    /// IEEE 754 doubles and lose precision above `2^53`. Resolving a fix-one
+    /// action after such a round trip must still match the cached source hash.
+    #[test]
+    fn fix_one_survives_client_json_number_round_trip() {
+        let (server, mut ctx, path) = code_action_fixture();
+        ctx.set_code_action_capabilities(
+            &serde_json::from_value(serde_json::json!({
+                "textDocument": {"codeAction": {
+                    "codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["quickfix"]}},
+                    "dataSupport": true,
+                    "resolveSupport": {"properties": ["edit"]},
+                }},
+            }))
+            .unwrap(),
+        );
+        assert!(ctx.supports_code_action_resolve_edit());
+
+        let actions = literal_actions(
+            server
+                .code_action(path, 0..0, action_context(None), &ctx)
+                .unwrap(),
+        );
+        let mut action = actions
+            .into_iter()
+            .find(|action| action.title == "Make field public")
+            .expect("fix one action");
+        let payload = action.data.clone().unwrap();
+        assert_eq!(
+            payload["FixOne"]["expected_source_hash"]
+                .as_str()
+                .map(str::len),
+            Some(16),
+            "source hash must travel as text: {payload}"
+        );
+
+        action.data = Some(round_trip_client_numbers(payload));
+        let resolved = server.code_action_resolve(action, &ctx).unwrap();
+        assert!(resolved.disabled.is_none());
+        assert!(resolved.edit.is_some());
+    }
+
+    /// Round-trips every JSON number through `f64`, like a client that stores
+    /// parsed JSON in JavaScript numbers does.
+    fn round_trip_client_numbers(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Number(number) => {
+                let float = number.as_f64().expect("finite JSON number");
+                if float.fract() == 0.0 && float >= 0.0 {
+                    // JavaScript re-serializes integral doubles without a fraction.
+                    serde_json::Value::from(float as u64)
+                } else {
+                    serde_json::json!(float)
+                }
+            }
+            serde_json::Value::Array(items) => {
+                items.into_iter().map(round_trip_client_numbers).collect()
+            }
+            serde_json::Value::Object(entries) => entries
+                .into_iter()
+                .map(|(key, value)| (key, round_trip_client_numbers(value)))
+                .collect(),
+            value => value,
+        }
+    }
+
     #[test]
     fn resolving_fix_all_preserves_cached_fixes() {
         let server = server();

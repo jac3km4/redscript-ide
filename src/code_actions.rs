@@ -16,6 +16,41 @@ use crate::workspace::content_hash;
 
 pub(crate) type FixMap = HashMap<PathBuf, BTreeMap<(u32, u32), Vec<Fix>>>;
 
+/// Serde helpers that carry a source hash as hexadecimal text.
+///
+/// LSP clients keep `CodeAction.data` as parsed JSON, and most JSON
+/// implementations represent numbers as IEEE 754 doubles. Values above `2^53`
+/// are rounded, so a `u64` hash would come back altered from `codeAction/resolve`
+/// and every "fix one" action would be treated as stale. Text keeps all 64 bits.
+mod source_hash {
+    use std::fmt;
+
+    use serde::de::{Error, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(hash: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("{hash:016x}"))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        struct HashVisitor;
+
+        impl Visitor<'_> for HashVisitor {
+            type Value = u64;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a hexadecimal source hash")
+            }
+
+            fn visit_str<E: Error>(self, value: &str) -> Result<Self::Value, E> {
+                u64::from_str_radix(value, 16).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(HashVisitor)
+    }
+}
+
 pub(crate) fn generate_fix<'ctx>(
     diag: &Diagnostic<'ctx>,
     diag_file: &ast::File,
@@ -211,6 +246,9 @@ pub(crate) struct Fix {
     pub(crate) edit: lsp::TextEdit,
     /// Hash of the source the fix was computed against, used to reject stale
     /// fixes without retaining a copy of the whole file.
+    ///
+    /// Serialized as a hexadecimal string; see [`source_hash`].
+    #[serde(with = "source_hash")]
     pub(crate) expected_source_hash: u64,
 }
 
