@@ -19,15 +19,15 @@ lsp-server = "0.10"
 lsp-types = "0.97"
 tempfile = "3"
 rayon = "1"
-redscript-io = { git = "https://github.com/jac3km4/redscript", rev = "eac585bf92625897ff7a2f164b94ccfca62cbf0b" }
-redscript-redmod-formatter = { git = "https://github.com/jac3km4/redscript", rev = "eac585bf92625897ff7a2f164b94ccfca62cbf0b" }
-redscript-redmod-adapter = { git = "https://github.com/jac3km4/redscript", rev = "eac585bf92625897ff7a2f164b94ccfca62cbf0b", features = ["parallel"] }
-redscript-community-formatter = { git = "https://github.com/jac3km4/redscript", rev = "eac585bf92625897ff7a2f164b94ccfca62cbf0b" }
-redscript-community-parser = { git = "https://github.com/jac3km4/redscript", rev = "eac585bf92625897ff7a2f164b94ccfca62cbf0b", features = ["parallel"] }
-redscript-compiler-api = { git = "https://github.com/jac3km4/redscript", rev = "eac585bf92625897ff7a2f164b94ccfca62cbf0b", features = ["parallel"] }
-redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "eac585bf92625897ff7a2f164b94ccfca62cbf0b", features = ["parallel"] }
-redscript-dotfile = { git = "https://github.com/jac3km4/redscript", rev = "eac585bf92625897ff7a2f164b94ccfca62cbf0b" }
-redscript-code-edit = { git = "https://github.com/jac3km4/redscript", rev = "eac585bf92625897ff7a2f164b94ccfca62cbf0b" }
+redscript-io = { git = "https://github.com/jac3km4/redscript", rev = "af7bc2f1" }
+redscript-redmod-formatter = { git = "https://github.com/jac3km4/redscript", rev = "af7bc2f1" }
+redscript-redmod-adapter = { git = "https://github.com/jac3km4/redscript", rev = "af7bc2f1", features = ["parallel"] }
+redscript-community-formatter = { git = "https://github.com/jac3km4/redscript", rev = "af7bc2f1" }
+redscript-community-parser = { git = "https://github.com/jac3km4/redscript", rev = "af7bc2f1", features = ["parallel"] }
+redscript-compiler-api = { git = "https://github.com/jac3km4/redscript", rev = "af7bc2f1", features = ["parallel"] }
+redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "af7bc2f1", features = ["parallel"] }
+redscript-dotfile = { git = "https://github.com/jac3km4/redscript", rev = "af7bc2f1" }
+redscript-code-edit = { git = "https://github.com/jac3km4/redscript", rev = "af7bc2f1" }
 
 [workspace.metadata.release]
 pre-release-commit-message = "chore: release {{version}}"
