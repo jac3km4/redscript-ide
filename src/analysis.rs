@@ -6,7 +6,7 @@
 
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use hashbrown::HashMap;
 use ouroboros::self_referencing;
@@ -15,6 +15,7 @@ use redscript_compiler_api::{
     CompilationInputs, CompileErrorReporter, Diagnostic, LoweredCompilationUnit, QueryTarget,
     ScriptBundle, SourceMapExt, Symbols, TypeFlagRegistry, TypeInterner, ast, ir,
 };
+use redscript_compiler_frontend::Shared;
 
 use crate::dialect::{self, ParsedSources};
 use crate::query::{AtContext, ExprAt};
@@ -42,6 +43,72 @@ impl Deref for CacheBytes {
 impl From<Vec<u8>> for CacheBytes {
     fn from(bytes: Vec<u8>) -> Self {
         Self::Owned(Arc::from(bytes))
+    }
+}
+
+/// The decoded base-game inputs shared by every snapshot.
+///
+/// Decoding the bundle dominates the cost of a cold snapshot, so it happens once
+/// here and is reused. The decode stays lazy (it runs on the first analysis, not
+/// on snapshot construction), matching the rest of the snapshot lifecycle.
+pub(crate) struct BaseEnv {
+    /// The raw bundle bytes, borrowed for the server's lifetime.
+    ///
+    /// They are leaked rather than kept in a self-referential `ScriptBundle`:
+    /// the bundle cannot be made owned, because the upstream `ScriptBundle`'s
+    /// `into_owned` debug-asserts that a native function has no source, which
+    /// the real game bundle violates. The leak is one allocation per server.
+    bytes: &'static [u8],
+    decoded: OnceLock<DecodedBase>,
+}
+
+struct DecodedBase {
+    bundle: ScriptBundle<'static>,
+    interner: Shared<TypeInterner>,
+}
+
+impl BaseEnv {
+    pub(crate) fn new(bytes: CacheBytes) -> Self {
+        let bytes: &'static [u8] = match bytes {
+            CacheBytes::Embedded(bytes) => bytes,
+            CacheBytes::Owned(bytes) => Box::leak(Box::new(bytes)),
+        };
+        Self {
+            bytes,
+            decoded: OnceLock::new(),
+        }
+    }
+
+    /// Decodes the bundle once, on first use.
+    ///
+    /// The interner is shared (not forked) so every snapshot interns into the
+    /// same table: the first snapshot populates the base-game names, and later
+    /// snapshots resolve them without re-allocating. Snapshots stay independent
+    /// through their own [`Symbols`].
+    fn decode(&self) -> anyhow::Result<DecodedBase> {
+        Ok(DecodedBase {
+            bundle: ScriptBundle::from_bytes(self.bytes)?,
+            interner: Shared::new(TypeInterner::default()),
+        })
+    }
+
+    /// Decodes on first use and reuses the result afterwards.
+    fn decoded(&self) -> &DecodedBase {
+        self.decoded.get_or_init(|| {
+            self.decode()
+                .expect("cache bytes were validated before analysis")
+        })
+    }
+
+    /// An empty base for the placeholder snapshot, with no decode required.
+    fn empty() -> Self {
+        Self {
+            bytes: &[],
+            decoded: OnceLock::from(DecodedBase {
+                bundle: ScriptBundle::default(),
+                interner: Shared::new(TypeInterner::default()),
+            }),
+        }
     }
 }
 
@@ -83,8 +150,9 @@ impl CompilationCache {
                     Some(type_ref) => type_ref.id(),
                     None => None,
                 };
+                let interner = &cache.base.decoded().interner;
                 from_scopes
-                    .or_else(|| cache.interner.get_index(cache.interner.get_index_of(name)?))
+                    .or_else(|| interner.get_index(interner.get_index_of(name)?))
                     // The interner may know a name that has no type definition in
                     // this snapshot; callers index `Symbols` with the result.
                     .filter(|&typ| syms.get_type(typ).is_some())
@@ -132,12 +200,11 @@ fn is_type_receiver(expr: Option<&ir::Expr<'_>>) -> bool {
 
 #[self_referencing(pub_extras)]
 pub(crate) struct CompilationCache {
-    pub(crate) cache_bytes: CacheBytes,
-    pub(crate) interner: TypeInterner,
+    pub(crate) base: Arc<BaseEnv>,
     pub(crate) sources: ast::SourceMap,
     pub(crate) file_ids: HashMap<PathBuf, ast::FileId>,
 
-    #[borrows(cache_bytes, interner, sources)]
+    #[borrows(base, sources)]
     #[not_covariant]
     pub(crate) analysis: DeferredAnalysis<'this>,
 }
@@ -162,7 +229,6 @@ pub(crate) struct AnalyzedSources<'ctx> {
 /// query log closure that reads them is never called.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct AnalysisTimings {
-    pub(crate) bundle_ms: f64,
     pub(crate) symbols_ms: f64,
     pub(crate) parse_ms: f64,
     pub(crate) lower_ms: f64,
@@ -186,8 +252,8 @@ impl AnalysisTimings {
     /// Renders the phases for the verbose query log.
     pub(crate) fn summary(&self) -> String {
         format!(
-            "bundle_ms={:.3} symbols_ms={:.3} parse_ms={:.3} lower_ms={:.3} diagnostics_ms={:.3}",
-            self.bundle_ms, self.symbols_ms, self.parse_ms, self.lower_ms, self.diagnostics_ms,
+            "symbols_ms={:.3} parse_ms={:.3} lower_ms={:.3} diagnostics_ms={:.3}",
+            self.symbols_ms, self.parse_ms, self.lower_ms, self.diagnostics_ms,
         )
     }
 }
@@ -225,23 +291,21 @@ impl AnalysisMode {
 
 impl<'ctx> AnalyzedSources<'ctx> {
     fn deferred(
-        bytes: &'ctx [u8],
+        base: &'ctx Arc<BaseEnv>,
         sources: &'ctx ast::SourceMap,
-        interner: &'ctx TypeInterner,
         mode: AnalysisMode,
     ) -> DeferredAnalysis<'ctx> {
-        // Loading the base-game bundle and interning its ~30k symbols is only
-        // paid when this snapshot is actually analyzed. Snapshots that are
-        // replaced by a newer edit before they are forced stay free.
+        // Decoding the base-game bundle and interning its ~30k symbols is only
+        // paid when this snapshot is actually analyzed, and the decoded base is
+        // shared by every snapshot. Snapshots that are replaced by a newer edit
+        // before they are forced stay free.
         LazyLock::new(Box::new(move || {
+            let decoded = base.decoded();
             let mut timings = AnalysisTimings::default();
-            let bundle = AnalysisTimings::phase(&mut timings.bundle_ms, || {
-                ScriptBundle::from_bytes(bytes).expect("cache bytes were validated before analysis")
-            });
             let symbols = AnalysisTimings::phase(&mut timings.symbols_ms, || {
                 CompilationInputs::load_without_mapping(
-                    &bundle,
-                    interner,
+                    &decoded.bundle,
+                    &decoded.interner,
                     &TypeFlagRegistry::default(),
                 )
                 .expect("cache bytes were validated before analysis")
@@ -251,13 +315,25 @@ impl<'ctx> AnalyzedSources<'ctx> {
             // Only a query snapshot may abort this way; the shared active cache
             // is always fully analyzed so later queries can reuse it.
             if mode.is_query() && crate::server::is_cancelled() {
-                return Self::new(ParsedSources::empty(), symbols, interner, mode, timings);
+                return Self::new(
+                    ParsedSources::empty(),
+                    symbols,
+                    &decoded.interner,
+                    mode,
+                    timings,
+                );
             }
             let parsed = AnalysisTimings::phase(&mut timings.parse_ms, || dialect::parse(sources));
             if mode.is_query() && crate::server::is_cancelled() {
-                return Self::new(ParsedSources::empty(), symbols, interner, mode, timings);
+                return Self::new(
+                    ParsedSources::empty(),
+                    symbols,
+                    &decoded.interner,
+                    mode,
+                    timings,
+                );
             }
-            Self::new(parsed, symbols, interner, mode, timings)
+            Self::new(parsed, symbols, &decoded.interner, mode, timings)
         }))
     }
 
@@ -342,19 +418,17 @@ impl CompilationCache {
     }
 
     pub(crate) fn from_sources(
-        cache_bytes: CacheBytes,
+        base: Arc<BaseEnv>,
         sources: ast::SourceMap,
-        interner: TypeInterner,
     ) -> anyhow::Result<Self> {
-        Self::from_sources_with(cache_bytes, sources, interner, AnalysisMode::Diagnostics)
+        Self::from_sources_with(base, sources, AnalysisMode::Diagnostics)
     }
 
     /// Like [`CompilationCache::from_sources`], choosing whether the snapshot
     /// runs the diagnostic passes. Query snapshots use [`AnalysisMode::Query`].
     pub(crate) fn from_sources_with(
-        cache_bytes: CacheBytes,
+        base: Arc<BaseEnv>,
         sources: ast::SourceMap,
-        interner: TypeInterner,
         mode: AnalysisMode,
     ) -> anyhow::Result<Self> {
         let file_ids = sources
@@ -363,31 +437,19 @@ impl CompilationCache {
             .collect();
         sources.populate_boot_lib();
 
-        Self::try_new(
-            cache_bytes,
-            interner,
-            sources,
-            file_ids,
-            move |bytes, interner, sources| {
-                Ok(AnalyzedSources::deferred(
-                    &bytes[..],
-                    sources,
-                    interner,
-                    mode,
-                ))
-            },
-        )
+        Self::try_new(base, sources, file_ids, move |base, sources| {
+            Ok(AnalyzedSources::deferred(base, sources, mode))
+        })
     }
 }
 
 impl Default for CompilationCache {
     fn default() -> Self {
         Self::new(
-            CacheBytes::Embedded(&[]),
-            TypeInterner::default(),
+            Arc::new(BaseEnv::empty()),
             ast::SourceMap::default(),
             HashMap::default(),
-            |_, interner, _| {
+            |base, _| {
                 LazyLock::new(Box::new(move || {
                     AnalyzedSources::new(
                         ParsedSources {
@@ -395,7 +457,7 @@ impl Default for CompilationCache {
                             diagnostics: vec![],
                         },
                         Symbols::with_default_types(),
-                        interner,
+                        &base.decoded().interner,
                         AnalysisMode::Diagnostics,
                         AnalysisTimings::default(),
                     )
@@ -427,9 +489,8 @@ mod tests {
     fn cache_loading_is_deferred_but_validation_is_eager() {
         let corrupt: Vec<u8> = vec![0, 1, 2, 3];
         let snapshot = CompilationCache::from_sources(
-            CacheBytes::Owned(Arc::from(corrupt.clone())),
+            Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(corrupt.clone())))),
             ast::SourceMap::new(),
-            TypeInterner::default(),
         );
         assert!(snapshot.is_ok());
         assert!(CompilationCache::validate_cache_bytes(&corrupt).is_err());
@@ -446,9 +507,8 @@ mod tests {
             let sources = ast::SourceMap::new();
             let id = sources.push_back("a.reds", "public class A {}");
             let cache = CompilationCache::from_sources_with(
-                CacheBytes::Owned(Arc::from(bytes.clone())),
+                Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(bytes.clone())))),
                 sources,
-                TypeInterner::default(),
                 AnalysisMode::Query(QueryTarget { file: id, pos: 0 }),
             )
             .unwrap();
@@ -487,9 +547,8 @@ mod tests {
                 AnalysisMode::Diagnostics
             };
             let cache = CompilationCache::from_sources_with(
-                CacheBytes::Owned(Arc::from(bytes.clone())),
+                Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(bytes.clone())))),
                 sources,
-                TypeInterner::default(),
                 mode,
             )
             .unwrap();
@@ -516,6 +575,34 @@ mod tests {
         );
     }
 
+    /// Snapshots built from the same base share the decoded bundle and the
+    /// interner, but each resolves its own sources into an independent
+    /// `Symbols`: a type defined in one snapshot never leaks into another.
+    #[test]
+    fn snapshots_share_the_base_but_keep_independent_symbols() {
+        let bytes = ScriptBundle::default().into_writeable().to_bytes().unwrap();
+        let base = Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(bytes))));
+        let types = |source: &str| {
+            let sources = ast::SourceMap::new();
+            sources.push_back("a.reds", source);
+            let cache = CompilationCache::from_sources(base.clone(), sources).unwrap();
+            cache.with(|cache| {
+                cache
+                    .analysis
+                    .symbols
+                    .types()
+                    .map(|(id, _)| id.as_str().into_owned())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let a = types("public class OnlyInA {}");
+        let b = types("public class OnlyInB {}");
+        assert!(a.iter().any(|name| name == "OnlyInA"));
+        assert!(!a.iter().any(|name| name == "OnlyInB"));
+        assert!(b.iter().any(|name| name == "OnlyInB"));
+        assert!(!b.iter().any(|name| name == "OnlyInA"));
+    }
+
     /// Speculative query snapshots never read diagnostics, so they skip the
     /// `UnusedLocals` pass that full snapshots run.
     #[test]
@@ -533,9 +620,8 @@ mod tests {
                 AnalysisMode::Diagnostics
             };
             let cache = CompilationCache::from_sources_with(
-                CacheBytes::Owned(Arc::from(bytes.clone())),
+                Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(bytes.clone())))),
                 sources,
-                TypeInterner::default(),
                 mode,
             )
             .unwrap();

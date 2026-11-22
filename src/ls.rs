@@ -11,10 +11,10 @@ use lsp_types as lsp;
 use redscript_community_formatter::{FormatSettings, format_document};
 use redscript_compiler_api::ast::Span;
 use redscript_compiler_api::{
-    Diagnostic, LoweredCompilationUnit, QueryTarget, Symbols, TypeId, TypeInterner, TypeSchema, ast,
+    Diagnostic, LoweredCompilationUnit, QueryTarget, Symbols, TypeId, TypeSchema, ast,
 };
 
-use crate::analysis::{AnalysisMode, CacheBytes, CompilationCache};
+use crate::analysis::{AnalysisMode, BaseEnv, CacheBytes, CompilationCache};
 use crate::code_actions::{Fix, FixMap, FixRequest, FixScope, generate_fix};
 use crate::completions::{
     CompletionResolveData, generate_completions, member_completion_range,
@@ -208,9 +208,8 @@ impl RedscriptLanguageServer {
         }
         Ok(Self {
             compilation_cache: CompilationCache::from_sources(
-                cache_bytes,
+                Arc::new(BaseEnv::new(cache_bytes)),
                 sources,
-                TypeInterner::default(),
             )?,
             workspaces,
             config_warnings,
@@ -267,11 +266,7 @@ impl RedscriptLanguageServer {
         for (path, text) in files {
             sources.push_back(path, text);
         }
-        CompilationCache::from_sources(
-            self.compilation_cache.borrow_cache_bytes().clone(),
-            sources,
-            TypeInterner::default(),
-        )
+        CompilationCache::from_sources(self.compilation_cache.borrow_base().clone(), sources)
     }
 
     fn make_snapshot(
@@ -289,11 +284,7 @@ impl RedscriptLanguageServer {
             read_diagnostics,
             io_warnings,
         );
-        CompilationCache::from_sources(
-            self.compilation_cache.borrow_cache_bytes().clone(),
-            sources,
-            TypeInterner::default(),
-        )
+        CompilationCache::from_sources(self.compilation_cache.borrow_base().clone(), sources)
     }
 
     fn rebuild(&mut self, ctx: &LspContext) -> anyhow::Result<()> {
@@ -455,9 +446,8 @@ impl RedscriptLanguageServer {
                         standalone.insert(
                             path,
                             CompilationCache::from_sources(
-                                self.compilation_cache.borrow_cache_bytes().clone(),
+                                self.compilation_cache.borrow_base().clone(),
                                 sources,
-                                TypeInterner::default(),
                             )?,
                         );
                     }
@@ -1560,9 +1550,8 @@ impl RedscriptLanguageServer {
             pos: loc.pos().saturating_sub(1),
         };
         let query_cache = CompilationCache::from_sources_with(
-            base.borrow_cache_bytes().clone(),
+            base.borrow_base().clone(),
             sources,
-            TypeInterner::default(),
             AnalysisMode::Query(target),
         )?;
         cancelled()?;
@@ -1857,7 +1846,7 @@ impl LanguageServer for RedscriptLanguageServer {
 #[cfg(test)]
 mod tests {
     use redscript_compiler_api::{
-        CompileErrorReporter, LowerError, ScriptBundle, SourceMapExt, ir,
+        CompileErrorReporter, LowerError, ScriptBundle, SourceMapExt, TypeInterner, ir,
     };
 
     use super::*;
