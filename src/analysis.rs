@@ -15,6 +15,7 @@ use redscript_compiler_api::{
     CompilationInputs, CompileErrorReporter, Diagnostic, LoweredCompilationUnit, QueryTarget,
     ScriptBundle, SourceMapExt, Symbols, TypeFlagRegistry, TypeInterner, ast, ir,
 };
+use redscript_compiler_frontend::Shared;
 
 use crate::dialect::{self, ParsedSources};
 use crate::query::{AtContext, ExprAt};
@@ -52,34 +53,34 @@ impl From<Vec<u8>> for CacheBytes {
 /// here and is reused. The decode stays lazy (it runs on the first analysis, not
 /// on snapshot construction), matching the rest of the snapshot lifecycle.
 pub(crate) struct BaseEnv {
-    /// The raw bundle bytes, borrowed for the server's lifetime.
-    ///
-    /// They are leaked rather than kept in a self-referential `ScriptBundle`,
-    /// because the base [`Symbols`] borrows the interner and the bundle names
-    /// for `'static`; the bundle also cannot be made owned, since the upstream
-    /// `ScriptBundle::into_owned` debug-asserts that a native function has no
-    /// source, which the real game bundle violates. The leak is one allocation
-    /// per server.
-    bytes: &'static [u8],
+    /// The raw bundle bytes, owned here so the base [`Symbols`] can borrow them
+    /// without leaking them or keeping a separate self-referential bundle.
+    bytes: CacheBytes,
     decoded: OnceLock<DecodedBase>,
 }
 
+/// The base-game [`Symbols`] table together with the bytes and interner it
+/// borrows, held in one self-referential value so both outlive it without being
+/// leaked.
+///
+/// The bundle itself is not stored: upstream `ScriptBundle::into_owned`
+/// debug-asserts that a native function has no source, which the real game
+/// bundle violates, so the raw bytes are kept and the bundle is rebuilt (and
+/// dropped) inside the builder closure.
+#[self_referencing]
 struct DecodedBase {
-    /// The base interner, leaked for the server's lifetime so the base
-    /// [`Symbols`] can borrow it for `'static`. Snapshots share it, so a
-    /// user-defined type interns into the same table; they stay independent
-    /// through their own [`Symbols`], so no definition leaks between snapshots.
-    interner: &'static TypeInterner,
-    /// The base-game symbol table, built once and cloned by every snapshot.
-    symbols: Symbols<'static>,
+    bytes: CacheBytes,
+    /// The base interner, shared with every snapshot: each snapshot forks a
+    /// disposable child, so a user-defined type or typo interns into the child
+    /// and never accumulates in the base for the server's lifetime.
+    interner: Shared<TypeInterner>,
+    #[borrows(bytes, interner)]
+    #[covariant]
+    symbols: Symbols<'this>,
 }
 
 impl BaseEnv {
     pub(crate) fn new(bytes: CacheBytes) -> Self {
-        let bytes: &'static [u8] = match bytes {
-            CacheBytes::Embedded(bytes) => bytes,
-            CacheBytes::Owned(bytes) => Box::leak(Box::new(bytes)),
-        };
         Self {
             bytes,
             decoded: OnceLock::new(),
@@ -88,14 +89,19 @@ impl BaseEnv {
 
     /// Decodes the bundle and interns the base-game symbols once, on first use.
     fn decode(&self) -> anyhow::Result<DecodedBase> {
-        let bundle = ScriptBundle::from_bytes(self.bytes)?;
-        let interner: &'static TypeInterner = Box::leak(Box::new(TypeInterner::default()));
-        let symbols = CompilationInputs::load_without_mapping(
-            &bundle,
-            interner,
-            &TypeFlagRegistry::default(),
-        )?;
-        Ok(DecodedBase { interner, symbols })
+        DecodedBase::try_new(
+            self.bytes.clone(),
+            Shared::new(TypeInterner::default()),
+            |bytes, interner| {
+                let bundle = ScriptBundle::from_bytes(bytes)?;
+                let symbols = CompilationInputs::load_without_mapping(
+                    &bundle,
+                    interner,
+                    &TypeFlagRegistry::default(),
+                )?;
+                Ok::<_, anyhow::Error>(symbols)
+            },
+        )
     }
 
     /// Decodes on first use and reuses the result afterwards.
@@ -122,11 +128,12 @@ impl BaseEnv {
     /// An empty base for the placeholder snapshot, with no decode required.
     fn empty() -> Self {
         Self {
-            bytes: &[],
-            decoded: OnceLock::from(DecodedBase {
-                interner: Box::leak(Box::new(TypeInterner::default())),
-                symbols: Symbols::with_default_types(),
-            }),
+            bytes: CacheBytes::Embedded(&[]),
+            decoded: OnceLock::from(DecodedBase::new(
+                CacheBytes::Embedded(&[]),
+                Shared::new(TypeInterner::default()),
+                |_, _| Symbols::with_default_types(),
+            )),
         }
     }
 }
@@ -169,9 +176,12 @@ impl CompilationCache {
                     Some(type_ref) => type_ref.id(),
                     None => None,
                 };
-                let interner = cache.base.decoded().interner;
+                // Search the snapshot's forked interner: it resolves predef
+                // names, the shared base parent, and this snapshot's own
+                // user-defined types, which the base interner never saw.
+                let interner = cache.interner.get();
                 from_scopes
-                    .or_else(|| interner.get_index(interner.get_index_of(name)?))
+                    .or_else(|| interner.and_then(|interner| interner.get(name)))
                     // The interner may know a name that has no type definition in
                     // this snapshot; callers index `Symbols` with the result.
                     .filter(|&typ| syms.get_type(typ).is_some())
@@ -220,10 +230,17 @@ fn is_type_receiver(expr: Option<&ir::Expr<'_>>) -> bool {
 #[self_referencing(pub_extras)]
 pub(crate) struct CompilationCache {
     pub(crate) base: Arc<BaseEnv>,
+    /// A per-snapshot child of the base interner, forked on first analysis.
+    ///
+    /// Forking (rather than sharing the base interner) keeps every transient
+    /// user-defined type, typo, or partial identifier this snapshot interns out
+    /// of the base, and off its `RwLock`. The fork is lazy so a snapshot replaced
+    /// before it is forced stays free, matching the deferred analysis.
+    pub(crate) interner: OnceLock<TypeInterner>,
     pub(crate) sources: ast::SourceMap,
     pub(crate) file_ids: HashMap<PathBuf, ast::FileId>,
 
-    #[borrows(base, sources)]
+    #[borrows(base, interner, sources)]
     #[not_covariant]
     pub(crate) analysis: DeferredAnalysis<'this>,
 }
@@ -311,6 +328,7 @@ impl AnalysisMode {
 impl<'ctx> AnalyzedSources<'ctx> {
     fn deferred(
         base: &'ctx Arc<BaseEnv>,
+        interner: &'ctx OnceLock<TypeInterner>,
         sources: &'ctx ast::SourceMap,
         mode: AnalysisMode,
     ) -> DeferredAnalysis<'ctx> {
@@ -320,33 +338,28 @@ impl<'ctx> AnalyzedSources<'ctx> {
         // they are forced stay free.
         LazyLock::new(Box::new(move || {
             let decoded = base.decoded();
+            // Fork the base interner once per snapshot. The child shares every
+            // base name by pointer but isolates the types this snapshot interns,
+            // so a user-defined type or typo never reaches the shared base. The
+            // base is fully decoded above, so it is never interned into after
+            // forking.
+            let interner = interner.get_or_init(|| TypeInterner::fork(decoded.borrow_interner()));
             let mut timings = AnalysisTimings::default();
-            let symbols =
-                AnalysisTimings::phase(&mut timings.symbols_ms, || decoded.symbols.clone());
+            let symbols = AnalysisTimings::phase(&mut timings.symbols_ms, || {
+                decoded.borrow_symbols().clone()
+            });
             // A speculative query that was cancelled while the base symbols
             // loaded skips parsing and lowering: the worker discards its result.
             // Only a query snapshot may abort this way; the shared active cache
             // is always fully analyzed so later queries can reuse it.
             if mode.is_query() && crate::server::is_cancelled() {
-                return Self::new(
-                    ParsedSources::empty(),
-                    symbols,
-                    decoded.interner,
-                    mode,
-                    timings,
-                );
+                return Self::new(ParsedSources::empty(), symbols, interner, mode, timings);
             }
             let parsed = AnalysisTimings::phase(&mut timings.parse_ms, || dialect::parse(sources));
             if mode.is_query() && crate::server::is_cancelled() {
-                return Self::new(
-                    ParsedSources::empty(),
-                    symbols,
-                    decoded.interner,
-                    mode,
-                    timings,
-                );
+                return Self::new(ParsedSources::empty(), symbols, interner, mode, timings);
             }
-            Self::new(parsed, symbols, decoded.interner, mode, timings)
+            Self::new(parsed, symbols, interner, mode, timings)
         }))
     }
 
@@ -432,8 +445,8 @@ impl CompilationCache {
             .collect();
         sources.populate_boot_lib();
 
-        Self::try_new(base, sources, file_ids, move |base, sources| {
-            Ok(AnalyzedSources::deferred(base, sources, mode))
+        Self::try_new(base, OnceLock::new(), sources, file_ids, move |base, interner, sources| {
+            Ok(AnalyzedSources::deferred(base, interner, sources, mode))
         })
     }
 }
@@ -442,17 +455,21 @@ impl Default for CompilationCache {
     fn default() -> Self {
         Self::new(
             Arc::new(BaseEnv::empty()),
+            OnceLock::new(),
             ast::SourceMap::default(),
             HashMap::default(),
-            |base, _| {
+            |base, interner, _| {
                 LazyLock::new(Box::new(move || {
+                    let decoded = base.decoded();
+                    let interner =
+                        interner.get_or_init(|| TypeInterner::fork(decoded.borrow_interner()));
                     AnalyzedSources::new(
                         ParsedSources {
                             modules: vec![],
                             diagnostics: vec![],
                         },
-                        base.decoded().symbols.clone(),
-                        base.decoded().interner,
+                        decoded.borrow_symbols().clone(),
+                        interner,
                         AnalysisMode::Diagnostics,
                         AnalysisTimings::default(),
                     )
@@ -470,6 +487,12 @@ mod tests {
     use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    /// A logging context for query entry points that only need a sink.
+    fn context() -> LspContext {
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        LspContext::new(sender)
+    }
 
     /// The analysis worker thread requires the compiler cache and its lazily
     /// built analysis to cross the thread boundary, so both must stay `Send`
@@ -573,17 +596,23 @@ mod tests {
         );
     }
 
-    /// Snapshots built from the same base share the decoded bundle and the
-    /// interner, but each resolves its own sources into an independent
-    /// `Symbols`: a type defined in one snapshot never leaks into another.
+    /// Snapshots built from the same base share the decoded bundle and the base
+    /// interner's parent chain, but each resolves its own sources into an
+    /// independent `Symbols`, and interns its user-defined types into its own
+    /// forked interner: a type defined in one snapshot never leaks into another
+    /// or into the shared base.
     #[test]
     fn snapshots_share_the_base_but_keep_independent_symbols() {
         let bytes = ScriptBundle::default().into_writeable().to_bytes().unwrap();
         let base = Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(bytes))));
-        let types = |source: &str| {
+        let snapshot = |source: &str| {
             let sources = ast::SourceMap::new();
             sources.push_back("a.reds", source);
-            let cache = CompilationCache::from_sources(base.clone(), sources).unwrap();
+            CompilationCache::from_sources(base.clone(), sources).unwrap()
+        };
+        let a = snapshot("public class OnlyInA {}");
+        let b = snapshot("public class OnlyInB {}");
+        let type_names = |cache: &CompilationCache| {
             cache.with(|cache| {
                 cache
                     .analysis
@@ -593,12 +622,33 @@ mod tests {
                     .collect::<Vec<_>>()
             })
         };
-        let a = types("public class OnlyInA {}");
-        let b = types("public class OnlyInB {}");
-        assert!(a.iter().any(|name| name == "OnlyInA"));
-        assert!(!a.iter().any(|name| name == "OnlyInB"));
-        assert!(b.iter().any(|name| name == "OnlyInB"));
-        assert!(!b.iter().any(|name| name == "OnlyInA"));
+        let a_names = type_names(&a);
+        let b_names = type_names(&b);
+        assert!(a_names.iter().any(|name| name == "OnlyInA"));
+        assert!(!a_names.iter().any(|name| name == "OnlyInB"));
+        assert!(b_names.iter().any(|name| name == "OnlyInB"));
+        assert!(!b_names.iter().any(|name| name == "OnlyInA"));
+
+        // Each snapshot interns its own types into its forked child interner,
+        // never the shared base.
+        let interned = |cache: &CompilationCache, name: &str| {
+            cache
+                .borrow_interner()
+                .get()
+                .is_some_and(|interner| interner.get(name).is_some())
+        };
+        assert!(interned(&a, "OnlyInA"));
+        assert!(!interned(&a, "OnlyInB"));
+        assert!(interned(&b, "OnlyInB"));
+        assert!(!interned(&b, "OnlyInA"));
+        assert!(
+            base.decoded().borrow_interner().get("OnlyInA").is_none(),
+            "a snapshot-local type must not reach the shared base interner"
+        );
+        assert!(
+            base.decoded().borrow_interner().get("OnlyInB").is_none(),
+            "a snapshot-local type must not reach the shared base interner"
+        );
     }
 
     /// The shared aggregate behind a base type name, if it has one.
@@ -622,7 +672,7 @@ mod tests {
     fn snapshots_share_the_base_symbol_table() {
         let bytes = ScriptBundle::default().into_writeable().to_bytes().unwrap();
         let base = Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(bytes))));
-        let base_aggregate = shared_aggregate(&base.decoded().symbols, "IScriptable")
+        let base_aggregate = shared_aggregate(base.decoded().borrow_symbols(), "IScriptable")
             .expect("the default base defines IScriptable");
         let sources = ast::SourceMap::new();
         sources.push_back("a.reds", "public class A {}");
@@ -664,5 +714,44 @@ mod tests {
         };
         assert!(report(false) > 0);
         assert_eq!(report(true), 0);
+    }
+
+    /// `query_at` resolves a name through the snapshot's forked interner, which
+    /// knows the snapshot's own user-defined types; the shared base interner
+    /// never saw them. The queried file does not declare or import the type, so
+    /// the per-file scope lookup misses and only the forked interner can resolve
+    /// it.
+    #[test]
+    fn query_at_resolves_snapshot_local_types_through_the_forked_interner() {
+        let bytes = ScriptBundle::default().into_writeable().to_bytes().unwrap();
+        let base = Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(bytes))));
+        let sources = ast::SourceMap::new();
+        sources.push_back("defs.reds", "public class SnapshotLocal {}");
+        let use_source = "public func Target() -> SnapshotLocal { return new SnapshotLocal(); }";
+        let id = sources.push_back("use.reds", use_source);
+        let cache =
+            CompilationCache::from_sources(base.clone(), sources).unwrap();
+        let ctx = context();
+        let pos = use_source.find("SnapshotLocal").unwrap() as u32 + 2;
+        let resolved = cache
+            .query_at(
+                id,
+                pos,
+                |at| Ok(at.type_().map(|typ| typ.as_str().into_owned())),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("SnapshotLocal"),
+            "a snapshot-local type resolves via the snapshot's forked interner"
+        );
+        assert!(
+            base.decoded()
+                .borrow_interner()
+                .get("SnapshotLocal")
+                .is_none(),
+            "the base interner must not know the snapshot-local type"
+        );
     }
 }
