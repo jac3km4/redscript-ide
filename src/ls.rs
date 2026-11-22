@@ -3989,6 +3989,22 @@ mod tests {
         assert!(stale.documentation.is_none());
     }
 
+    /// A resolve only consumes this server's own deferred-documentation payload:
+    /// data attached by the client or a proxy is preserved and never replaced.
+    #[test]
+    fn completion_resolve_preserves_foreign_data() {
+        let (_temp, server, ctx, _receiver) = fixture();
+        let data = serde_json::json!({ "foreign": true });
+        let item = lsp::CompletionItem {
+            label: "PushBack".to_owned(),
+            data: Some(data.clone()),
+            ..Default::default()
+        };
+        let resolved = server.completion_resolve(item, &ctx).unwrap();
+        assert!(resolved.documentation.is_none());
+        assert_eq!(resolved.data, Some(data));
+    }
+
     /// Prints end-to-end member-completion latency for a multi-file workspace.
     ///
     /// Run explicitly with
