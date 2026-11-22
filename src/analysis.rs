@@ -15,7 +15,6 @@ use redscript_compiler_api::{
     CompilationInputs, CompileErrorReporter, Diagnostic, LoweredCompilationUnit, QueryTarget,
     ScriptBundle, SourceMapExt, Symbols, TypeFlagRegistry, TypeInterner, ast, ir,
 };
-use redscript_compiler_frontend::Shared;
 
 use crate::dialect::{self, ParsedSources};
 use crate::query::{AtContext, ExprAt};
@@ -48,23 +47,31 @@ impl From<Vec<u8>> for CacheBytes {
 
 /// The decoded base-game inputs shared by every snapshot.
 ///
-/// Decoding the bundle dominates the cost of a cold snapshot, so it happens once
+/// Building the base-game [`Symbols`] table (decoding the bundle and interning
+/// its ~30k names) dominates the cost of a cold snapshot, so it happens once
 /// here and is reused. The decode stays lazy (it runs on the first analysis, not
 /// on snapshot construction), matching the rest of the snapshot lifecycle.
 pub(crate) struct BaseEnv {
     /// The raw bundle bytes, borrowed for the server's lifetime.
     ///
-    /// They are leaked rather than kept in a self-referential `ScriptBundle`:
-    /// the bundle cannot be made owned, because the upstream `ScriptBundle`'s
-    /// `into_owned` debug-asserts that a native function has no source, which
-    /// the real game bundle violates. The leak is one allocation per server.
+    /// They are leaked rather than kept in a self-referential `ScriptBundle`,
+    /// because the base [`Symbols`] borrows the interner and the bundle names
+    /// for `'static`; the bundle also cannot be made owned, since the upstream
+    /// `ScriptBundle::into_owned` debug-asserts that a native function has no
+    /// source, which the real game bundle violates. The leak is one allocation
+    /// per server.
     bytes: &'static [u8],
     decoded: OnceLock<DecodedBase>,
 }
 
 struct DecodedBase {
-    bundle: ScriptBundle<'static>,
-    interner: Shared<TypeInterner>,
+    /// The base interner, leaked for the server's lifetime so the base
+    /// [`Symbols`] can borrow it for `'static`. Snapshots share it, so a
+    /// user-defined type interns into the same table; they stay independent
+    /// through their own [`Symbols`], so no definition leaks between snapshots.
+    interner: &'static TypeInterner,
+    /// The base-game symbol table, built once and cloned by every snapshot.
+    symbols: Symbols<'static>,
 }
 
 impl BaseEnv {
@@ -79,17 +86,16 @@ impl BaseEnv {
         }
     }
 
-    /// Decodes the bundle once, on first use.
-    ///
-    /// The interner is shared (not forked) so every snapshot interns into the
-    /// same table: the first snapshot populates the base-game names, and later
-    /// snapshots resolve them without re-allocating. Snapshots stay independent
-    /// through their own [`Symbols`].
+    /// Decodes the bundle and interns the base-game symbols once, on first use.
     fn decode(&self) -> anyhow::Result<DecodedBase> {
-        Ok(DecodedBase {
-            bundle: ScriptBundle::from_bytes(self.bytes)?,
-            interner: Shared::new(TypeInterner::default()),
-        })
+        let bundle = ScriptBundle::from_bytes(self.bytes)?;
+        let interner: &'static TypeInterner = Box::leak(Box::new(TypeInterner::default()));
+        let symbols = CompilationInputs::load_without_mapping(
+            &bundle,
+            interner,
+            &TypeFlagRegistry::default(),
+        )?;
+        Ok(DecodedBase { interner, symbols })
     }
 
     /// Decodes on first use and reuses the result afterwards.
@@ -100,13 +106,26 @@ impl BaseEnv {
         })
     }
 
+    /// Decodes eagerly and caches the result, reporting invalid bytes.
+    ///
+    /// A configured cache is validated at startup this way, and the same decode
+    /// then serves the first snapshot, so the work is not done twice.
+    pub(crate) fn ensure_decoded(&self) -> anyhow::Result<()> {
+        if self.decoded.get().is_some() {
+            return Ok(());
+        }
+        let decoded = self.decode()?;
+        self.decoded.set(decoded).ok();
+        Ok(())
+    }
+
     /// An empty base for the placeholder snapshot, with no decode required.
     fn empty() -> Self {
         Self {
             bytes: &[],
             decoded: OnceLock::from(DecodedBase {
-                bundle: ScriptBundle::default(),
-                interner: Shared::new(TypeInterner::default()),
+                interner: Box::leak(Box::new(TypeInterner::default())),
+                symbols: Symbols::with_default_types(),
             }),
         }
     }
@@ -150,7 +169,7 @@ impl CompilationCache {
                     Some(type_ref) => type_ref.id(),
                     None => None,
                 };
-                let interner = &cache.base.decoded().interner;
+                let interner = cache.base.decoded().interner;
                 from_scopes
                     .or_else(|| interner.get_index(interner.get_index_of(name)?))
                     // The interner may know a name that has no type definition in
@@ -295,21 +314,15 @@ impl<'ctx> AnalyzedSources<'ctx> {
         sources: &'ctx ast::SourceMap,
         mode: AnalysisMode,
     ) -> DeferredAnalysis<'ctx> {
-        // Decoding the base-game bundle and interning its ~30k symbols is only
-        // paid when this snapshot is actually analyzed, and the decoded base is
-        // shared by every snapshot. Snapshots that are replaced by a newer edit
-        // before they are forced stay free.
+        // The base-game bundle and symbol table are decoded once and shared by
+        // every snapshot: forcing this snapshot only clones the copy-on-write
+        // base table, which is cheap. Snapshots replaced by a newer edit before
+        // they are forced stay free.
         LazyLock::new(Box::new(move || {
             let decoded = base.decoded();
             let mut timings = AnalysisTimings::default();
-            let symbols = AnalysisTimings::phase(&mut timings.symbols_ms, || {
-                CompilationInputs::load_without_mapping(
-                    &decoded.bundle,
-                    &decoded.interner,
-                    &TypeFlagRegistry::default(),
-                )
-                .expect("cache bytes were validated before analysis")
-            });
+            let symbols =
+                AnalysisTimings::phase(&mut timings.symbols_ms, || decoded.symbols.clone());
             // A speculative query that was cancelled while the base symbols
             // loaded skips parsing and lowering: the worker discards its result.
             // Only a query snapshot may abort this way; the shared active cache
@@ -318,7 +331,7 @@ impl<'ctx> AnalyzedSources<'ctx> {
                 return Self::new(
                     ParsedSources::empty(),
                     symbols,
-                    &decoded.interner,
+                    decoded.interner,
                     mode,
                     timings,
                 );
@@ -328,12 +341,12 @@ impl<'ctx> AnalyzedSources<'ctx> {
                 return Self::new(
                     ParsedSources::empty(),
                     symbols,
-                    &decoded.interner,
+                    decoded.interner,
                     mode,
                     timings,
                 );
             }
-            Self::new(parsed, symbols, &decoded.interner, mode, timings)
+            Self::new(parsed, symbols, decoded.interner, mode, timings)
         }))
     }
 
@@ -360,24 +373,6 @@ impl<'ctx> AnalyzedSources<'ctx> {
             diagnostics: reporter.into_reported(),
             timings,
         }
-    }
-}
-
-impl CompilationCache {
-    /// Decodes the cache and interns its symbols once, discarding the result.
-    ///
-    /// [`CompilationCache::from_sources`] defers that work so a snapshot that is
-    /// never analyzed stays cheap, but a corrupt configured cache must still be
-    /// detected when the language server starts. Callers validate once per byte
-    /// source, then rely on every later snapshot failing the same way.
-    pub(crate) fn validate_cache_bytes(bytes: &[u8]) -> anyhow::Result<()> {
-        let bundle = ScriptBundle::from_bytes(bytes)?;
-        CompilationInputs::load_without_mapping(
-            &bundle,
-            &TypeInterner::default(),
-            &TypeFlagRegistry::default(),
-        )?;
-        Ok(())
     }
 }
 
@@ -456,8 +451,8 @@ impl Default for CompilationCache {
                             modules: vec![],
                             diagnostics: vec![],
                         },
-                        Symbols::with_default_types(),
-                        &base.decoded().interner,
+                        base.decoded().symbols.clone(),
+                        base.decoded().interner,
                         AnalysisMode::Diagnostics,
                         AnalysisTimings::default(),
                     )
@@ -470,6 +465,8 @@ impl Default for CompilationCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redscript_compiler_api::{Aggregate, TypeSchema};
+    use redscript_compiler_frontend::Shared;
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -484,18 +481,18 @@ mod tests {
 
     /// Building a snapshot must not deserialize the cache; validating the bytes
     /// is the only eager step, so a corrupt configured cache is still reported
-    /// at startup while an unforced snapshot stays free.
+    /// at startup while an unforced snapshot stays free. Validation warms the
+    /// shared base, so the first snapshot reuses that decode.
     #[test]
     fn cache_loading_is_deferred_but_validation_is_eager() {
         let corrupt: Vec<u8> = vec![0, 1, 2, 3];
-        let snapshot = CompilationCache::from_sources(
-            Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(corrupt.clone())))),
-            ast::SourceMap::new(),
-        );
+        let base = Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(corrupt))));
+        let snapshot = CompilationCache::from_sources(base.clone(), ast::SourceMap::new());
         assert!(snapshot.is_ok());
-        assert!(CompilationCache::validate_cache_bytes(&corrupt).is_err());
+        assert!(base.ensure_decoded().is_err());
         let valid = ScriptBundle::default().into_writeable().to_bytes().unwrap();
-        assert!(CompilationCache::validate_cache_bytes(&valid).is_ok());
+        let base = Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(valid))));
+        assert!(base.ensure_decoded().is_ok());
     }
 
     /// A cancelled speculative query skips parsing and lowering, while a query
@@ -601,6 +598,41 @@ mod tests {
         assert!(!a.iter().any(|name| name == "OnlyInB"));
         assert!(b.iter().any(|name| name == "OnlyInB"));
         assert!(!b.iter().any(|name| name == "OnlyInA"));
+    }
+
+    /// The shared aggregate behind a base type name, if it has one.
+    fn shared_aggregate<'ctx>(
+        symbols: &Symbols<'ctx>,
+        name: &str,
+    ) -> Option<Shared<Aggregate<'ctx>>> {
+        symbols
+            .types()
+            .find(|(id, _)| id.as_str().as_ref() == name)
+            .and_then(|(_, def)| match def.schema() {
+                TypeSchema::Aggregate(aggregate) => Some(aggregate.clone()),
+                _ => None,
+            })
+    }
+
+    /// The base symbol table is built once and cloned per snapshot: an untouched
+    /// base type is shared by pointer between the base and every snapshot rather
+    /// than deep-copied, which is what makes reuse cheap.
+    #[test]
+    fn snapshots_share_the_base_symbol_table() {
+        let bytes = ScriptBundle::default().into_writeable().to_bytes().unwrap();
+        let base = Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(bytes))));
+        let base_aggregate = shared_aggregate(&base.decoded().symbols, "IScriptable")
+            .expect("the default base defines IScriptable");
+        let sources = ast::SourceMap::new();
+        sources.push_back("a.reds", "public class A {}");
+        let cache = CompilationCache::from_sources(base.clone(), sources).unwrap();
+        let snapshot_aggregate = cache
+            .with(|cache| shared_aggregate(&cache.analysis.symbols, "IScriptable"))
+            .expect("the snapshot inherits IScriptable");
+        assert!(
+            Shared::ptr_eq(&base_aggregate, &snapshot_aggregate),
+            "an untouched base aggregate is shared, not copied"
+        );
     }
 
     /// Speculative query snapshots never read diagnostics, so they skip the

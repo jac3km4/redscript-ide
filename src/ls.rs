@@ -200,17 +200,16 @@ impl RedscriptLanguageServer {
         let mut diagnostics = DiagnosticTracker::default();
         diagnostics.set_reads(read_diagnostics);
         diagnostics.set_configs(config_diagnostics);
+        let base = Arc::new(BaseEnv::new(cache_bytes));
         // Validate a configured cache once, so a corrupt file is reported at
         // startup (and `main` can fall back to the embedded cache) instead of on
-        // the first analysis. The trusted embedded cache skips this decode.
+        // the first analysis. The trusted embedded cache skips this decode, and
+        // a validated cache warms the shared base for the first snapshot.
         if validate {
-            CompilationCache::validate_cache_bytes(&cache_bytes)?;
+            base.ensure_decoded()?;
         }
         Ok(Self {
-            compilation_cache: CompilationCache::from_sources(
-                Arc::new(BaseEnv::new(cache_bytes)),
-                sources,
-            )?,
+            compilation_cache: CompilationCache::from_sources(base, sources)?,
             workspaces,
             config_warnings,
             reported_config_warnings: BTreeSet::new(),
