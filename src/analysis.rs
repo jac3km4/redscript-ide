@@ -464,9 +464,10 @@ impl Default for CompilationCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use redscript_compiler_api::{Aggregate, TypeSchema};
     use redscript_compiler_frontend::Shared;
+
+    use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
 
