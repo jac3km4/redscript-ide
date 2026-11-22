@@ -8,6 +8,10 @@ use crate::dialect::Dialect;
 use crate::display::{DocDisplay, FunctionTypeDisplay, SnippetDisplay};
 use crate::query::{AtContext, ExprAt, ReceiverTypeEnvs};
 
+/// How many members to format between cooperative cancellation checks while
+/// building a completion response.
+const CANCELLATION_INTERVAL: usize = 64;
+
 pub fn method<'ctx>(
     name: &'ctx str,
     typ: &FunctionType<'ctx>,
@@ -347,34 +351,37 @@ pub(crate) fn generate_completions(
         let symbols = at.symbols();
         let envs = ReceiverTypeEnvs::new(typ, symbols);
 
-        // A receiver can expose hundreds of inherited members; let a cancelled
-        // request stop formatting them instead of blocking newer work.
-        crate::ls::cancelled()?;
-        let methods = symbols
+        // A receiver can expose hundreds of inherited members; a cancelled
+        // request stops formatting them instead of blocking newer work.
+        let mut formatted = 0;
+        for e in symbols
             .query_methods(typ.id())
             .filter(|m| !m.func().flags().is_static())
-            .map(|e| {
-                instance_method(
-                    e.name(),
-                    e.key().parent(),
-                    e.func().type_(),
-                    &envs,
-                    e.func().doc(),
-                )
-            });
-        completions.extend(methods);
+        {
+            if formatted % CANCELLATION_INTERVAL == 0 {
+                crate::ls::cancelled()?;
+            }
+            formatted += 1;
+            completions.push(instance_method(
+                e.name(),
+                e.key().parent(),
+                e.func().type_(),
+                &envs,
+                e.func().doc(),
+            ));
+        }
 
-        crate::ls::cancelled()?;
-        let fields = symbols
-            .base_iter_with_self(typ.id())
-            .flat_map(|(declaring_type, agg)| {
-                let envs = &envs;
-                agg.fields().iter().map(move |e| {
-                    let specialized = envs.field_type(declaring_type, e.field().type_());
-                    field(e.name(), e.field(), specialized.as_ref())
-                })
-            });
-        completions.extend(fields);
+        formatted = 0;
+        for (declaring_type, agg) in symbols.base_iter_with_self(typ.id()) {
+            for e in agg.fields().iter() {
+                if formatted % CANCELLATION_INTERVAL == 0 {
+                    crate::ls::cancelled()?;
+                }
+                formatted += 1;
+                let specialized = envs.field_type(declaring_type, e.field().type_());
+                completions.push(field(e.name(), e.field(), specialized.as_ref()));
+            }
+        }
     };
 
     // A client that resolves documentation lazily gets it omitted here and
