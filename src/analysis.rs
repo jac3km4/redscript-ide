@@ -445,9 +445,15 @@ impl CompilationCache {
             .collect();
         sources.populate_boot_lib();
 
-        Self::try_new(base, OnceLock::new(), sources, file_ids, move |base, interner, sources| {
-            Ok(AnalyzedSources::deferred(base, interner, sources, mode))
-        })
+        Self::try_new(
+            base,
+            OnceLock::new(),
+            sources,
+            file_ids,
+            move |base, interner, sources| {
+                Ok(AnalyzedSources::deferred(base, interner, sources, mode))
+            },
+        )
     }
 }
 
@@ -729,8 +735,7 @@ mod tests {
         sources.push_back("defs.reds", "public class SnapshotLocal {}");
         let use_source = "public func Target() -> SnapshotLocal { return new SnapshotLocal(); }";
         let id = sources.push_back("use.reds", use_source);
-        let cache =
-            CompilationCache::from_sources(base.clone(), sources).unwrap();
+        let cache = CompilationCache::from_sources(base.clone(), sources).unwrap();
         let ctx = context();
         let pos = use_source.find("SnapshotLocal").unwrap() as u32 + 2;
         let resolved = cache
