@@ -11,7 +11,7 @@ use lsp_types as lsp;
 use redscript_community_formatter::{FormatSettings, format_document};
 use redscript_compiler_api::ast::Span;
 use redscript_compiler_api::{
-    Diagnostic, LoweredCompilationUnit, Symbols, TypeId, TypeInterner, TypeSchema, ast,
+    Diagnostic, LoweredCompilationUnit, QueryTarget, Symbols, TypeId, TypeInterner, TypeSchema, ast,
 };
 
 use crate::analysis::{AnalysisMode, CacheBytes, CompilationCache};
@@ -1553,11 +1553,17 @@ impl RedscriptLanguageServer {
 
         let id = sources.push_back(&path, contents);
         cancelled()?;
+        // `query_at` selects the enclosing function at `loc.pos().saturating_sub(1)`,
+        // so the single-function lowering must use the same byte.
+        let target = QueryTarget {
+            file: id,
+            pos: loc.pos().saturating_sub(1),
+        };
         let query_cache = CompilationCache::from_sources_with(
             base.borrow_cache_bytes().clone(),
             sources,
             TypeInterner::default(),
-            AnalysisMode::Query,
+            AnalysisMode::Query(target),
         )?;
         cancelled()?;
         query_cache.query_at(id, loc.pos(), cb, ctx)
@@ -3546,6 +3552,30 @@ mod tests {
                 });
             }
         }
+    }
+
+    /// A speculative query lowers only the function enclosing the cursor, so a
+    /// completion must still resolve a receiver type declared in another file
+    /// even when an unrelated function precedes the queried one.
+    #[test]
+    fn member_completion_resolves_a_cross_file_receiver_in_a_later_function() {
+        let (temp, mut server, ctx, _receiver) = fixture();
+        let other = temp.path().join("other.reds");
+        fs::write(
+            &other,
+            "public class Other { public func Size() -> String { return \"x\"; } }",
+        )
+        .unwrap();
+        server.files_changed(vec![other], &ctx).unwrap();
+        let path = temp.path().join("members.reds");
+        let text = "public func Unrelated() -> Int32 { return 0; }\n\
+                    public func Test(values: ref<Other>) { values.Si; }";
+        let response = dot_completions(&mut server, &ctx, &path, text, 1);
+        let lsp::CompletionResponse::Array(items) = &*response else {
+            panic!("expected completion items");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "Size");
     }
 
     #[test]

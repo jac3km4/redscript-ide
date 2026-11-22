@@ -7,8 +7,8 @@ use std::{fs, io};
 use ignore::IncrementalIgnore;
 use rayon::prelude::*;
 use redscript_compiler_api::{
-    CompileErrorReporter, Diagnostic, DiagnosticLevel, LoweredCompilationUnit, Symbols,
-    TypeInterner, ast, parse_file,
+    CompileErrorReporter, Diagnostic, DiagnosticLevel, LoweredCompilationUnit, QueryTarget,
+    Symbols, TypeInterner, ast, parse_file,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,11 +245,17 @@ impl<'src> ParsedSources<'src> {
             .collect()
     }
 
+    /// Lowers the parsed modules into a compilation unit.
+    ///
+    /// `target` selects the single-function query pipeline: only the function
+    /// enclosing the target position is lowered, which is all an IDE query reads.
+    /// `None` runs the full pipeline used for diagnostics.
     pub fn process(
         &self,
         symbols: Symbols<'src>,
         reporter: &mut CompileErrorReporter<'src>,
         interner: &'src TypeInterner,
+        target: Option<QueryTarget>,
     ) -> (LoweredCompilationUnit<'src>, Symbols<'src>) {
         let invalid_files = self.diagnostic_files();
         let mut redmods = Vec::new();
@@ -266,13 +272,23 @@ impl<'src> ParsedSources<'src> {
                 }
             }
         }
-        let (unit, symbols, errors) = redscript_redmod_adapter::process_sources(
-            redmods,
-            dependencies,
-            symbols,
-            reporter,
-            interner,
-        );
+        let (unit, symbols, errors) = match target {
+            Some(target) => redscript_redmod_adapter::process_sources_for_query(
+                redmods,
+                dependencies,
+                symbols,
+                reporter,
+                interner,
+                target,
+            ),
+            None => redscript_redmod_adapter::process_sources(
+                redmods,
+                dependencies,
+                symbols,
+                reporter,
+                interner,
+            ),
+        };
         reporter.report_many(errors.into_iter().map(redmod_diagnostic));
         (unit, symbols)
     }

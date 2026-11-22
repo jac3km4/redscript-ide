@@ -12,8 +12,8 @@ use hashbrown::HashMap;
 use ouroboros::self_referencing;
 use redscript_compiler_api::pass::{DiagnosticPass, UnusedLocals};
 use redscript_compiler_api::{
-    CompilationInputs, CompileErrorReporter, Diagnostic, LoweredCompilationUnit, ScriptBundle,
-    SourceMapExt, Symbols, TypeFlagRegistry, TypeInterner, ast, ir,
+    CompilationInputs, CompileErrorReporter, Diagnostic, LoweredCompilationUnit, QueryTarget,
+    ScriptBundle, SourceMapExt, Symbols, TypeFlagRegistry, TypeInterner, ast, ir,
 };
 
 use crate::dialect::{self, ParsedSources};
@@ -199,15 +199,27 @@ pub(crate) enum AnalysisMode {
     /// Full lowering plus the diagnostic passes; required when the snapshot's
     /// diagnostics are read.
     Diagnostics,
-    /// Lowering only. Speculative query snapshots never read diagnostics, so the
-    /// `UnusedLocals` pass (which visits every function in the workspace) is
-    /// skipped.
-    Query,
+    /// Lower only the function enclosing an IDE query. Speculative query
+    /// snapshots never read diagnostics, so the `UnusedLocals` pass (which
+    /// visits every function in the workspace) is skipped, and every unrelated
+    /// function body stays unlifted.
+    Query(QueryTarget),
 }
 
 impl AnalysisMode {
     fn run_diagnostics(self) -> bool {
         matches!(self, Self::Diagnostics)
+    }
+
+    fn query_target(self) -> Option<QueryTarget> {
+        match self {
+            Self::Diagnostics => None,
+            Self::Query(target) => Some(target),
+        }
+    }
+
+    fn is_query(self) -> bool {
+        matches!(self, Self::Query(_))
     }
 }
 
@@ -238,11 +250,11 @@ impl<'ctx> AnalyzedSources<'ctx> {
             // loaded skips parsing and lowering: the worker discards its result.
             // Only a query snapshot may abort this way; the shared active cache
             // is always fully analyzed so later queries can reuse it.
-            if mode == AnalysisMode::Query && crate::server::is_cancelled() {
+            if mode.is_query() && crate::server::is_cancelled() {
                 return Self::new(ParsedSources::empty(), symbols, interner, mode, timings);
             }
             let parsed = AnalysisTimings::phase(&mut timings.parse_ms, || dialect::parse(sources));
-            if mode == AnalysisMode::Query && crate::server::is_cancelled() {
+            if mode.is_query() && crate::server::is_cancelled() {
                 return Self::new(ParsedSources::empty(), symbols, interner, mode, timings);
             }
             Self::new(parsed, symbols, interner, mode, timings)
@@ -258,7 +270,7 @@ impl<'ctx> AnalyzedSources<'ctx> {
     ) -> Self {
         let mut reporter = CompileErrorReporter::default();
         let (unit, symbols) = AnalysisTimings::phase(&mut timings.lower_ms, || {
-            parsed.process(symbols, &mut reporter, interner)
+            parsed.process(symbols, &mut reporter, interner, mode.query_target())
         });
         if mode.run_diagnostics() {
             AnalysisTimings::phase(&mut timings.diagnostics_ms, || {
@@ -432,12 +444,12 @@ mod tests {
         let bytes = ScriptBundle::default().into_writeable().to_bytes().unwrap();
         let modules = |cancelled: bool| {
             let sources = ast::SourceMap::new();
-            sources.push_back("a.reds", "public class A {}");
+            let id = sources.push_back("a.reds", "public class A {}");
             let cache = CompilationCache::from_sources_with(
                 CacheBytes::Owned(Arc::from(bytes.clone())),
                 sources,
                 TypeInterner::default(),
-                AnalysisMode::Query,
+                AnalysisMode::Query(QueryTarget { file: id, pos: 0 }),
             )
             .unwrap();
             let token = crate::server::CancelToken::default();
@@ -453,17 +465,73 @@ mod tests {
         assert_eq!(modules(true), 0);
     }
 
+    /// Query snapshots lower only the function enclosing the target position,
+    /// while a diagnostics snapshot lowers every function in the workspace.
+    /// `query_at` only reads the enclosing function, so this is the work query
+    /// mode removes.
+    #[test]
+    fn query_mode_lowers_only_the_target_function() {
+        let bytes = ScriptBundle::default().into_writeable().to_bytes().unwrap();
+        let source = "public func First() -> Int32 { return 1; }\n\
+                      public func Second() -> Int32 { return 2; }";
+        let target = source.find("return 2").unwrap() as u32;
+        let spans = |query: bool| {
+            let sources = ast::SourceMap::new();
+            let id = sources.push_back("a.reds", source);
+            let mode = if query {
+                AnalysisMode::Query(QueryTarget {
+                    file: id,
+                    pos: target,
+                })
+            } else {
+                AnalysisMode::Diagnostics
+            };
+            let cache = CompilationCache::from_sources_with(
+                CacheBytes::Owned(Arc::from(bytes.clone())),
+                sources,
+                TypeInterner::default(),
+                mode,
+            )
+            .unwrap();
+            cache.with(|cache| {
+                cache
+                    .analysis
+                    .unit
+                    .all_functions()
+                    .map(|func| func.span)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let all = spans(false);
+        assert!(all.iter().any(|span| span.contains(target)));
+        let query = spans(true);
+        assert_eq!(query.len(), 1, "only the target function should be lowered");
+        assert!(
+            query[0].contains(target),
+            "the lowered span encloses the target"
+        );
+        assert!(
+            all.len() > query.len(),
+            "query mode lowers strictly less than a full snapshot"
+        );
+    }
+
     /// Speculative query snapshots never read diagnostics, so they skip the
     /// `UnusedLocals` pass that full snapshots run.
     #[test]
     fn query_mode_skips_diagnostic_passes() {
         let bytes = ScriptBundle::default().into_writeable().to_bytes().unwrap();
-        let report = |mode| {
+        let report = |query: bool| {
             let sources = ast::SourceMap::new();
-            sources.push_back(
+            let id = sources.push_back(
                 "unused.reds",
                 "public func Test() -> Void { let unused = 1; }",
             );
+            let mode = if query {
+                AnalysisMode::Query(QueryTarget { file: id, pos: 0 })
+            } else {
+                AnalysisMode::Diagnostics
+            };
             let cache = CompilationCache::from_sources_with(
                 CacheBytes::Owned(Arc::from(bytes.clone())),
                 sources,
@@ -475,7 +543,7 @@ mod tests {
                 .analyze(|_, _, diagnostics, _| Ok(diagnostics.len()))
                 .unwrap()
         };
-        assert!(report(AnalysisMode::Diagnostics) > 0);
-        assert_eq!(report(AnalysisMode::Query), 0);
+        assert!(report(false) > 0);
+        assert_eq!(report(true), 0);
     }
 }
