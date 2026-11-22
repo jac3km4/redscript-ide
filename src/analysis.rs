@@ -234,7 +234,17 @@ impl<'ctx> AnalyzedSources<'ctx> {
                 )
                 .expect("cache bytes were validated before analysis")
             });
+            // A speculative query that was cancelled while the base symbols
+            // loaded skips parsing and lowering: the worker discards its result.
+            // Only a query snapshot may abort this way; the shared active cache
+            // is always fully analyzed so later queries can reuse it.
+            if mode == AnalysisMode::Query && crate::server::is_cancelled() {
+                return Self::new(ParsedSources::empty(), symbols, interner, mode, timings);
+            }
             let parsed = AnalysisTimings::phase(&mut timings.parse_ms, || dialect::parse(sources));
+            if mode == AnalysisMode::Query && crate::server::is_cancelled() {
+                return Self::new(ParsedSources::empty(), symbols, interner, mode, timings);
+            }
             Self::new(parsed, symbols, interner, mode, timings)
         }))
     }
@@ -413,6 +423,34 @@ mod tests {
         assert!(CompilationCache::validate_cache_bytes(&corrupt).is_err());
         let valid = ScriptBundle::default().into_writeable().to_bytes().unwrap();
         assert!(CompilationCache::validate_cache_bytes(&valid).is_ok());
+    }
+
+    /// A cancelled speculative query skips parsing and lowering, while a query
+    /// that runs to completion still parses its sources.
+    #[test]
+    fn a_cancelled_query_snapshot_skips_parsing_and_lowering() {
+        let bytes = ScriptBundle::default().into_writeable().to_bytes().unwrap();
+        let modules = |cancelled: bool| {
+            let sources = ast::SourceMap::new();
+            sources.push_back("a.reds", "public class A {}");
+            let cache = CompilationCache::from_sources_with(
+                CacheBytes::Owned(Arc::from(bytes.clone())),
+                sources,
+                TypeInterner::default(),
+                AnalysisMode::Query,
+            )
+            .unwrap();
+            let token = crate::server::CancelToken::default();
+            if cancelled {
+                token.cancel();
+            }
+            crate::server::set_current_cancel(token);
+            let count = cache.with(|cache| cache.analysis.parsed.modules.len());
+            crate::server::clear_current_cancel();
+            count
+        };
+        assert!(modules(false) > 0);
+        assert_eq!(modules(true), 0);
     }
 
     /// Speculative query snapshots never read diagnostics, so they skip the

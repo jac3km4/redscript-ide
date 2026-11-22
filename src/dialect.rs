@@ -229,6 +229,15 @@ pub struct ParsedSources<'src> {
 }
 
 impl<'src> ParsedSources<'src> {
+    /// An analysis with no parsed modules, used when a speculative query is
+    /// cancelled before parsing.
+    pub fn empty() -> Self {
+        Self {
+            modules: vec![],
+            diagnostics: vec![],
+        }
+    }
+
     pub fn diagnostic_files(&self) -> HashSet<ast::FileId> {
         self.diagnostics
             .iter()
