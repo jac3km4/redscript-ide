@@ -147,7 +147,7 @@ fn local_definition_span(function: &LoweredFunction<'_>, local: ir::Local) -> Op
     fn authored_span(info: &ir::LocalInfo<'_>) -> Option<Span> {
         // Generated temporaries can inherit source spans, but are not declarations.
         (info.name.is_some() && info.temporary_purpose.is_none())
-            .then_some(info.span)
+            .then_some(info.name_span)
             .flatten()
     }
 
@@ -612,7 +612,7 @@ mod tests {
             .filter(|info| info.temporary_purpose.is_some())
             .collect();
         assert!(!generated.is_empty());
-        assert!(generated.iter().any(|info| info.span.is_some()));
+        assert!(generated.iter().any(|info| info.name_span.is_some()));
         for info in generated {
             let expr = ir::Expr::Local(info.id, function.span);
             assert_eq!(

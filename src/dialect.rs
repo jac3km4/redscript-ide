@@ -210,7 +210,7 @@ pub fn discover(
 
 pub enum ParsedModule<'src> {
     Community(ast::SourceModule<'src>),
-    Redmod(redscript_redmod_adapter::ParsedModule<'src>),
+    Redmod(redscript_redmod_adapter::AdaptedModule<'src>),
 }
 
 impl<'src> ParsedModule<'src> {
