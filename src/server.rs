@@ -148,7 +148,7 @@ enum WorkerCmd {
     Request {
         id: RequestId,
         method: String,
-        kind: Box<WorkerRequest>,
+        request: Box<WorkerRequest>,
         started: Instant,
         cancel: CancelToken,
     },
@@ -223,7 +223,7 @@ impl LanguageServer for NoopServer {
 
     fn hover(
         &self,
-        _doc: CodeLocation<'_>,
+        _loc: CodeLocation<'_>,
         _ctx: &LspContext,
     ) -> anyhow::Result<Option<lsp::Hover>> {
         Ok(None)
@@ -231,7 +231,7 @@ impl LanguageServer for NoopServer {
 
     fn completion(
         &self,
-        _doc: CodeLocation<'_>,
+        _loc: CodeLocation<'_>,
         _ctx: &LspContext,
     ) -> anyhow::Result<Arc<lsp::CompletionResponse>> {
         Ok(Arc::new(lsp::CompletionResponse::Array(Vec::new())))
@@ -239,7 +239,7 @@ impl LanguageServer for NoopServer {
 
     fn goto_definition(
         &self,
-        _doc: CodeLocation<'_>,
+        _loc: CodeLocation<'_>,
         _ctx: &LspContext,
     ) -> anyhow::Result<lsp::GotoDefinitionResponse> {
         Ok(lsp::GotoDefinitionResponse::Array(Vec::new()))
@@ -294,7 +294,7 @@ pub struct LspServer<'a> {
     server: Box<dyn LanguageServer + 'a>,
     buffers: Buffers,
     context: LspContext,
-    watch_files: bool,
+    dynamic_watch_files: bool,
     watched_roots: Vec<PathBuf>,
     shutdown: bool,
     /// Requests dispatched to the worker that have not yet produced a response,
@@ -333,7 +333,7 @@ pub struct LspServer<'a> {
 
 impl LspServer<'_> {
     pub fn spawn<P>(
-        create_props: impl Fn(Options, &LspContext) -> anyhow::Result<P>,
+        prepare_init: impl Fn(Options, &LspContext) -> anyhow::Result<P>,
         create_server: impl for<'a> Fn(
             &'a P,
             &LspContext,
@@ -348,7 +348,7 @@ impl LspServer<'_> {
         context.set_code_action_capabilities(&init_params.capabilities);
         context.set_presentation_capabilities(&init_params.capabilities);
         log_initialization(&context, &init_params);
-        let watch_files = init_params
+        let dynamic_watch_files = init_params
             .capabilities
             .workspace
             .as_ref()
@@ -358,7 +358,7 @@ impl LspServer<'_> {
         let workspace_folders =
             workspace_folder_paths(init_params.workspace_folders.unwrap_or_default(), &context)?;
         let options = Options::new(workspace_folders, init_params.initialization_options);
-        let props = create_props(options, &context).inspect_err(|err| {
+        let init_state = prepare_init(options, &context).inspect_err(|err| {
             context
                 .logger()
                 .error(format!("Initialization options failed: {err:#}"));
@@ -374,7 +374,7 @@ impl LspServer<'_> {
         });
         connection.initialize_finish(id, initialize_data)?;
 
-        let server = create_server(&props, &context).inspect_err(|err| {
+        let server = create_server(&init_state, &context).inspect_err(|err| {
             let message = format!("Language server startup failed: {err:#}");
             context.logger().error(&message);
             context.show_message(lsp::MessageType::ERROR, message);
@@ -384,7 +384,7 @@ impl LspServer<'_> {
             server,
             context: context.clone(),
             buffers: Buffers::default(),
-            watch_files,
+            dynamic_watch_files,
             watched_roots: vec![],
             shutdown: false,
             in_flight: HashMap::new(),
@@ -410,7 +410,7 @@ impl LspServer<'_> {
     pub(crate) fn for_test(
         server: Box<dyn LanguageServer + 'static>,
         buffers: Buffers,
-        watch_files: bool,
+        dynamic_watch_files: bool,
     ) -> (LspServer<'static>, Connection) {
         let (connection, client) = Connection::memory();
         let context = LspContext::new(connection.sender.clone());
@@ -420,7 +420,7 @@ impl LspServer<'_> {
                 server,
                 buffers,
                 context,
-                watch_files,
+                dynamic_watch_files,
                 watched_roots: vec![],
                 shutdown: false,
                 in_flight: HashMap::new(),
@@ -447,7 +447,7 @@ impl LspServer<'_> {
         let context = self.context.clone();
         let latest_state_rev = self.latest_state_rev.clone();
         let latest_diag_rev = self.latest_diag_rev.clone();
-        let watch_files = self.watch_files;
+        let dynamic_watch_files = self.dynamic_watch_files;
 
         std::thread::scope(|scope| {
             scope.spawn(move || {
@@ -458,7 +458,7 @@ impl LspServer<'_> {
                     event_tx,
                     latest_state_rev,
                     latest_diag_rev,
-                    watch_files,
+                    dynamic_watch_files,
                 );
             });
             self.protocol_loop(cmd_tx, event_rx)
@@ -605,14 +605,14 @@ impl LspServer<'_> {
 
         log_request_metadata(&self.context, &request);
         match self.parse_worker_request(&request.method, request.params) {
-            Ok(kind) => {
+            Ok(worker_request) => {
                 let cancel = CancelToken::default();
                 self.in_flight.insert(request.id.clone(), cancel.clone());
                 cmd_tx
                     .send(WorkerCmd::Request {
                         id: request.id,
                         method: request.method,
-                        kind: Box::new(kind),
+                        request: Box::new(worker_request),
                         started: Instant::now(),
                         cancel,
                     })
@@ -897,7 +897,7 @@ impl LspServer<'_> {
         };
         let documents = match reloaded {
             Ok(text) => {
-                self.buffers.replace(uri, text);
+                self.buffers.resync_contents(uri, text);
                 self.context.logger().verbose(|| {
                     format!(
                         "Document save resynchronized uri={} version={:?}",
@@ -1102,7 +1102,7 @@ impl LspServer<'_> {
         let doc = self.owned_document(uri)?;
         let pos = doc
             .buffer
-            .get_pos(pos.line, pos.character)
+            .byte_offset(pos.line, pos.character)
             .context("position not found")?;
         Ok(OwnedCodeLocation { doc, pos })
     }
@@ -1192,7 +1192,7 @@ impl LspServer<'_> {
                 } = serde_json::from_value(params).map_err(invalid_params)?;
                 let path = path_from_uri(&text_document.uri).map_err(invalid_params)?;
                 let span = self
-                    .range(&text_document.uri, range)
+                    .byte_span(&text_document.uri, range)
                     .map_err(invalid_params)?;
                 Ok(WorkerRequest::CodeAction {
                     path,
@@ -1216,7 +1216,7 @@ impl LspServer<'_> {
     }
 
     fn update_watchers(&mut self) -> anyhow::Result<()> {
-        if !self.watch_files {
+        if !self.dynamic_watch_files {
             return Ok(());
         }
         let roots = self.server.watch_roots();
@@ -1227,7 +1227,7 @@ impl LspServer<'_> {
     /// when they are unchanged. Used by the protocol thread with roots computed
     /// on the worker.
     fn update_watchers_with(&mut self, roots: Vec<PathBuf>) -> anyhow::Result<()> {
-        if !self.watch_files {
+        if !self.dynamic_watch_files {
             return Ok(());
         }
         if roots == self.watched_roots {
@@ -1353,7 +1353,7 @@ impl LspServer<'_> {
                 } = serde_json::from_value(params).map_err(invalid_params)?;
                 let path = path_from_uri(&text_document.uri).map_err(invalid_params)?;
                 let range = self
-                    .range(&text_document.uri, range)
+                    .byte_span(&text_document.uri, range)
                     .map_err(invalid_params)?;
                 response_value(self.server.code_action(path, range, context, &self.context))
             }
@@ -1632,21 +1632,21 @@ impl LspServer<'_> {
     ) -> anyhow::Result<CodeLocation<'_>> {
         let document = self.document(uri)?;
         let pos = document
-            .body
-            .get_pos(pos.line, pos.character)
+            .buffer
+            .byte_offset(pos.line, pos.character)
             .context("position not found")?;
         Ok(CodeLocation::new(document, pos))
     }
 
-    fn range(&self, uri: &lsp::Uri, range: lsp::Range) -> anyhow::Result<Range<u32>> {
+    fn byte_span(&self, uri: &lsp::Uri, range: lsp::Range) -> anyhow::Result<Range<u32>> {
         let document = self.document(uri)?;
         let start = document
-            .body
-            .get_pos(range.start.line, range.start.character)
+            .buffer
+            .byte_offset(range.start.line, range.start.character)
             .context("start position not found")?;
         let end = document
-            .body
-            .get_pos(range.end.line, range.end.character)
+            .buffer
+            .byte_offset(range.end.line, range.end.character)
             .context("end position not found")?;
         Ok(start..end)
     }
@@ -1723,7 +1723,7 @@ fn is_summary_method(method: &str) -> bool {
 }
 
 /// Logs the redacted request metadata for hover/completion, mirroring what the
-/// synchronous [`LspServer::handle`] path records.
+/// synchronous test request path records.
 fn log_request_metadata(context: &LspContext, request: &lsp_server::Request) {
     if !is_summary_method(&request.method) {
         return;
@@ -1860,11 +1860,11 @@ fn worker_main<'a>(
     event_tx: Sender<WorkerEvent>,
     latest_state_rev: Arc<AtomicU64>,
     latest_diag_rev: Arc<AtomicU64>,
-    watch_files: bool,
+    dynamic_watch_files: bool,
 ) {
     let publish_roots =
         |roots_rev: u64, server: &dyn LanguageServer, event_tx: &Sender<WorkerEvent>| {
-            if watch_files {
+            if dynamic_watch_files {
                 event_tx
                     .send(WorkerEvent::WatchRoots {
                         roots_rev,
@@ -2022,7 +2022,7 @@ fn worker_main<'a>(
             WorkerCmd::Request {
                 id,
                 method,
-                kind,
+                request,
                 started,
                 cancel,
             } => {
@@ -2030,7 +2030,7 @@ fn worker_main<'a>(
                     continue;
                 }
                 set_current_cancel(cancel.clone());
-                let result = execute_request(&mut *server, *kind, &context);
+                let result = execute_request(&mut *server, *request, &context);
                 clear_current_cancel();
                 // A cancelled request already received its `RequestCancelled`
                 // response from the protocol thread; drop the late result.
@@ -2078,7 +2078,7 @@ pub trait LanguageServer: Send {
     fn check(&mut self, path: PathBuf, ctx: &LspContext)
     -> anyhow::Result<Option<DiagnosticBatch>>;
     /// Like [`LanguageServer::check`], but lets `should_abort` stop work that a
-    /// newer save has superseded. The default ignores it and calls [`check`].
+    /// newer save has superseded. The default ignores it and calls [`Self::check`].
     fn check_cancellable(
         &mut self,
         path: PathBuf,
@@ -2107,10 +2107,10 @@ pub trait LanguageServer: Send {
         removed: Vec<PathBuf>,
         ctx: &LspContext,
     ) -> anyhow::Result<()>;
-    fn hover(&self, doc: CodeLocation<'_>, ctx: &LspContext) -> anyhow::Result<Option<lsp::Hover>>;
+    fn hover(&self, loc: CodeLocation<'_>, ctx: &LspContext) -> anyhow::Result<Option<lsp::Hover>>;
     fn completion(
         &self,
-        doc: CodeLocation<'_>,
+        loc: CodeLocation<'_>,
         ctx: &LspContext,
     ) -> anyhow::Result<Arc<lsp::CompletionResponse>>;
     /// Returns the completion response adapted to the client's presentation
@@ -2119,10 +2119,10 @@ pub trait LanguageServer: Send {
     /// adapted form instead of re-cloning and re-adapting it per request.
     fn completion_for_client(
         &self,
-        doc: CodeLocation<'_>,
+        loc: CodeLocation<'_>,
         ctx: &LspContext,
     ) -> anyhow::Result<Arc<lsp::CompletionResponse>> {
-        let mut response = self.completion(doc, ctx)?.as_ref().clone();
+        let mut response = self.completion(loc, ctx)?.as_ref().clone();
         ctx.adapt_completion(&mut response);
         Ok(Arc::new(response))
     }
@@ -2137,7 +2137,7 @@ pub trait LanguageServer: Send {
     }
     fn goto_definition(
         &self,
-        doc: CodeLocation<'_>,
+        loc: CodeLocation<'_>,
         ctx: &LspContext,
     ) -> anyhow::Result<lsp::GotoDefinitionResponse>;
     fn document_symbols(
@@ -2531,12 +2531,12 @@ impl<'a> LspLog<'a> {
 #[derive(Debug, Clone)]
 pub struct Document<'a> {
     path: PathBuf,
-    body: &'a Buffer,
+    buffer: &'a Buffer,
 }
 
 impl<'a> Document<'a> {
-    pub(crate) fn new(path: PathBuf, body: &'a Buffer) -> Self {
-        Self { path, body }
+    pub(crate) fn new(path: PathBuf, buffer: &'a Buffer) -> Self {
+        Self { path, buffer }
     }
 
     pub fn path(&self) -> &Path {
@@ -2544,7 +2544,7 @@ impl<'a> Document<'a> {
     }
 
     pub fn buffer(&self) -> &Buffer {
-        self.body
+        self.buffer
     }
 }
 
@@ -2577,14 +2577,14 @@ impl<'a> CodeLocation<'a> {
 
 #[derive(Debug)]
 pub struct Options {
-    pub workspace_dirs: Vec<PathBuf>,
+    pub workspace_folders: Vec<PathBuf>,
     pub init_options: Option<Value>,
 }
 
 impl Options {
-    fn new(workspace_dirs: Vec<PathBuf>, init_options: Option<Value>) -> Self {
+    fn new(workspace_folders: Vec<PathBuf>, init_options: Option<Value>) -> Self {
         Self {
-            workspace_dirs,
+            workspace_folders,
             init_options,
         }
     }
@@ -2818,21 +2818,21 @@ mod tests {
 
         fn hover(
             &self,
-            doc: CodeLocation<'_>,
+            loc: CodeLocation<'_>,
             _ctx: &LspContext,
         ) -> anyhow::Result<Option<lsp::Hover>> {
             if let Some(events) = &self.events {
                 events
                     .lock()
                     .unwrap()
-                    .push(format!("hover:{}", doc.doc().buffer().contents()));
+                    .push(format!("hover:{}", loc.doc().buffer().contents()));
             }
             self.hover.clone().context("stub handler failed")
         }
 
         fn completion(
             &self,
-            _doc: CodeLocation<'_>,
+            _loc: CodeLocation<'_>,
             _ctx: &LspContext,
         ) -> anyhow::Result<Arc<lsp::CompletionResponse>> {
             Ok(Arc::new(
@@ -2844,7 +2844,7 @@ mod tests {
 
         fn goto_definition(
             &self,
-            _doc: CodeLocation<'_>,
+            _loc: CodeLocation<'_>,
             _ctx: &LspContext,
         ) -> anyhow::Result<lsp::GotoDefinitionResponse> {
             Ok(lsp::GotoDefinitionResponse::Array(vec![]))
@@ -2970,7 +2970,7 @@ mod tests {
                 server: Box::<StubServer>::default(),
                 buffers,
                 context,
-                watch_files: false,
+                dynamic_watch_files: false,
                 watched_roots: vec![],
                 shutdown: false,
                 in_flight: HashMap::new(),
@@ -3661,7 +3661,7 @@ mod tests {
     fn queued_changes_apply_incrementally_and_rebuild_once_per_batch() {
         let (mut server, client) = memory_server();
         let events = record_changes(&mut server);
-        server.watch_files = true;
+        server.dynamic_watch_files = true;
         let uri = "file:///C:/test.reds";
         let other = "file:///C:/other.reds";
         server
@@ -4406,7 +4406,7 @@ mod tests {
     #[test]
     fn watch_roots_apply_after_intervening_document_state_changes() {
         let (mut server, client) = memory_server();
-        server.watch_files = true;
+        server.dynamic_watch_files = true;
         // A root-changing command queued at `roots_rev = 1` stays current even
         // after intervening edits advance `state_rev`, which only governs
         // diagnostics and must not drop the watcher update.
@@ -4450,7 +4450,7 @@ mod tests {
     #[test]
     fn dynamic_watcher_registration_tracks_workspace_folders() {
         let (mut server, client) = memory_server();
-        server.watch_files = true;
+        server.dynamic_watch_files = true;
         server.server = Box::new(StubServer {
             watch_roots: vec![PathBuf::from("C:/workspace")],
             ..Default::default()
@@ -4529,7 +4529,7 @@ mod tests {
     #[test]
     fn watcher_registration_is_skipped_without_dynamic_registration() {
         let (mut server, client) = memory_server();
-        assert!(!server.watch_files);
+        assert!(!server.dynamic_watch_files);
         server.server = Box::new(StubServer {
             watch_roots: vec![PathBuf::from("C:/workspace")],
             ..Default::default()
@@ -4706,7 +4706,7 @@ mod tests {
 
         fn hover(
             &self,
-            _doc: CodeLocation<'_>,
+            _loc: CodeLocation<'_>,
             _ctx: &LspContext,
         ) -> anyhow::Result<Option<lsp::Hover>> {
             self.events.lock().unwrap().push("hover:start".into());
@@ -4718,7 +4718,7 @@ mod tests {
 
         fn completion(
             &self,
-            _doc: CodeLocation<'_>,
+            _loc: CodeLocation<'_>,
             _ctx: &LspContext,
         ) -> anyhow::Result<Arc<lsp::CompletionResponse>> {
             Ok(Arc::new(lsp::CompletionResponse::Array(Vec::new())))
@@ -4726,7 +4726,7 @@ mod tests {
 
         fn goto_definition(
             &self,
-            _doc: CodeLocation<'_>,
+            _loc: CodeLocation<'_>,
             _ctx: &LspContext,
         ) -> anyhow::Result<lsp::GotoDefinitionResponse> {
             Ok(lsp::GotoDefinitionResponse::Array(Vec::new()))
@@ -4859,8 +4859,8 @@ mod tests {
                     ..Default::default()
                 }],
             )]),
-            reads: BTreeMap::new(),
-            configs: BTreeMap::new(),
+            read_diagnostics: BTreeMap::new(),
+            config_diagnostics: BTreeMap::new(),
             versions: HashMap::new(),
         };
         let (entered, release, _events) = blocking_server(&mut server, Some(batch));
@@ -4918,8 +4918,8 @@ mod tests {
                         ..Default::default()
                     }],
                 )]),
-                reads: BTreeMap::new(),
-                configs: BTreeMap::new(),
+                read_diagnostics: BTreeMap::new(),
+                config_diagnostics: BTreeMap::new(),
                 versions: HashMap::from([(path.clone(), 1)]),
             }),
             ..Default::default()
@@ -4964,8 +4964,8 @@ mod tests {
                     ..Default::default()
                 }],
             )]),
-            reads: BTreeMap::new(),
-            configs: BTreeMap::new(),
+            read_diagnostics: BTreeMap::new(),
+            config_diagnostics: BTreeMap::new(),
             versions: HashMap::from([(path.clone(), 1)]),
         };
         let entered = Arc::new(Barrier::new(2));
@@ -5096,7 +5096,7 @@ mod tests {
         let request = || WorkerCmd::Request {
             id: RequestId::from("1".to_owned()),
             method: lsp::request::WorkspaceSymbolRequest::METHOD.to_owned(),
-            kind: Box::new(WorkerRequest::WorkspaceSymbol(String::new())),
+            request: Box::new(WorkerRequest::WorkspaceSymbol(String::new())),
             started: Instant::now(),
             cancel: CancelToken::default(),
         };
@@ -5184,7 +5184,7 @@ mod tests {
             .send(WorkerCmd::Request {
                 id: RequestId::from("1".to_owned()),
                 method: lsp::request::DocumentSymbolRequest::METHOD.to_owned(),
-                kind: Box::new(WorkerRequest::DocumentSymbols(OwnedDocument {
+                request: Box::new(WorkerRequest::DocumentSymbols(OwnedDocument {
                     path: PathBuf::from("C:/test.reds"),
                     buffer: Buffer::new(String::new()),
                 })),
@@ -5290,8 +5290,8 @@ mod tests {
                     ..Default::default()
                 }],
             )]),
-            reads: BTreeMap::new(),
-            configs: BTreeMap::new(),
+            read_diagnostics: BTreeMap::new(),
+            config_diagnostics: BTreeMap::new(),
             versions: HashMap::from([(path.clone(), 1)]),
         };
         let (entered, release, events) = blocking_server(&mut server, Some(batch));
@@ -5366,8 +5366,8 @@ mod tests {
                     ..Default::default()
                 }],
             )]),
-            reads: BTreeMap::new(),
-            configs: BTreeMap::new(),
+            read_diagnostics: BTreeMap::new(),
+            config_diagnostics: BTreeMap::new(),
             versions: HashMap::from([(path.clone(), 1)]),
         };
         let (entered, release, events) = blocking_server(&mut server, Some(batch));

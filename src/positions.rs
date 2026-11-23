@@ -1,4 +1,8 @@
+use lsp_types as lsp;
 use lsp_types::Position;
+use redscript_compiler_api::ast;
+
+use crate::server::LspContext;
 
 pub fn position(source: &str, offset: u32) -> Option<Position> {
     let prefix = source.get(..offset as usize)?;
@@ -36,6 +40,27 @@ pub fn byte_offset(chars: impl Iterator<Item = char>, column: u32) -> Option<usi
         }
     }
     (units == column).then_some(bytes)
+}
+
+/// Converts a compiler source span to an LSP range.
+pub fn span_range(span: ast::Span, file: &ast::File) -> Option<lsp::Range> {
+    Some(lsp::Range {
+        start: file_position(file, span.start)?,
+        end: file_position(file, span.end)?,
+    })
+}
+
+/// Converts a compiler source span to an LSP location.
+pub fn span_location(
+    span: ast::Span,
+    sources: &ast::SourceMap,
+    ctx: &LspContext,
+) -> Option<lsp::Location> {
+    let file = sources.get(span.file)?;
+    Some(lsp::Location {
+        uri: ctx.uri(file.path()).ok()?,
+        range: span_range(span, file)?,
+    })
 }
 
 #[cfg(test)]

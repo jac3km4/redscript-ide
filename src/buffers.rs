@@ -15,27 +15,27 @@ pub struct Buffers {
 }
 
 impl Buffers {
-    pub fn remove(&mut self, url: &lsp::Uri) {
-        self.map.remove(url);
+    pub fn remove(&mut self, uri: &lsp::Uri) {
+        self.map.remove(uri);
     }
 
-    pub fn open(&mut self, url: lsp::Uri, content: String, version: i32) {
+    pub fn open(&mut self, uri: lsp::Uri, content: String, version: i32) {
         let mut buffer = Buffer::new(content);
         buffer.version = Some(version);
 
-        self.map.insert(url, buffer);
+        self.map.insert(uri, buffer);
     }
 
-    /// Whether `url`'s buffer is out of sync with the client after a rejected
+    /// Whether `uri`'s buffer is out of sync with the client after a rejected
     /// incremental change, so a later save must reload it from disk.
-    pub fn is_desynced(&self, url: &lsp::Uri) -> bool {
-        self.map.get(url).is_some_and(|buffer| buffer.desynced)
+    pub fn is_desynced(&self, uri: &lsp::Uri) -> bool {
+        self.map.get(uri).is_some_and(|buffer| buffer.desynced)
     }
 
-    /// Replaces `url`'s contents with `content`, clearing any desync while
+    /// Replaces `uri`'s contents with `content`, clearing any desync while
     /// preserving the tracked version.
-    pub fn replace(&mut self, url: &lsp::Uri, content: String) {
-        if let Some(buffer) = self.map.get_mut(url) {
+    pub fn resync_contents(&mut self, uri: &lsp::Uri, content: String) {
+        if let Some(buffer) = self.map.get_mut(uri) {
             buffer.contents = Rope::from_str(&content);
             buffer.desynced = false;
         }
@@ -44,20 +44,20 @@ impl Buffers {
     #[cfg(test)]
     pub fn change(
         &mut self,
-        url: &lsp::Uri,
+        uri: &lsp::Uri,
         version: i32,
         changes: Vec<lsp::TextDocumentContentChangeEvent>,
     ) -> bool {
-        self.try_change(url, version, changes).is_ok()
+        self.try_change(uri, version, changes).is_ok()
     }
 
     pub fn try_change(
         &mut self,
-        url: &lsp::Uri,
+        uri: &lsp::Uri,
         version: i32,
         changes: Vec<lsp::TextDocumentContentChangeEvent>,
     ) -> Result<(), ChangeError> {
-        let Some(buffer) = self.map.get_mut(url) else {
+        let Some(buffer) = self.map.get_mut(uri) else {
             return Err(ChangeError::NotOpen);
         };
         if let Some(current) = buffer.version
@@ -68,7 +68,7 @@ impl Buffers {
         let mut staged = buffer.clone();
         for change in changes {
             if let Some(range) = change.range {
-                if !staged.update_range(range, change.text) {
+                if !staged.apply_edit(range, change.text) {
                     buffer.desynced = true;
                     return Err(ChangeError::InvalidRange(range));
                 }
@@ -82,8 +82,8 @@ impl Buffers {
         Ok(())
     }
 
-    pub fn get(&self, url: &lsp::Uri) -> Option<&Buffer> {
-        self.map.get(url)
+    pub fn get(&self, uri: &lsp::Uri) -> Option<&Buffer> {
+        self.map.get(uri)
     }
 }
 
@@ -105,11 +105,12 @@ impl Buffer {
         }
     }
 
-    pub fn update_range(&mut self, range: lsp::Range, text: String) -> bool {
-        let Some(start) = self.get_pos(range.start.line, range.start.character) else {
+    /// Applies an LSP range edit, returning whether the range was valid.
+    pub fn apply_edit(&mut self, range: lsp::Range, text: String) -> bool {
+        let Some(start) = self.byte_offset(range.start.line, range.start.character) else {
             return false;
         };
-        let Some(end) = self.get_pos(range.end.line, range.end.character) else {
+        let Some(end) = self.byte_offset(range.end.line, range.end.character) else {
             return false;
         };
         let start = self.contents.byte_to_char(start as usize);
@@ -122,7 +123,8 @@ impl Buffer {
         true
     }
 
-    pub fn get_pos(&self, line: u32, col: u32) -> Option<u32> {
+    /// Converts an LSP `(line, column)` to a UTF-8 byte offset in the buffer.
+    pub fn byte_offset(&self, line: u32, col: u32) -> Option<u32> {
         let line = line as usize;
         let contents = self.contents.get_line(line)?;
         let line_start = self.contents.try_line_to_byte(line).ok()?;
@@ -169,10 +171,10 @@ mod tests {
     #[test]
     fn edits_and_queries_use_utf16_columns() {
         let mut buffer = Buffer::new("first\r\né😀error".into());
-        assert_eq!(buffer.get_pos(1, 3), Some(13));
-        assert_eq!(buffer.get_pos(1, 2), None);
-        assert_eq!(buffer.get_pos(5, 0), None);
-        assert!(buffer.update_range(
+        assert_eq!(buffer.byte_offset(1, 3), Some(13));
+        assert_eq!(buffer.byte_offset(1, 2), None);
+        assert_eq!(buffer.byte_offset(5, 0), None);
+        assert!(buffer.apply_edit(
             lsp::Range::new(lsp::Position::new(1, 3), lsp::Position::new(1, 8)),
             "fixed".into(),
         ));
@@ -261,7 +263,7 @@ mod tests {
             Err(ChangeError::InvalidRange(bad)),
         );
         assert!(buffers.is_desynced(&uri));
-        buffers.replace(&uri, "from disk".into());
+        buffers.resync_contents(&uri, "from disk".into());
         assert!(!buffers.is_desynced(&uri));
         let buffer = buffers.get(&uri).unwrap();
         assert_eq!(buffer.contents().to_string(), "from disk");

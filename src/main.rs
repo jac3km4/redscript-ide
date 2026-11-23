@@ -174,7 +174,7 @@ fn main() -> anyhow::Result<()> {
     LspServer::spawn(
         |opts, _ctx| {
             let (source, warnings) = resolve_cache_source(opts.init_options);
-            Ok((opts.workspace_dirs, source, warnings))
+            Ok((opts.workspace_folders, source, warnings))
         },
         |(dirs, source, warnings), ctx| {
             let has_warnings = !warnings.is_empty();
@@ -189,7 +189,7 @@ fn main() -> anyhow::Result<()> {
                     "No 'game_dir' or 'cache_file' configured; using bundled base-game API cache (may be out of date). Set 'game_dir' or 'cache_file' in initializationOptions to load your game cache.",
                 );
             }
-            ls.log_missing_roots(ctx);
+            ls.report_workspace_warnings(ctx);
             ctx.logger().info("Language server ready for requests");
             Ok(Box::new(ls))
         },

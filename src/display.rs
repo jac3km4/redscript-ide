@@ -46,7 +46,7 @@ impl fmt::Display for ExprAtDisplay<'_, '_> {
         } else {
             false
         };
-        if let Some(typ) = inner.type_()
+        if let Some(typ) = inner.named_type()
             && let Some(def) = inner.symbols().get_type(typ)
         {
             if has_header {
@@ -345,7 +345,7 @@ mod tests {
         let ir::Stmt::Return(Some(expr), _) = function.block.stmts.back().unwrap() else {
             unreachable!()
         };
-        let at = ExprAt::new(Some(expr), Some(function), None, &symbols, &sources, None);
+        let at = ExprAt::new(Some(expr), Some(function), None, &symbols, &sources, false);
         if invalid_receiver {
             assert!(at.expr_type().is_none());
         }
@@ -415,7 +415,7 @@ mod tests {
             None,
             &symbols,
             &sources,
-            None,
+            false,
         );
         let display = at.display().to_string();
         assert!(display.contains(expected), "{display}");
@@ -509,7 +509,7 @@ mod tests {
         // The interner may know a name that has no definition in this snapshot.
         let unknown = interner.intern("NoSuchType");
         assert!(symbols.get_type(unknown).is_none());
-        let at = ExprAt::new(None, None, Some(unknown), &symbols, &sources, None);
+        let at = ExprAt::new(None, None, Some(unknown), &symbols, &sources, false);
         assert!(at.definition_span().is_none());
         assert_eq!(at.display().to_string(), "");
     }

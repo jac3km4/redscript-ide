@@ -17,28 +17,28 @@ const MAX_BASE_DEPTH: usize = 64;
 pub struct ExprAt<'ctx, 'a> {
     expr: Option<&'a ir::Expr<'ctx>>,
     func: Option<&'a LoweredFunction<'ctx>>,
-    type_: Option<TypeId<'ctx>>,
+    named_type: Option<TypeId<'ctx>>,
     symbols: &'a Symbols<'ctx>,
     sources: &'ctx SourceMap,
-    context: Option<AtContext>,
+    in_expr_position: bool,
 }
 
 impl<'ctx, 'a> ExprAt<'ctx, 'a> {
     pub fn new(
         expr: Option<&'a ir::Expr<'ctx>>,
         func: Option<&'a LoweredFunction<'ctx>>,
-        type_: Option<TypeId<'ctx>>,
+        named_type: Option<TypeId<'ctx>>,
         symbols: &'a Symbols<'ctx>,
         sources: &'ctx SourceMap,
-        context: Option<AtContext>,
+        in_expr_position: bool,
     ) -> Self {
         Self {
             expr,
             func,
-            type_,
+            named_type,
             symbols,
             sources,
-            context,
+            in_expr_position,
         }
     }
 
@@ -47,10 +47,10 @@ impl<'ctx, 'a> ExprAt<'ctx, 'a> {
             cb(ExprAt::new(
                 expr,
                 self.func,
-                self.type_,
+                self.named_type,
                 self.symbols,
                 self.sources,
-                self.context,
+                self.in_expr_position,
             ))
         };
         if let Some(func) = self.func {
@@ -68,14 +68,14 @@ impl<'ctx, 'a> ExprAt<'ctx, 'a> {
         self.func
     }
 
-    pub fn type_(&self) -> Option<TypeId<'ctx>> {
-        self.type_
+    pub fn named_type(&self) -> Option<TypeId<'ctx>> {
+        self.named_type
     }
 
     /// Attach or clear the resolved type binding used for symbol rendering and
     /// fallback navigation.
-    pub fn with_type(mut self, type_: Option<TypeId<'ctx>>) -> Self {
-        self.type_ = type_;
+    pub fn with_named_type(mut self, named_type: Option<TypeId<'ctx>>) -> Self {
+        self.named_type = named_type;
         self
     }
 
@@ -87,8 +87,8 @@ impl<'ctx, 'a> ExprAt<'ctx, 'a> {
         self.sources
     }
 
-    pub fn context(&self) -> Option<AtContext> {
-        self.context
+    pub fn is_expr_position(&self) -> bool {
+        self.in_expr_position
     }
 
     pub fn expr_type(&self) -> Option<Type<'ctx>> {
@@ -102,7 +102,7 @@ impl<'ctx, 'a> ExprAt<'ctx, 'a> {
     }
 
     pub fn definition_span(&self) -> Option<Span> {
-        if let Some(typ) = self.type_ {
+        if let Some(typ) = self.named_type {
             self.symbols.get_type(typ)?.span()
         } else if let Some(expr) = self.expr {
             match expr {
@@ -266,11 +266,6 @@ fn with_expr_at<'ctx, A>(
     cb(expr)
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum AtContext {
-    Expr,
-}
-
 pub fn type_of<'ctx>(
     expr: &ir::Expr<'ctx>,
     func: &LoweredFunction<'ctx>,
@@ -395,7 +390,7 @@ impl<'ctx, 'a> ReceiverTypeEnvs<'ctx, 'a> {
     }
 
     /// Instantiate a method declaration at the cached receiver.
-    pub fn function_type(
+    pub fn method_type(
         &self,
         declaring_type: TypeId<'ctx>,
         func_type: &FunctionType<'ctx>,
@@ -523,7 +518,7 @@ mod tests {
         sources: &'ctx SourceMap,
         pos: usize,
     ) -> Option<Span> {
-        ExprAt::new(None, Some(function), None, symbols, sources, None)
+        ExprAt::new(None, Some(function), None, symbols, sources, false)
             .with_expr_at(pos as u32, |at| at.definition_span())
     }
 
@@ -621,7 +616,7 @@ mod tests {
         for info in generated {
             let expr = ir::Expr::Local(info.id, function.span);
             assert_eq!(
-                ExprAt::new(Some(&expr), Some(function), None, &symbols, &sources, None)
+                ExprAt::new(Some(&expr), Some(function), None, &symbols, &sources, false)
                     .definition_span(),
                 None
             );
@@ -631,7 +626,7 @@ mod tests {
             .find_at(source.rfind("total").unwrap() as u32)
             .unwrap();
         assert_eq!(
-            ExprAt::new(Some(expr), None, None, &symbols, &sources, None).definition_span(),
+            ExprAt::new(Some(expr), None, None, &symbols, &sources, false).definition_span(),
             None
         );
         let missing = ir::Expr::Local(ir::Local::Var(u16::MAX), function.span);
@@ -642,7 +637,7 @@ mod tests {
                 None,
                 &symbols,
                 &sources,
-                None
+                false
             )
             .definition_span(),
             None

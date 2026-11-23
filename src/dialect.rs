@@ -91,7 +91,7 @@ fn resolve_identity(path: &Path) -> PathBuf {
 /// Call this whenever the filesystem state may have changed (files added or
 /// removed, symlinks created or retargeted, ignore files edited) so that
 /// subsequent [`identity`] and [`is_ignored`] calls observe the new layout.
-pub fn clear_identity_cache() {
+pub fn clear_path_caches() {
     IDENTITY_CACHE.with(|cache| cache.borrow_mut().clear());
     IGNORE_MATCHERS.with(|matchers| matchers.borrow_mut().clear());
 }
@@ -102,7 +102,7 @@ pub fn clear_identity_cache() {
 /// so `.ignore` files, `.gitignore` files (when a Git repository is present),
 /// the global Git ignore file and `.git/info/exclude` are honored, along with
 /// hidden-file filtering. Compiled matchers are cached per root until
-/// [`clear_identity_cache`] is called.
+/// [`clear_path_caches`] is called.
 pub fn is_ignored(path: &Path, root: &Path) -> bool {
     IGNORE_MATCHERS.with(|matchers| {
         let mut matchers = matchers.borrow_mut();
@@ -250,7 +250,7 @@ impl<'src> ParsedSources<'src> {
     /// `target` selects the single-function query pipeline: only the function
     /// enclosing the target position is lowered, which is all an IDE query reads.
     /// `None` runs the full pipeline used for diagnostics.
-    pub fn process(
+    pub fn lower(
         &self,
         symbols: Symbols<'src>,
         reporter: &mut CompileErrorReporter<'src>,
@@ -259,10 +259,10 @@ impl<'src> ParsedSources<'src> {
     ) -> (LoweredCompilationUnit<'src>, Symbols<'src>) {
         let invalid_files = self.diagnostic_files();
         let mut redmods = Vec::new();
-        let mut dependencies = Vec::new();
+        let mut community_modules = Vec::new();
         for (id, module) in &self.modules {
             match module {
-                ParsedModule::Community(module) => dependencies.push(module.clone()),
+                ParsedModule::Community(module) => community_modules.push(module.clone()),
                 ParsedModule::Redmod(parsed) => {
                     // Converted modules remain queryable after validation errors,
                     // but only valid inputs participate in lowering.
@@ -275,7 +275,7 @@ impl<'src> ParsedSources<'src> {
         let (unit, symbols, errors) = match target {
             Some(target) => redscript_redmod_adapter::process_sources_for_query(
                 redmods,
-                dependencies,
+                community_modules,
                 symbols,
                 reporter,
                 interner,
@@ -283,7 +283,7 @@ impl<'src> ParsedSources<'src> {
             ),
             None => redscript_redmod_adapter::process_sources(
                 redmods,
-                dependencies,
+                community_modules,
                 symbols,
                 reporter,
                 interner,
@@ -432,12 +432,12 @@ mod tests {
 
     #[test]
     fn identity_is_memoized_and_can_be_cleared() {
-        clear_identity_cache();
+        clear_path_caches();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("nested/deeper/file.script");
         let first = identity(&path);
         assert_eq!(identity(&path), first);
-        clear_identity_cache();
+        clear_path_caches();
         assert_eq!(identity(&path), first);
     }
 
@@ -446,7 +446,7 @@ mod tests {
     fn identity_cache_follows_symlink_retargeting_after_clear() {
         use std::os::unix::fs::symlink;
 
-        clear_identity_cache();
+        clear_path_caches();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first");
         let second = temp.path().join("second");
@@ -468,13 +468,13 @@ mod tests {
         symlink(&second, &link).unwrap();
         assert_eq!(identity(&linked), from_first);
 
-        clear_identity_cache();
+        clear_path_caches();
         assert_eq!(identity(&linked), from_second);
     }
 
     #[test]
     fn is_ignored_matches_discovery_rules() {
-        clear_identity_cache();
+        clear_path_caches();
         let temp = tempfile::tempdir().unwrap();
         let ignored = temp.path().join("ignored.script");
         let kept = temp.path().join("kept.script");
@@ -492,7 +492,7 @@ mod tests {
 
         // `.gitignore` requires a Git repository, matching `WalkBuilder`.
         fs::write(temp.path().join(".gitignore"), "kept.script\n").unwrap();
-        clear_identity_cache();
+        clear_path_caches();
         assert!(!is_ignored(&kept, temp.path()));
     }
 

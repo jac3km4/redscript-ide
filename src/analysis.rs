@@ -18,7 +18,7 @@ use redscript_compiler_api::{
 use redscript_compiler_frontend::Shared;
 
 use crate::dialect::{self, ParsedSources};
-use crate::query::{AtContext, ExprAt};
+use crate::query::ExprAt;
 use crate::server::LspContext;
 
 const DIAGNOSTIC_PASSES: &[&'static (dyn DiagnosticPass + 'static)] = &[&UnusedLocals];
@@ -138,7 +138,7 @@ impl BaseEnv {
     }
 }
 
-impl CompilationCache {
+impl AnalysisSnapshot {
     pub(crate) fn query_at<A>(
         &self,
         id: ast::FileId,
@@ -148,21 +148,21 @@ impl CompilationCache {
     ) -> anyhow::Result<A> {
         let preceding_pos = pos.saturating_sub(1);
         self.with(|cache| {
-            let match_ = cache
+            let ast_match = cache
                 .analysis
                 .parsed
                 .modules
                 .iter()
                 .find(|(file, _)| *file == id)
                 .and_then(|(_, module)| module.module().find_at(preceding_pos));
-            let (query_context, definite_name, fallback_name) = match match_ {
+            let (in_expr_position, type_pos_name, expr_ident_name) = match ast_match {
                 Some(ast::QueryResult::Type(&ast::Type::Named { name, .. })) => {
-                    (None, Some(name), None)
+                    (false, Some(name), None)
                 }
                 Some(ast::QueryResult::Expr(&ast::Expr::Ident(name))) => {
-                    (Some(AtContext::Expr), None, Some(name))
+                    (true, None, Some(name))
                 }
-                _ => (None, None, None),
+                _ => (false, None, None),
             };
 
             let analysis = cache.analysis;
@@ -189,21 +189,21 @@ impl CompilationCache {
             // Type names in type positions always resolve. An identifier resolves
             // to a type only when no expression binding claims it, so a local,
             // parameter or field that shadows a type name takes precedence.
-            let definite_type = definite_name.and_then(resolve);
-            let fallback_type = fallback_name.and_then(resolve);
-            ExprAt::new(None, func, definite_type, syms, cache.sources, query_context).with_expr_at(preceding_pos, |at| {
-                let at = match fallback_type {
-                    Some(typ) if is_type_receiver(at.expr()) => at.with_type(Some(typ)),
+            let named_type = type_pos_name.and_then(resolve);
+            let receiver_type_candidate = expr_ident_name.and_then(resolve);
+            ExprAt::new(None, func, named_type, syms, cache.sources, in_expr_position).with_expr_at(preceding_pos, |at| {
+                let at = match receiver_type_candidate {
+                    Some(typ) if is_type_receiver(at.expr()) => at.with_named_type(Some(typ)),
                     _ => at,
                 };
                 ctx.logger().verbose(|| {
                     format!(
-                        "Query result lookup_byte_offset={preceding_pos} parsed_module={} ast_match={} function={} expression={} named_type={} receiver_type={} context={query_context:?} parse_diagnostics={} semantic_diagnostics={} phases({})",
+                        "Query result lookup_byte_offset={preceding_pos} parsed_module={} ast_match={} function={} expression={} named_type={} expr_type={} in_expr_position={in_expr_position} parse_diagnostics={} semantic_diagnostics={} phases({})",
                         analysis.parsed.modules.iter().any(|(file, _)| *file == id),
-                        match_.is_some(),
+                        ast_match.is_some(),
                         func.is_some(),
                         at.expr().is_some(),
-                        at.type_().is_some(),
+                        at.named_type().is_some(),
                         at.expr_type().is_some(),
                         analysis.parsed.diagnostics.len(),
                         analysis.diagnostics.len(),
@@ -228,7 +228,7 @@ fn is_type_receiver(expr: Option<&ir::Expr<'_>>) -> bool {
 }
 
 #[self_referencing(pub_extras)]
-pub(crate) struct CompilationCache {
+pub(crate) struct AnalysisSnapshot {
     pub(crate) base: Arc<BaseEnv>,
     /// A per-snapshot child of the base interner, forked on first analysis.
     ///
@@ -294,7 +294,7 @@ impl AnalysisTimings {
     }
 }
 
-/// Narrows the work a [`CompilationCache`] performs when its analysis is first
+/// Narrows the work an [`AnalysisSnapshot`] performs when its analysis is first
 /// forced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnalysisMode {
@@ -372,7 +372,7 @@ impl<'ctx> AnalyzedSources<'ctx> {
     ) -> Self {
         let mut reporter = CompileErrorReporter::default();
         let (unit, symbols) = AnalysisTimings::phase(&mut timings.lower_ms, || {
-            parsed.process(symbols, &mut reporter, interner, mode.query_target())
+            parsed.lower(symbols, &mut reporter, interner, mode.query_target())
         });
         if mode.run_diagnostics() {
             AnalysisTimings::phase(&mut timings.diagnostics_ms, || {
@@ -389,7 +389,7 @@ impl<'ctx> AnalyzedSources<'ctx> {
     }
 }
 
-impl CompilationCache {
+impl AnalysisSnapshot {
     /// Test-only: whether this snapshot's analysis has already been forced. Used
     /// to assert that an unchanged snapshot is reused rather than rebuilt.
     #[cfg(test)]
@@ -397,7 +397,11 @@ impl CompilationCache {
         self.with(|cache| LazyLock::get(cache.analysis).is_some())
     }
 
-    pub(crate) fn analyze<A>(
+    /// Runs `cb` against the snapshot's lowered unit, symbols, and diagnostics.
+    ///
+    /// Forcing the analysis happens on first use; callers that only need the
+    /// symbol surface still pay the full lowering cost.
+    pub(crate) fn with_lowered<A>(
         &self,
         mut cb: impl for<'ctx> FnMut(
             &LoweredCompilationUnit<'ctx>,
@@ -432,7 +436,7 @@ impl CompilationCache {
         Self::from_sources_with(base, sources, AnalysisMode::Diagnostics)
     }
 
-    /// Like [`CompilationCache::from_sources`], choosing whether the snapshot
+    /// Like [`AnalysisSnapshot::from_sources`], choosing whether the snapshot
     /// runs the diagnostic passes. Query snapshots use [`AnalysisMode::Query`].
     pub(crate) fn from_sources_with(
         base: Arc<BaseEnv>,
@@ -457,7 +461,7 @@ impl CompilationCache {
     }
 }
 
-impl Default for CompilationCache {
+impl Default for AnalysisSnapshot {
     fn default() -> Self {
         Self::new(
             Arc::new(BaseEnv::empty()),
@@ -504,8 +508,8 @@ mod tests {
     /// built analysis to cross the thread boundary, so both must stay `Send`
     /// and `Sync` as upstream `redscript` changes land.
     #[test]
-    fn compilation_cache_and_analysis_are_send_and_sync() {
-        assert_send_sync::<CompilationCache>();
+    fn analysis_snapshot_and_analysis_are_send_and_sync() {
+        assert_send_sync::<AnalysisSnapshot>();
         assert_send_sync::<AnalyzedSources<'static>>();
     }
 
@@ -517,7 +521,7 @@ mod tests {
     fn cache_loading_is_deferred_but_validation_is_eager() {
         let corrupt: Vec<u8> = vec![0, 1, 2, 3];
         let base = Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(corrupt))));
-        let snapshot = CompilationCache::from_sources(base.clone(), ast::SourceMap::new());
+        let snapshot = AnalysisSnapshot::from_sources(base.clone(), ast::SourceMap::new());
         assert!(snapshot.is_ok());
         assert!(base.ensure_decoded().is_err());
         let valid = ScriptBundle::default().into_writeable().to_bytes().unwrap();
@@ -533,7 +537,7 @@ mod tests {
         let modules = |cancelled: bool| {
             let sources = ast::SourceMap::new();
             let id = sources.push_back("a.reds", "public class A {}");
-            let cache = CompilationCache::from_sources_with(
+            let cache = AnalysisSnapshot::from_sources_with(
                 Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(bytes.clone())))),
                 sources,
                 AnalysisMode::Query(QueryTarget { file: id, pos: 0 }),
@@ -573,7 +577,7 @@ mod tests {
             } else {
                 AnalysisMode::Diagnostics
             };
-            let cache = CompilationCache::from_sources_with(
+            let cache = AnalysisSnapshot::from_sources_with(
                 Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(bytes.clone())))),
                 sources,
                 mode,
@@ -614,11 +618,11 @@ mod tests {
         let snapshot = |source: &str| {
             let sources = ast::SourceMap::new();
             sources.push_back("a.reds", source);
-            CompilationCache::from_sources(base.clone(), sources).unwrap()
+            AnalysisSnapshot::from_sources(base.clone(), sources).unwrap()
         };
         let a = snapshot("public class OnlyInA {}");
         let b = snapshot("public class OnlyInB {}");
-        let type_names = |cache: &CompilationCache| {
+        let type_names = |cache: &AnalysisSnapshot| {
             cache.with(|cache| {
                 cache
                     .analysis
@@ -637,7 +641,7 @@ mod tests {
 
         // Each snapshot interns its own types into its forked child interner,
         // never the shared base.
-        let interned = |cache: &CompilationCache, name: &str| {
+        let interned = |cache: &AnalysisSnapshot, name: &str| {
             cache
                 .borrow_interner()
                 .get()
@@ -682,7 +686,7 @@ mod tests {
             .expect("the default base defines IScriptable");
         let sources = ast::SourceMap::new();
         sources.push_back("a.reds", "public class A {}");
-        let cache = CompilationCache::from_sources(base.clone(), sources).unwrap();
+        let cache = AnalysisSnapshot::from_sources(base.clone(), sources).unwrap();
         let snapshot_aggregate = cache
             .with(|cache| shared_aggregate(&cache.analysis.symbols, "IScriptable"))
             .expect("the snapshot inherits IScriptable");
@@ -708,14 +712,14 @@ mod tests {
             } else {
                 AnalysisMode::Diagnostics
             };
-            let cache = CompilationCache::from_sources_with(
+            let cache = AnalysisSnapshot::from_sources_with(
                 Arc::new(BaseEnv::new(CacheBytes::Owned(Arc::from(bytes.clone())))),
                 sources,
                 mode,
             )
             .unwrap();
             cache
-                .analyze(|_, _, diagnostics, _| Ok(diagnostics.len()))
+                .with_lowered(|_, _, diagnostics, _| Ok(diagnostics.len()))
                 .unwrap()
         };
         assert!(report(false) > 0);
@@ -735,14 +739,14 @@ mod tests {
         sources.push_back("defs.reds", "public class SnapshotLocal {}");
         let use_source = "public func Target() -> SnapshotLocal { return new SnapshotLocal(); }";
         let id = sources.push_back("use.reds", use_source);
-        let cache = CompilationCache::from_sources(base.clone(), sources).unwrap();
+        let cache = AnalysisSnapshot::from_sources(base.clone(), sources).unwrap();
         let ctx = context();
         let pos = use_source.find("SnapshotLocal").unwrap() as u32 + 2;
         let resolved = cache
             .query_at(
                 id,
                 pos,
-                |at| Ok(at.type_().map(|typ| typ.as_str().into_owned())),
+                |at| Ok(at.named_type().map(|typ| typ.as_str().into_owned())),
                 &ctx,
             )
             .unwrap();

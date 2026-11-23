@@ -14,18 +14,19 @@ use redscript_compiler_api::{
     Diagnostic, LoweredCompilationUnit, QueryTarget, Symbols, TypeId, TypeSchema, ast,
 };
 
-use crate::analysis::{AnalysisMode, BaseEnv, CacheBytes, CompilationCache};
+use crate::analysis::{AnalysisMode, AnalysisSnapshot, BaseEnv, CacheBytes};
 use crate::code_actions::{Fix, FixMap, FixRequest, FixScope, generate_fix};
 use crate::completions::{
     CompletionResolveData, generate_completions, member_completion_range,
     repair_completion_terminator,
 };
-use crate::diagnostics::{DiagnosticBatch, DiagnosticTracker, diagnostic_tags, location, range};
+use crate::diagnostics::{DiagnosticBatch, DiagnosticTracker, diagnostic_tags};
 use crate::dialect::{self, Dialect};
+use crate::positions::{span_location, span_range};
 use crate::query::ExprAt;
 use crate::server::{CodeLocation, CompletionPresentation, Document, LanguageServer, LspContext};
 use crate::workspace::{
-    FileResolution, LoadedWorkspace, Overlay, WorkspaceDir, collect_workspace_sources,
+    FileResolution, LoadedWorkspace, Overlay, WorkspaceConfig, collect_workspace_sources,
     content_hash, record_source_read_error,
 };
 
@@ -59,16 +60,20 @@ struct CompilerDiagnostics {
 }
 
 pub struct RedscriptLanguageServer {
-    workspaces: HashMap<PathBuf, WorkspaceDir>,
+    /// Loaded configuration for each LSP workspace folder, keyed by folder path.
+    workspace_folders: HashMap<PathBuf, WorkspaceConfig>,
     config_warnings: BTreeSet<String>,
     reported_config_warnings: BTreeSet<String>,
     io_warnings: BTreeSet<String>,
     reported_io_warnings: BTreeSet<String>,
-    standalone_paths: HashSet<PathBuf>,
-    compilation_cache: CompilationCache,
+    /// Standalone paths that are analyzed, including ones whose last read failed.
+    tracked_standalone_paths: HashSet<PathBuf>,
+    /// Snapshot of the whole workspace, rebuilt on discovery or overlay changes.
+    workspace_snapshot: AnalysisSnapshot,
     cached_fixes: FixMap,
     overlays: HashMap<PathBuf, Overlay>,
-    standalone: HashMap<PathBuf, CompilationCache>,
+    /// One snapshot per file analyzed outside every workspace root.
+    standalone_snapshots: HashMap<PathBuf, AnalysisSnapshot>,
     generation: u64,
     missing_roots: BTreeSet<PathBuf>,
     reported_missing_roots: BTreeSet<PathBuf>,
@@ -86,11 +91,12 @@ pub struct RedscriptLanguageServer {
 
 struct CachedCompletion {
     path: PathBuf,
-    receiver_end: usize,
+    /// Byte offset of the `.` member-access token the response was computed for.
+    dot_offset: usize,
     source_without_member: String,
     other_overlays: BTreeMap<PathBuf, Arc<str>>,
-    response: Arc<lsp::CompletionResponse>,
-    /// Documentation deferred out of `response` when the client resolves it
+    raw_response: Arc<lsp::CompletionResponse>,
+    /// Documentation deferred out of `raw_response` when the client resolves it
     /// lazily, indexed by each item's `data.id`.
     docs: Vec<String>,
     /// Identifies this cached response's `docs` so a resolve against a newer
@@ -99,7 +105,7 @@ struct CachedCompletion {
     /// The response adapted to a client's completion presentation capabilities,
     /// produced on first use. Capabilities are fixed after `initialize`, so this
     /// normally holds one entry that every later request reuses.
-    adapted: Option<(CompletionPresentation, Arc<lsp::CompletionResponse>)>,
+    adapted_response: Option<(CompletionPresentation, Arc<lsp::CompletionResponse>)>,
 }
 
 /// Orders a file's edits by position so `TextEdit` ordering is deterministic.
@@ -138,9 +144,9 @@ fn overlays_match(
         })
 }
 
-/// Whether a standalone `CompilationCache` was built from exactly `text` at
+/// Whether a standalone `AnalysisSnapshot` was built from exactly `text` at
 /// `path`, so its already-forced analysis can be reused as-is.
-fn standalone_matches(cache: &CompilationCache, path: &Path, text: &str) -> bool {
+fn standalone_matches(cache: &AnalysisSnapshot, path: &Path, text: &str) -> bool {
     cache.borrow_file_ids().get(path).is_some_and(|&id| {
         cache.with_sources(|sources| sources.get(id).is_some_and(|file| file.source() == text))
     })
@@ -172,25 +178,25 @@ impl RedscriptLanguageServer {
         workspace_folders: impl IntoIterator<Item = impl Into<PathBuf>>,
         validate: bool,
     ) -> anyhow::Result<Self> {
-        let mut workspaces = HashMap::new();
+        let mut loaded_folders = HashMap::new();
         let mut config_diagnostics = BTreeMap::new();
         let mut config_warnings = BTreeSet::new();
         for dir in workspace_folders {
             let dir: PathBuf = dir.into();
             let dir = dialect::identity(&dir);
-            let loaded = WorkspaceDir::load(&dir, None);
+            let loaded = WorkspaceConfig::load(&dir, None);
             if let Some(diagnostic) = loaded.diagnostic {
                 config_diagnostics.insert(loaded.dotfile_path, diagnostic);
             }
             config_warnings.extend(loaded.warnings);
-            workspaces.insert(dir, loaded.workspace);
+            loaded_folders.insert(dir, loaded.workspace);
         }
-        let workspace_dirs = workspaces.iter().flat_map(|(_, w)| w.roots.clone());
+        let source_roots = loaded_folders.iter().flat_map(|(_, w)| w.roots.clone());
         let mut missing_roots = BTreeSet::new();
         let mut read_diagnostics = BTreeMap::new();
         let mut io_warnings = BTreeSet::new();
         let sources = collect_workspace_sources(
-            workspace_dirs,
+            source_roots,
             &HashMap::new(),
             |_| false,
             &mut missing_roots,
@@ -198,8 +204,8 @@ impl RedscriptLanguageServer {
             &mut io_warnings,
         );
         let mut diagnostics = DiagnosticTracker::default();
-        diagnostics.set_reads(read_diagnostics);
-        diagnostics.set_configs(config_diagnostics);
+        diagnostics.set_read_diagnostics(read_diagnostics);
+        diagnostics.set_config_diagnostics(config_diagnostics);
         let base = Arc::new(BaseEnv::new(cache_bytes));
         // Validate a configured cache once, so a corrupt file is reported at
         // startup (and `main` can fall back to the embedded cache) instead of on
@@ -209,16 +215,16 @@ impl RedscriptLanguageServer {
             base.ensure_decoded()?;
         }
         Ok(Self {
-            compilation_cache: CompilationCache::from_sources(base, sources)?,
-            workspaces,
+            workspace_snapshot: AnalysisSnapshot::from_sources(base, sources)?,
+            workspace_folders: loaded_folders,
             config_warnings,
             reported_config_warnings: BTreeSet::new(),
             io_warnings,
             reported_io_warnings: BTreeSet::new(),
-            standalone_paths: HashSet::new(),
+            tracked_standalone_paths: HashSet::new(),
             cached_fixes: HashMap::new(),
             overlays: HashMap::new(),
-            standalone: HashMap::new(),
+            standalone_snapshots: HashMap::new(),
             generation: 0,
             missing_roots,
             reported_missing_roots: BTreeSet::new(),
@@ -239,13 +245,13 @@ impl RedscriptLanguageServer {
         // fixes on every save.
     }
 
-    fn make_edit_snapshot(&self) -> anyhow::Result<CompilationCache> {
+    fn build_edit_snapshot(&self) -> anyhow::Result<AnalysisSnapshot> {
         let sources = ast::SourceMap::new();
         let mut files: BTreeMap<PathBuf, String> = BTreeMap::new();
-        self.compilation_cache.with_sources(|active| {
+        self.workspace_snapshot.with_sources(|active| {
             for (_, file) in active.files() {
                 if self
-                    .compilation_cache
+                    .workspace_snapshot
                     .borrow_file_ids()
                     .contains_key(file.path())
                 {
@@ -265,16 +271,16 @@ impl RedscriptLanguageServer {
         for (path, text) in files {
             sources.push_back(path, text);
         }
-        CompilationCache::from_sources(self.compilation_cache.borrow_base().clone(), sources)
+        AnalysisSnapshot::from_sources(self.workspace_snapshot.borrow_base().clone(), sources)
     }
 
-    fn make_snapshot(
+    fn build_workspace_snapshot(
         &self,
         roots: impl IntoIterator<Item = PathBuf>,
         missing_roots: &mut BTreeSet<PathBuf>,
         read_diagnostics: &mut BTreeMap<PathBuf, lsp::Diagnostic>,
         io_warnings: &mut BTreeSet<String>,
-    ) -> anyhow::Result<CompilationCache> {
+    ) -> anyhow::Result<AnalysisSnapshot> {
         let sources = collect_workspace_sources(
             roots,
             &self.overlays,
@@ -283,15 +289,11 @@ impl RedscriptLanguageServer {
             read_diagnostics,
             io_warnings,
         );
-        CompilationCache::from_sources(self.compilation_cache.borrow_base().clone(), sources)
+        AnalysisSnapshot::from_sources(self.workspace_snapshot.borrow_base().clone(), sources)
     }
 
     fn rebuild(&mut self, ctx: &LspContext) -> anyhow::Result<()> {
-        self.rebuild_with_reload(ctx, true)
-    }
-
-    fn rebuild_with_reload(&mut self, ctx: &LspContext, reload: bool) -> anyhow::Result<()> {
-        self.rebuild_scoped(ctx, reload, true, true)
+        self.rebuild_scoped(ctx, true, true, true)
     }
 
     /// Whether `path` belongs to a loaded workspace, and so dirties the
@@ -360,7 +362,7 @@ impl RedscriptLanguageServer {
             BTreeMap<PathBuf, lsp::Diagnostic>,
         ) = self
             .diagnostics
-            .reads()
+            .read_diagnostics()
             .iter()
             .map(|(path, diag)| (path.clone(), diag.clone()))
             .partition(|(path, _)| self.resolve_file(path).as_workspace().is_some());
@@ -386,8 +388,8 @@ impl RedscriptLanguageServer {
                 }
             });
             let workspace = if reload {
-                self.make_snapshot(
-                    self.workspaces
+                self.build_workspace_snapshot(
+                    self.workspace_folders
                         .values()
                         .flat_map(|workspace| workspace.roots.clone()),
                     &mut missing_roots,
@@ -395,9 +397,9 @@ impl RedscriptLanguageServer {
                     &mut io_warnings,
                 )?
             } else {
-                self.make_edit_snapshot()?
+                self.build_edit_snapshot()?
             };
-            self.compilation_cache = workspace;
+            self.workspace_snapshot = workspace;
             ctx.logger().verbose(|| {
                 format!(
                     "Rebuild workspace ready elapsed_ms={:.3}",
@@ -410,9 +412,9 @@ impl RedscriptLanguageServer {
             ctx.logger()
                 .verbose(|| "Rebuild phase=standalone analysis".to_owned());
             let paths: HashSet<_> = self
-                .standalone
+                .standalone_snapshots
                 .keys()
-                .chain(self.standalone_paths.iter())
+                .chain(self.tracked_standalone_paths.iter())
                 .chain(self.overlays.keys())
                 .filter(|path| self.resolve_file(path).as_workspace().is_none())
                 .cloned()
@@ -420,7 +422,7 @@ impl RedscriptLanguageServer {
             // Take the previous caches so an unchanged standalone file keeps its
             // already-analyzed snapshot instead of re-interning the base-game
             // symbols into a fresh snapshot.
-            let mut reusable = std::mem::take(&mut self.standalone);
+            let mut reusable = std::mem::take(&mut self.standalone_snapshots);
             let mut standalone = HashMap::with_capacity(paths.len());
             let mut active_standalone_paths = HashSet::new();
             for path in paths {
@@ -444,8 +446,8 @@ impl RedscriptLanguageServer {
                         sources.push_back(&path, text.to_string());
                         standalone.insert(
                             path,
-                            CompilationCache::from_sources(
-                                self.compilation_cache.borrow_base().clone(),
+                            AnalysisSnapshot::from_sources(
+                                self.workspace_snapshot.borrow_base().clone(),
                                 sources,
                             )?,
                         );
@@ -464,18 +466,18 @@ impl RedscriptLanguageServer {
             }
             // Drop read errors for paths that are no longer active.
             standalone_reads.retain(|path, _| active_standalone_paths.contains(path));
-            self.standalone = standalone;
-            self.standalone_paths = active_standalone_paths;
+            self.standalone_snapshots = standalone;
+            self.tracked_standalone_paths = active_standalone_paths;
         }
 
         if reload {
             self.missing_roots = missing_roots;
         }
         workspace_reads.extend(standalone_reads);
-        self.diagnostics.set_reads(workspace_reads);
+        self.diagnostics.set_read_diagnostics(workspace_reads);
         self.io_warnings = io_warnings;
         if reload {
-            self.log_missing_roots(ctx);
+            self.report_workspace_warnings(ctx);
         } else {
             self.log_io_warnings(ctx);
         }
@@ -512,7 +514,7 @@ impl RedscriptLanguageServer {
             by_file: BTreeMap::new(),
             fixes: std::mem::take(&mut self.cached_fixes),
         };
-        self.check_workspace(|unit, symbols, diagnostics, sources| {
+        self.with_workspace_analysis(|unit, symbols, diagnostics, sources| {
             self.collect_compiler_diagnostics(
                 Some(unit),
                 diagnostics,
@@ -526,8 +528,8 @@ impl RedscriptLanguageServer {
             self.cached_fixes = collected.fixes;
             return Ok(None);
         }
-        for cache in self.standalone.values() {
-            cache.analyze(|unit, symbols, diagnostics, sources| {
+        for cache in self.standalone_snapshots.values() {
+            cache.with_lowered(|unit, symbols, diagnostics, sources| {
                 self.collect_compiler_diagnostics(
                     Some(unit),
                     diagnostics,
@@ -556,8 +558,8 @@ impl RedscriptLanguageServer {
     /// analyzed snapshot, so removing a workspace folder or deleting a file
     /// does not leave its fixes addressable.
     fn prune_cached_fixes(&mut self) {
-        let workspace = self.compilation_cache.borrow_file_ids();
-        let standalone = &self.standalone;
+        let workspace = self.workspace_snapshot.borrow_file_ids();
+        let standalone = &self.standalone_snapshots;
         let overlays = &self.overlays;
         self.cached_fixes.retain(|path, _| {
             workspace.contains_key(path)
@@ -566,10 +568,10 @@ impl RedscriptLanguageServer {
         });
     }
 
-    /// The most specific workspace root containing `path`, together with the
-    /// workspace folder that owns it and the loaded workspace.
-    fn find_workspace_root(&self, path: &Path) -> Option<(&PathBuf, &PathBuf, &WorkspaceDir)> {
-        self.workspaces
+    /// The most specific source root containing `path`, together with the
+    /// workspace folder that owns it and its loaded configuration.
+    fn find_source_root(&self, path: &Path) -> Option<(&PathBuf, &PathBuf, &WorkspaceConfig)> {
+        self.workspace_folders
             .iter()
             .flat_map(|(owner, workspace)| {
                 workspace
@@ -588,7 +590,7 @@ impl RedscriptLanguageServer {
 
     fn resolve_file(&self, path: &Path) -> FileResolution<'_> {
         let path = dialect::identity(path);
-        if let Some((root, _, workspace)) = self.find_workspace_root(&path) {
+        if let Some((root, _, workspace)) = self.find_source_root(&path) {
             // An open buffer that the workspace walk would skip is treated as
             // if it had never been discovered, so it cannot be injected into
             // workspace compilation.
@@ -602,11 +604,11 @@ impl RedscriptLanguageServer {
         }
     }
 
-    /// Returns the workspace folder key (the key of `self.workspaces`) that owns
+    /// Returns the workspace folder key (the key of `self.workspace_folders`) that owns
     /// `path`, or `None` when the path is not part of any workspace.
-    fn workspace_root_for(&self, path: &Path) -> Option<PathBuf> {
+    fn workspace_folder_for(&self, path: &Path) -> Option<PathBuf> {
         let path = dialect::identity(path);
-        let (root, owner, _) = self.find_workspace_root(&path)?;
+        let (root, owner, _) = self.find_source_root(&path)?;
         (!dialect::is_ignored(&path, root)).then(|| owner.clone())
     }
 
@@ -625,7 +627,7 @@ impl RedscriptLanguageServer {
             |at| {
                 let range = at.expr().and_then(|e| {
                     let span = e.span();
-                    range(span, at.sources().get(span.file)?)
+                    span_range(span, at.sources().get(span.file)?)
                 });
                 let span = at.expr().map(redscript_compiler_api::ir::Expr::span);
                 let value = at.display().to_string();
@@ -679,14 +681,14 @@ impl RedscriptLanguageServer {
             )
         });
         let path = dialect::identity(loc.doc().path());
-        let receiver_end = member.start;
+        let dot_offset = member.start;
         if let Some(cached) = self.completion_cache.lock().unwrap().as_ref()
             && cached.path == path
-            && cached.receiver_end == receiver_end
+            && cached.dot_offset == dot_offset
             && cached.source_without_member.len() == contents.len() - member.len()
             && cached
                 .source_without_member
-                .starts_with(&contents[..receiver_end])
+                .starts_with(&contents[..dot_offset])
             && cached
                 .source_without_member
                 .ends_with(&contents[member.end..])
@@ -694,7 +696,7 @@ impl RedscriptLanguageServer {
         {
             ctx.logger()
                 .verbose(|| "Completion analysis=reused member results".to_owned());
-            return Ok(cached.response.clone());
+            return Ok(cached.raw_response.clone());
         }
         // Only allocate the stripped source and overlay snapshot on a miss.
         let source_without_member = {
@@ -712,26 +714,26 @@ impl RedscriptLanguageServer {
         // A client that can resolve documentation lazily gets it omitted from
         // the response and looked up again from the cache on
         // `completionItem/resolve`.
-        let resolve = ctx
+        let resolve_generation = ctx
             .supports_lazy_completion_documentation()
             .then(|| self.completion_generation.fetch_add(1, Ordering::Relaxed));
         let generated = self.expr_at_with(
             loc.with_pos(member.start as u32),
             Some(member),
             Some(contents),
-            |at| generate_completions(at, dialect, resolve),
+            |at| generate_completions(at, dialect, resolve_generation),
             ctx,
         )?;
         let response = Arc::new(lsp::CompletionResponse::Array(generated.items));
         *self.completion_cache.lock().unwrap() = Some(CachedCompletion {
             path,
-            receiver_end,
+            dot_offset,
             source_without_member,
             other_overlays,
-            response: response.clone(),
+            raw_response: response.clone(),
             docs: generated.docs,
-            generation: resolve.unwrap_or(0),
-            adapted: None,
+            generation: resolve_generation.unwrap_or(0),
+            adapted_response: None,
         });
         Ok(response)
     }
@@ -751,8 +753,8 @@ impl RedscriptLanguageServer {
         let presentation = ctx.completion_presentation();
         let mut cache = self.completion_cache.lock().unwrap();
         if let Some(cached) = cache.as_mut()
-            && Arc::ptr_eq(&cached.response, &response)
-            && let Some((key, adapted)) = &cached.adapted
+            && Arc::ptr_eq(&cached.raw_response, &response)
+            && let Some((key, adapted)) = &cached.adapted_response
             && *key == presentation
         {
             return Ok(adapted.clone());
@@ -761,9 +763,9 @@ impl RedscriptLanguageServer {
         ctx.adapt_completion(&mut adapted);
         let adapted = Arc::new(adapted);
         if let Some(cached) = cache.as_mut()
-            && Arc::ptr_eq(&cached.response, &response)
+            && Arc::ptr_eq(&cached.raw_response, &response)
         {
-            cached.adapted = Some((presentation, adapted.clone()));
+            cached.adapted_response = Some((presentation, adapted.clone()));
         }
         Ok(adapted)
     }
@@ -819,7 +821,7 @@ impl RedscriptLanguageServer {
             |at| {
                 let locations = at
                     .definition_span()
-                    .and_then(|span| Some(vec![location(span, at.sources(), ctx)?]))
+                    .and_then(|span| Some(vec![span_location(span, at.sources(), ctx)?]))
                     .unwrap_or_default();
                 Ok(locations.into())
             },
@@ -833,7 +835,7 @@ impl RedscriptLanguageServer {
         ctx: &LspContext,
     ) -> anyhow::Result<lsp::WorkspaceSymbolResponse> {
         cancelled()?;
-        self.check_workspace(|_, syms, _, sources| {
+        self.with_workspace_analysis(|_, syms, _, sources| {
             let funcs = syms
                 .free_functions()
                 .filter_map(|e| Some((*e.name(), e.func().span()?)))
@@ -845,7 +847,7 @@ impl RedscriptLanguageServer {
                         kind: lsp::SymbolKind::FUNCTION,
                         tags: None,
                         deprecated: None,
-                        location: location(span, sources, ctx)?,
+                        location: span_location(span, sources, ctx)?,
                         container_name: None,
                     })
                 });
@@ -864,7 +866,7 @@ impl RedscriptLanguageServer {
                     |name: &str, kind, span: Option<Span>, container: Option<TypeId<'_>>| {
                         if name.contains(query)
                             && let Some(location) =
-                                span.and_then(|span| location(span, sources, ctx))
+                                span.and_then(|span| span_location(span, sources, ctx))
                         {
                             #[allow(deprecated)]
                             results.push(lsp::SymbolInformation {
@@ -1003,7 +1005,7 @@ impl RedscriptLanguageServer {
             return Ok(vec![]);
         }
         let path = dialect::identity(&path);
-        let scope = match self.workspace_root_for(&path) {
+        let scope = match self.workspace_folder_for(&path) {
             Some(ws_root) => FixScope::Workspace(ws_root),
             None => FixScope::Standalone(path.clone()),
         };
@@ -1026,7 +1028,7 @@ impl RedscriptLanguageServer {
                 continue;
             }
             for fix in slot_fixes {
-                if !self.valid_fix_cached(fix, &mut fix_hashes) {
+                if !self.is_valid_fix_cached(fix, &mut fix_hashes) {
                     continue;
                 }
                 let matched_diagnostics = fix.matching_diagnostics(&context.diagnostics);
@@ -1057,7 +1059,6 @@ impl RedscriptLanguageServer {
                     kind: Some(lsp::CodeActionKind::QUICKFIX),
                     data: Some(serde_json::to_value(FixRequest::FixAll(
                         fix.kind,
-                        self.generation,
                         scope.clone(),
                     ))?),
                     ..Default::default()
@@ -1093,10 +1094,10 @@ impl RedscriptLanguageServer {
 
         let request: FixRequest = serde_json::from_value(data)?;
         match request {
-            FixRequest::FixOne(fix) if self.valid_fix(&fix) => {
+            FixRequest::FixOne(fix) if self.is_valid_fix(&fix) => {
                 action.edit = Some(self.workspace_edit(vec![(fix.uri, vec![fix.edit])], ctx));
             }
-            FixRequest::FixAll(kind, _generation, scope) => {
+            FixRequest::FixAll(kind, scope) => {
                 let mut unique = HashSet::<(lsp::Uri, lsp::Range)>::new();
 
                 #[allow(clippy::mutable_key_type)]
@@ -1111,7 +1112,7 @@ impl RedscriptLanguageServer {
                     }
                     FixScope::Workspace(ws_root) => {
                         for (path, slots) in fixes {
-                            if self.workspace_root_for(path).as_ref() == Some(ws_root) {
+                            if self.workspace_folder_for(path).as_ref() == Some(ws_root) {
                                 selected.extend(slots.values().flatten());
                             }
                         }
@@ -1121,7 +1122,7 @@ impl RedscriptLanguageServer {
                 for fix in selected
                     .into_iter()
                     .filter(|f| f.kind == kind)
-                    .filter(|f| self.valid_fix_cached(f, &mut file_hashes))
+                    .filter(|f| self.is_valid_fix_cached(f, &mut file_hashes))
                 {
                     if unique.insert((fix.uri.clone(), fix.edit.range)) {
                         edits
@@ -1206,14 +1207,14 @@ impl RedscriptLanguageServer {
         }
     }
 
-    fn valid_fix(&self, fix: &Fix) -> bool {
+    fn is_valid_fix(&self, fix: &Fix) -> bool {
         let mut hashes = HashMap::new();
-        self.valid_fix_cached(fix, &mut hashes)
+        self.is_valid_fix_cached(fix, &mut hashes)
     }
 
-    /// Like [`valid_fix`], but memoizes the on-disk content hash per path so a
+    /// Like [`Self::is_valid_fix`], but memoizes the on-disk content hash per path so a
     /// fix-all over many fixes in the same unchanged file reads it once.
-    fn valid_fix_cached(&self, fix: &Fix, hashes: &mut HashMap<PathBuf, Option<u64>>) -> bool {
+    fn is_valid_fix_cached(&self, fix: &Fix, hashes: &mut HashMap<PathBuf, Option<u64>>) -> bool {
         let Ok(path) = crate::server::path_from_uri(&fix.uri) else {
             return false;
         };
@@ -1230,9 +1231,9 @@ impl RedscriptLanguageServer {
         hash == Some(fix.expected_source_hash)
     }
 
-    pub fn log_missing_roots(&mut self, ctx: &LspContext) {
+    pub fn report_workspace_warnings(&mut self, ctx: &LspContext) {
         let configured: HashSet<_> = self
-            .workspaces
+            .workspace_folders
             .values()
             .flat_map(|workspace| workspace.roots.iter())
             .collect();
@@ -1285,27 +1286,27 @@ impl RedscriptLanguageServer {
     /// Reloads workspace configuration for every loaded folder, reusing the
     /// results in `preloaded` for folders the caller has already loaded.
     fn reload_workspaces_with(&mut self, preloaded: &HashMap<PathBuf, LoadedWorkspace>) {
-        dialect::clear_identity_cache();
-        let mut workspaces = HashMap::with_capacity(self.workspaces.len());
+        dialect::clear_path_caches();
+        let mut workspace_folders = HashMap::with_capacity(self.workspace_folders.len());
         let mut config_diagnostics = BTreeMap::new();
         let mut config_warnings = BTreeSet::new();
-        for (dir, previous) in &self.workspaces {
+        for (dir, previous) in &self.workspace_folders {
             let loaded = match preloaded.get(dir) {
                 Some(loaded) => loaded.clone(),
-                None => WorkspaceDir::load(dir, Some(previous)),
+                None => WorkspaceConfig::load(dir, Some(previous)),
             };
             if let Some(diagnostic) = loaded.diagnostic {
                 config_diagnostics.insert(loaded.dotfile_path, diagnostic);
             }
             config_warnings.extend(loaded.warnings);
-            workspaces.insert(dir.clone(), loaded.workspace);
+            workspace_folders.insert(dir.clone(), loaded.workspace);
         }
-        self.workspaces = workspaces;
-        self.diagnostics.set_configs(config_diagnostics);
+        self.workspace_folders = workspace_folders;
+        self.diagnostics.set_config_diagnostics(config_diagnostics);
         self.config_warnings = config_warnings;
     }
 
-    fn check_workspace<A>(
+    fn with_workspace_analysis<A>(
         &self,
         mut cb: impl for<'ctx> FnMut(
             &LoweredCompilationUnit<'ctx>,
@@ -1314,7 +1315,7 @@ impl RedscriptLanguageServer {
             &'ctx ast::SourceMap,
         ) -> anyhow::Result<A>,
     ) -> anyhow::Result<A> {
-        self.compilation_cache.analyze(&mut cb)
+        self.workspace_snapshot.with_lowered(&mut cb)
     }
 
     #[cfg(test)]
@@ -1407,7 +1408,7 @@ impl RedscriptLanguageServer {
                         .flatten()
                         .map(|href| lsp::CodeDescription { href });
                     Some(lsp::Diagnostic {
-                        range: range(diag.span(), file)?,
+                        range: span_range(diag.span(), file)?,
                         severity: Some(if diag.is_error() {
                             lsp::DiagnosticSeverity::ERROR
                         } else {
@@ -1425,7 +1426,7 @@ impl RedscriptLanguageServer {
                                     Some(lsp::DiagnosticRelatedInformation {
                                         location: lsp::Location {
                                             uri: ctx.uri(file.path()).ok()?,
-                                            range: range(span, file)?,
+                                            range: span_range(span, file)?,
                                         },
                                         message: message.into(),
                                     })
@@ -1483,11 +1484,11 @@ impl RedscriptLanguageServer {
         let path = dialect::identity(loc.doc().path());
         let workspace = self.resolve_file(&path).as_workspace().is_some();
         let base = if workspace {
-            &self.compilation_cache
+            &self.workspace_snapshot
         } else {
-            self.standalone
+            self.standalone_snapshots
                 .get(&path)
-                .unwrap_or(&self.compilation_cache)
+                .unwrap_or(&self.workspace_snapshot)
         };
         ctx.logger().verbose(|| {
             format!(
@@ -1550,26 +1551,25 @@ impl RedscriptLanguageServer {
             file: id,
             pos: loc.pos().saturating_sub(1),
         };
-        let query_cache = CompilationCache::from_sources_with(
+        let query_snapshot = AnalysisSnapshot::from_sources_with(
             base.borrow_base().clone(),
             sources,
             AnalysisMode::Query(target),
         )?;
         cancelled()?;
-        query_cache.query_at(id, loc.pos(), cb, ctx)
+        query_snapshot.query_at(id, loc.pos(), cb, ctx)
     }
 
-    /// Apply an overlay for a single document without triggering a rebuild.
+    /// Applies an overlay for a single document without triggering a rebuild.
     ///
-    /// Returns `Some(reload)` for a supported dialect (`reload` is true when the
-    /// buffer was closed and disk contents must be restored), or `None` for a
-    /// path whose dialect is unsupported.
-    fn apply_document(
+    /// Returns whether the dialect is supported; an unsupported path is left
+    /// untouched.
+    fn apply_document_overlay(
         &mut self,
         path: &Path,
         buffer: Option<&crate::buffers::Buffer>,
         ctx: &LspContext,
-    ) -> Option<bool> {
+    ) -> bool {
         let path = dialect::identity(path);
         if Dialect::of(&path).is_none() {
             if buffer.is_some()
@@ -1584,7 +1584,7 @@ impl RedscriptLanguageServer {
                 ctx.logger().warn(&message);
                 ctx.show_message(lsp::MessageType::WARNING, message);
             }
-            return None;
+            return false;
         }
         if let Some(buffer) = buffer {
             self.overlays.insert(
@@ -1596,26 +1596,26 @@ impl RedscriptLanguageServer {
             );
         } else {
             self.overlays.remove(&path);
-            self.standalone.remove(&path);
-            self.standalone_paths.remove(&path);
+            self.standalone_snapshots.remove(&path);
+            self.tracked_standalone_paths.remove(&path);
             // A closed standalone file is no longer analyzed, so its cached
             // quick fixes would otherwise linger forever.
             if self.resolve_file(&path).as_workspace().is_none() {
                 self.cached_fixes.remove(&path);
             }
         }
-        Some(buffer.is_none())
+        true
     }
 }
 
 impl LanguageServer for RedscriptLanguageServer {
     fn watch_roots(&self) -> Vec<PathBuf> {
         let mut roots: Vec<_> = self
-            .workspaces
+            .workspace_folders
             .keys()
             .map(|path| dialect::identity(path))
             .chain(
-                self.workspaces
+                self.workspace_folders
                     .values()
                     .flat_map(|workspace| workspace.roots.clone()),
             )
@@ -1635,7 +1635,7 @@ impl LanguageServer for RedscriptLanguageServer {
         // standalone document just drops it. Open/change use known sources;
         // filesystem notifications refresh discovery.
         let workspace = self.is_workspace_document(&path);
-        if self.apply_document(&path, buffer, ctx).is_some() {
+        if self.apply_document_overlay(&path, buffer, ctx) {
             let reload = buffer.is_none() && workspace;
             self.rebuild_scoped(ctx, reload, workspace, !workspace)?;
         }
@@ -1656,7 +1656,7 @@ impl LanguageServer for RedscriptLanguageServer {
         let mut applied = false;
         for (path, buffer) in documents {
             let workspace = self.is_workspace_document(path);
-            if self.apply_document(path, *buffer, ctx).is_some() {
+            if self.apply_document_overlay(path, *buffer, ctx) {
                 applied = true;
                 reload |= buffer.is_none() && workspace;
                 workspace_dirty |= workspace;
@@ -1670,7 +1670,7 @@ impl LanguageServer for RedscriptLanguageServer {
     }
 
     fn files_changed(&mut self, _paths: Vec<PathBuf>, ctx: &LspContext) -> anyhow::Result<()> {
-        dialect::clear_identity_cache();
+        dialect::clear_path_caches();
         self.reload_workspaces();
         self.rebuild(ctx)
     }
@@ -1692,7 +1692,7 @@ impl LanguageServer for RedscriptLanguageServer {
         if path.file_name().is_some_and(|name| name == ".redscript") {
             // Reload configuration before the abort check so a superseded check
             // that still runs is cheap; the newer check reuses the reload.
-            dialect::clear_identity_cache();
+            dialect::clear_path_caches();
             self.reload_workspaces();
             if should_abort() {
                 return Ok(None);
@@ -1706,7 +1706,7 @@ impl LanguageServer for RedscriptLanguageServer {
             && Dialect::of(&path).is_some()
             && path.is_file()
         {
-            self.standalone_paths.insert(path);
+            self.tracked_standalone_paths.insert(path);
         }
         // A newer save already superseded this check, and it will rebuild the
         // snapshot it publishes; skip the filesystem scan here.
@@ -1731,7 +1731,7 @@ impl LanguageServer for RedscriptLanguageServer {
         removed: Vec<PathBuf>,
         ctx: &LspContext,
     ) -> anyhow::Result<()> {
-        dialect::clear_identity_cache();
+        dialect::clear_path_caches();
         let removed: Vec<PathBuf> = removed
             .into_iter()
             .map(|folder| dialect::identity(&folder))
@@ -1741,19 +1741,19 @@ impl LanguageServer for RedscriptLanguageServer {
             .map(|folder| dialect::identity(&folder))
             .collect();
         for folder in removed {
-            self.workspaces.remove(&folder);
+            self.workspace_folders.remove(&folder);
         }
         // Load each added folder once; the reload below reuses these results and
         // only re-reads folders that were already present.
         let preloaded: HashMap<PathBuf, LoadedWorkspace> = added
             .into_iter()
             .map(|dir| {
-                let loaded = WorkspaceDir::load(&dir, self.workspaces.get(&dir));
+                let loaded = WorkspaceConfig::load(&dir, self.workspace_folders.get(&dir));
                 (dir, loaded)
             })
             .collect();
         for (dir, loaded) in &preloaded {
-            self.workspaces
+            self.workspace_folders
                 .insert(dir.clone(), loaded.workspace.clone());
         }
         self.reload_workspaces_with(&preloaded);
@@ -1763,17 +1763,17 @@ impl LanguageServer for RedscriptLanguageServer {
     fn hover(
         &self,
         loc: CodeLocation<'_>,
-        _ctx: &LspContext,
+        ctx: &LspContext,
     ) -> anyhow::Result<Option<lsp_types::Hover>> {
-        self.hover_at(loc, _ctx)
+        self.hover_at(loc, ctx)
     }
 
     fn completion(
         &self,
         loc: CodeLocation<'_>,
-        _ctx: &LspContext,
+        ctx: &LspContext,
     ) -> anyhow::Result<Arc<lsp_types::CompletionResponse>> {
-        self.completion_at(loc, _ctx)
+        self.completion_at(loc, ctx)
     }
 
     fn completion_for_client(
@@ -2070,7 +2070,7 @@ mod tests {
         fs::write(&path, "public class {").unwrap();
         let mut server =
             RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
-        server.log_missing_roots(&ctx);
+        server.report_workspace_warnings(&ctx);
         server.publish_all_diagnostics(&ctx).unwrap();
         assert!(receiver.try_iter().any(|message| {
             let lsp_server::Message::Notification(notification) = message else {
@@ -2091,7 +2091,7 @@ mod tests {
         fs::write(&path, "public class {").unwrap();
         let mut server =
             RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
-        server.log_missing_roots(&ctx);
+        server.report_workspace_warnings(&ctx);
 
         let batch = server
             .collect_diagnostic_batch(&ctx, || false)
@@ -2390,7 +2390,7 @@ mod tests {
                 text.rfind("value").unwrap() as u32 + 1,
             );
             let unit_address = server
-                .compilation_cache
+                .workspace_snapshot
                 .with(|cache| &cache.analysis.unit as *const _ as usize);
             for _ in 0..2 {
                 let hover = server.hover_at(loc.clone(), &ctx).unwrap().unwrap();
@@ -2400,7 +2400,7 @@ mod tests {
                 assert!(contents.value.contains(typ), "{}", contents.value);
                 assert_eq!(
                     server
-                        .compilation_cache
+                        .workspace_snapshot
                         .with(|cache| &cache.analysis.unit as *const _ as usize),
                     unit_address,
                 );
@@ -2463,7 +2463,7 @@ mod tests {
             .count();
         assert_eq!(rebuilds, 1);
         server
-            .check_workspace(|_, symbols, _, _| {
+            .with_workspace_analysis(|_, symbols, _, _| {
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "A"));
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "B"));
                 Ok(())
@@ -2483,7 +2483,7 @@ mod tests {
         let path = temp.path().join("open.reds");
         let _buffers = open(&mut server, &ctx, &path, "public class Open {}", 1);
         server
-            .check_workspace(|_, symbols, _, _| {
+            .with_workspace_analysis(|_, symbols, _, _| {
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "Before"));
                 assert!(!symbols.types().any(|(id, _)| id.as_str() == "After"));
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "Open"));
@@ -2492,7 +2492,7 @@ mod tests {
             .unwrap();
         server.files_changed(vec![dependency], &ctx).unwrap();
         server
-            .check_workspace(|_, symbols, _, _| {
+            .with_workspace_analysis(|_, symbols, _, _| {
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "After"));
                 assert!(!symbols.types().any(|(id, _)| id.as_str() == "Before"));
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "Open"));
@@ -2514,7 +2514,7 @@ mod tests {
             .files_changed(vec![community, mixed.clone(), upper.clone()], &ctx)
             .unwrap();
         server
-            .check_workspace(|_, symbols, diags, _| {
+            .with_workspace_analysis(|_, symbols, diags, _| {
                 assert!(diags.is_empty(), "{diags:?}");
                 for name in ["Community", "MixedDisk", "UpperDisk"] {
                     assert!(symbols.types().any(|(id, _)| id.as_str() == name));
@@ -2526,9 +2526,9 @@ mod tests {
         let _upper = open(&mut server, &ctx, &upper, "class UpperLive {}", 1);
         let unsaved = temp.path().join("new.sCrIpT");
         let _unsaved = open(&mut server, &ctx, &unsaved, "class Unsaved {}", 1);
-        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 4);
+        assert_eq!(server.workspace_snapshot.borrow_file_ids().len(), 4);
         server
-            .check_workspace(|_, symbols, diags, _| {
+            .with_workspace_analysis(|_, symbols, diags, _| {
                 assert!(diags.is_empty(), "{diags:?}");
                 for name in ["Community", "MixedLive", "UpperLive", "Unsaved"] {
                     assert!(symbols.types().any(|(id, _)| id.as_str() == name));
@@ -2551,9 +2551,9 @@ mod tests {
         server
             .files_changed(vec![community.clone(), redmod.clone()], &ctx)
             .unwrap();
-        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 2);
+        assert_eq!(server.workspace_snapshot.borrow_file_ids().len(), 2);
         server
-            .check_workspace(|_, symbols, diags, _| {
+            .with_workspace_analysis(|_, symbols, diags, _| {
                 assert!(diags.is_empty(), "{diags:?}");
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "Redmod"));
                 Ok(())
@@ -2561,13 +2561,13 @@ mod tests {
             .unwrap();
         let _buffers = open(&mut server, &ctx, &redmod, "", 5);
         server
-            .check_workspace(|_, symbols, diags, _| {
+            .with_workspace_analysis(|_, symbols, diags, _| {
                 assert!(diags.is_empty(), "{diags:?}");
                 assert!(!symbols.types().any(|(id, _)| id.as_str() == "Redmod"));
                 Ok(())
             })
             .unwrap();
-        server.compilation_cache.with(|cache| {
+        server.workspace_snapshot.with(|cache| {
             let id = cache.file_ids[&dialect::identity(&redmod)];
             assert!(
                 cache
@@ -2582,9 +2582,9 @@ mod tests {
         let standalone = external.path().join("solo.script");
         fs::write(&standalone, "class Standalone {}").unwrap();
         check_and_publish(&mut server, standalone.clone(), &ctx);
-        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 2);
+        assert_eq!(server.workspace_snapshot.borrow_file_ids().len(), 2);
         assert_eq!(
-            server.standalone[&dialect::identity(&standalone)]
+            server.standalone_snapshots[&dialect::identity(&standalone)]
                 .borrow_file_ids()
                 .len(),
             1
@@ -2641,13 +2641,13 @@ mod tests {
                 .patched_expr_at(loc.clone(), |_| Ok(()), &ctx)
                 .unwrap();
         }
-        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 2);
+        assert_eq!(server.workspace_snapshot.borrow_file_ids().len(), 2);
         assert_eq!(
-            server.compilation_cache.with_sources(ast::SourceMap::len),
+            server.workspace_snapshot.with_sources(ast::SourceMap::len),
             3
         );
         server
-            .check_workspace(|_, _, diags, _| {
+            .with_workspace_analysis(|_, _, diags, _| {
                 assert!(diags.is_empty(), "{diags:?}");
                 Ok(())
             })
@@ -2778,10 +2778,10 @@ mod tests {
         let text = "function Test(obj: Object) -> Int32 { let values: array<Int32>; values.PushBack(Shared()); if (obj) { return values.Size(); } return 0; }";
         let buffers = open(&mut server, &ctx, &path, text, 2);
         server
-            .check_workspace(|unit, _, diagnostics, _| {
+            .with_workspace_analysis(|unit, _, diagnostics, _| {
                 assert!(diagnostics.is_empty(), "{diagnostics:?}");
                 assert!(unit.all_functions().any(|function| function.span.file
-                    == server.compilation_cache.borrow_file_ids()[&dialect::identity(&path)]));
+                    == server.workspace_snapshot.borrow_file_ids()[&dialect::identity(&path)]));
                 Ok(())
             })
             .unwrap();
@@ -2811,10 +2811,10 @@ mod tests {
             3,
         );
         server
-            .check_workspace(|_, _, diagnostics, _| {
+            .with_workspace_analysis(|_, _, diagnostics, _| {
                 assert!(!diagnostics.is_empty());
                 assert!(diagnostics.iter().any(|diag| diag.span().file
-                    == server.compilation_cache.borrow_file_ids()[&dialect::identity(&path)]));
+                    == server.workspace_snapshot.borrow_file_ids()[&dialect::identity(&path)]));
                 Ok(())
             })
             .unwrap();
@@ -2835,12 +2835,12 @@ mod tests {
         let text = "class Child extends Base { public override function F(x: Int32 ) {} }";
         let buffers = open(&mut server, &ctx, &path, text, 2);
         server
-            .check_workspace(|_, _, diagnostics, _| {
+            .with_workspace_analysis(|_, _, diagnostics, _| {
                 assert!(diagnostics.is_empty(), "{diagnostics:?}");
                 Ok(())
             })
             .unwrap();
-        server.compilation_cache.with(|cache| {
+        server.workspace_snapshot.with(|cache| {
             let id = cache.file_ids[&dialect::identity(&path)];
             let (_, crate::dialect::ParsedModule::Redmod(parsed)) = cache
                 .analysis
@@ -2863,7 +2863,10 @@ mod tests {
             .patched_expr_at(
                 loc,
                 |at| {
-                    assert_eq!(at.type_().map(|typ| typ.as_str()).as_deref(), Some("Int32"));
+                    assert_eq!(
+                        at.named_type().map(|typ| typ.as_str()).as_deref(),
+                        Some("Int32")
+                    );
                     Ok(())
                 },
                 &ctx,
@@ -2878,7 +2881,7 @@ mod tests {
             3,
         );
         server
-            .check_workspace(|_, _, diagnostics, _| {
+            .with_workspace_analysis(|_, _, diagnostics, _| {
                 assert!(
                     diagnostics.iter().any(|diag| {
                         diag.to_string()
@@ -2914,7 +2917,7 @@ mod tests {
             4,
         );
         server
-            .check_workspace(|_, _, diagnostics, _| {
+            .with_workspace_analysis(|_, _, diagnostics, _| {
                 assert!(
                     diagnostics.iter().any(|diag| {
                         diag.to_string()
@@ -2938,9 +2941,9 @@ mod tests {
         server.files_changed(vec![path.clone()], &ctx).unwrap();
         let buffers = open(&mut server, &ctx, &path, text, 2);
         server
-            .check_workspace(|unit, _, diagnostics, _| {
+            .with_workspace_analysis(|unit, _, diagnostics, _| {
                 assert!(diagnostics.is_empty(), "{diagnostics:?}");
-                let id = server.compilation_cache.borrow_file_ids()[&dialect::identity(&path)];
+                let id = server.workspace_snapshot.borrow_file_ids()[&dialect::identity(&path)];
                 let function = unit
                     .all_functions()
                     .find(|function| function.span.file == id)
@@ -3025,7 +3028,8 @@ mod tests {
                         );
                         assert_eq!(at.expr_type().unwrap().to_string(), typ);
                         assert_eq!(
-                            location(at.definition_span().unwrap(), at.sources(), &ctx).unwrap(),
+                            span_location(at.definition_span().unwrap(), at.sources(), &ctx)
+                                .unwrap(),
                             locations[0]
                         );
                         assert!(
@@ -3039,8 +3043,8 @@ mod tests {
                 )
                 .unwrap();
         }
-        server.compilation_cache.with_sources(|sources| {
-            let id = server.compilation_cache.borrow_file_ids()[&dialect::identity(&path)];
+        server.workspace_snapshot.with_sources(|sources| {
+            let id = server.workspace_snapshot.borrow_file_ids()[&dialect::identity(&path)];
             assert_eq!(sources.get(id).unwrap().source(), text);
         });
         assert_eq!(fs::read_to_string(path).unwrap(), "function DiskOnly() {}");
@@ -3079,7 +3083,7 @@ mod tests {
         for text in ["class Generic<T> {}", "class {"] {
             let _bad = open(&mut server, &ctx, &bad, text, 2);
             server
-                .check_workspace(|_, symbols, diagnostics, sources| {
+                .with_workspace_analysis(|_, symbols, diagnostics, sources| {
                     assert!(symbols.types().any(|(id, _)| id.as_str() == "Good"));
                     assert!(symbols.types().any(|(id, _)| id.as_str() == "Community"));
                     assert!(!symbols.types().any(|(id, _)| id.as_str() == "Generic"));
@@ -3112,9 +3116,9 @@ mod tests {
         server.files_changed(vec![path.clone()], &ctx).unwrap();
         assert_eq!(server.overlays.len(), 1);
         assert!(server.overlays.contains_key(&identity));
-        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 1);
+        assert_eq!(server.workspace_snapshot.borrow_file_ids().len(), 1);
         server
-            .check_workspace(|_, symbols, diagnostics, _| {
+            .with_workspace_analysis(|_, symbols, diagnostics, _| {
                 assert!(diagnostics.is_empty(), "{diagnostics:?}");
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "Live"));
                 assert!(!symbols.types().any(|(id, _)| id.as_str() == "Saved"));
@@ -3123,7 +3127,7 @@ mod tests {
             .unwrap();
         server.document_changed(path, None, &ctx).unwrap();
         assert!(server.overlays.is_empty());
-        assert!(server.compilation_cache.borrow_file_ids().is_empty());
+        assert!(server.workspace_snapshot.borrow_file_ids().is_empty());
     }
 
     fn missing_external_root_diagnostics(initially_missing: bool) {
@@ -3153,7 +3157,7 @@ mod tests {
         let mut server =
             RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
         assert_eq!(server.missing_roots.len(), usize::from(initially_missing));
-        server.log_missing_roots(&ctx);
+        server.report_workspace_warnings(&ctx);
         let startup: Vec<_> = receiver.try_iter().collect();
         assert_eq!(
             startup.iter().any(|message| {
@@ -3261,8 +3265,8 @@ mod tests {
             );
         }
         assert!(server.resolve_file(&removed).as_workspace().is_some());
-        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 1);
-        assert_eq!(server.standalone.len(), 1);
+        assert_eq!(server.workspace_snapshot.borrow_file_ids().len(), 1);
+        assert_eq!(server.standalone_snapshots.len(), 1);
         // Missing roots must not block diagnostic updates on save either.
         for path in [&healthy, &standalone] {
             let _buffer = open(&mut server, &ctx, path, "class {", 7);
@@ -3357,17 +3361,17 @@ mod tests {
         .unwrap();
         server.files_changed(vec![], &ctx).unwrap();
         assert!(server.resolve_file(&script).as_workspace().is_some());
-        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 1);
+        assert_eq!(server.workspace_snapshot.borrow_file_ids().len(), 1);
         let _buffers = open(&mut server, &ctx, &script, "class Unsaved {}", 2);
         fs::remove_file(&script).unwrap();
         server.files_changed(vec![script.clone()], &ctx).unwrap();
-        assert_eq!(server.compilation_cache.borrow_file_ids().len(), 1);
+        assert_eq!(server.workspace_snapshot.borrow_file_ids().len(), 1);
         server.document_changed(script, None, &ctx).unwrap();
-        assert!(server.compilation_cache.borrow_file_ids().is_empty());
+        assert!(server.workspace_snapshot.borrow_file_ids().is_empty());
         server
             .change_workspace_folders(vec![], vec![temp.path().to_owned()], &ctx)
             .unwrap();
-        assert!(server.workspaces.is_empty());
+        assert!(server.workspace_folders.is_empty());
     }
 
     #[test]
@@ -3407,7 +3411,7 @@ mod tests {
         let ignored = temp.path().join("ignored.script");
         fs::write(&ignored, text).unwrap();
         fs::write(temp.path().join(".ignore"), "ignored.script\n").unwrap();
-        dialect::clear_identity_cache();
+        dialect::clear_path_caches();
 
         // The workspace walk skips the ignored file, and an open buffer for it
         // is treated as standalone instead of being injected into the workspace.
@@ -3415,11 +3419,11 @@ mod tests {
         assert!(server.resolve_file(&ignored).as_workspace().is_none());
         assert!(
             !server
-                .compilation_cache
+                .workspace_snapshot
                 .borrow_file_ids()
                 .contains_key(&ignored)
         );
-        assert!(server.standalone.contains_key(&ignored));
+        assert!(server.standalone_snapshots.contains_key(&ignored));
 
         // Removing the ignore rule and refreshing restores workspace membership.
         fs::remove_file(temp.path().join(".ignore")).unwrap();
@@ -3429,7 +3433,7 @@ mod tests {
         assert!(server.resolve_file(&ignored).as_workspace().is_some());
         assert!(
             server
-                .compilation_cache
+                .workspace_snapshot
                 .borrow_file_ids()
                 .contains_key(&ignored)
         );
@@ -3529,7 +3533,7 @@ mod tests {
                 assert_eq!(items.len(), 1, "{extension}: {prefix}");
                 assert_eq!(items[0].label, "Size");
                 assert_eq!(items[0].detail.as_deref(), Some("() -> String"));
-                server.compilation_cache.with_sources(|sources| {
+                server.workspace_snapshot.with_sources(|sources| {
                     assert_eq!(
                         sources
                             .files()
@@ -3689,7 +3693,7 @@ mod tests {
         insert_cached_fix(&mut server, path.clone(), uri, text);
         assert!(server.resolve_file(&path).as_workspace().is_none());
         assert!(server.cached_fixes.contains_key(&path));
-        assert_eq!(server.apply_document(&path, None, &ctx), Some(true));
+        assert!(server.apply_document_overlay(&path, None, &ctx));
         assert!(!server.cached_fixes.contains_key(&path));
     }
 
@@ -3701,7 +3705,7 @@ mod tests {
         server.files_changed(vec![deleted.clone()], &ctx).unwrap();
         assert!(
             server
-                .compilation_cache
+                .workspace_snapshot
                 .borrow_file_ids()
                 .contains_key(&deleted)
         );
@@ -3795,7 +3799,7 @@ mod tests {
                 items.iter().any(|item| item.label == "Size"),
                 "{statement}: {items:?}"
             );
-            server.compilation_cache.with_sources(|sources| {
+            server.workspace_snapshot.with_sources(|sources| {
                 assert_eq!(
                     sources
                         .files()
@@ -3940,9 +3944,9 @@ mod tests {
             let last = items.iter().find(|item| item.label == "Last").unwrap();
             assert_eq!(last.detail, Some(format!("() -> {element}")));
             // Queries and their completion patches never become active snapshots.
-            assert_eq!(server.compilation_cache.borrow_file_ids().len(), 1);
+            assert_eq!(server.workspace_snapshot.borrow_file_ids().len(), 1);
             assert_eq!(
-                server.compilation_cache.with_sources(ast::SourceMap::len),
+                server.workspace_snapshot.with_sources(ast::SourceMap::len),
                 2
             );
         }
@@ -4084,7 +4088,7 @@ mod tests {
             lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(8, 8))
         );
         let mut formatted = crate::buffers::Buffer::new(source.into());
-        formatted.update_range(edits[0].range, edits[0].new_text.clone());
+        formatted.apply_edit(edits[0].range, edits[0].new_text.clone());
         assert_eq!(formatted.contents().to_string(), expected);
         assert!(
             server
@@ -4185,7 +4189,7 @@ mod tests {
             edit: lsp::TextEdit::new(lsp::Range::default(), "public ".into()),
             expected_source_hash: content_hash(b"class Native {}"),
         };
-        assert!(!server.valid_fix(&fix));
+        assert!(!server.is_valid_fix(&fix));
         let community = temp.path().join("test.reds");
         let _buffers = open(
             &mut server,
@@ -4196,9 +4200,9 @@ mod tests {
         );
         fix.uri = ctx.uri(&community).unwrap();
         fix.expected_source_hash = content_hash(b"public class Community {}");
-        assert!(server.valid_fix(&fix));
+        assert!(server.is_valid_fix(&fix));
         fix.expected_source_hash = content_hash(b"");
-        assert!(!server.valid_fix(&fix));
+        assert!(!server.is_valid_fix(&fix));
         let action = lsp::CodeAction {
             title: "stale".into(),
             data: Some(serde_json::to_value(FixRequest::FixOne(Box::new(fix))).unwrap()),
@@ -4231,7 +4235,6 @@ mod tests {
             data: Some(
                 serde_json::to_value(FixRequest::FixAll(
                     FixKind::MakeFieldPublic,
-                    server.generation,
                     FixScope::Workspace(temp.path().to_path_buf()),
                 ))
                 .unwrap(),
@@ -4273,16 +4276,16 @@ mod tests {
 
     fn server() -> RedscriptLanguageServer {
         RedscriptLanguageServer {
-            workspaces: HashMap::new(),
+            workspace_folders: HashMap::new(),
             config_warnings: BTreeSet::new(),
             reported_config_warnings: BTreeSet::new(),
             io_warnings: BTreeSet::new(),
             reported_io_warnings: BTreeSet::new(),
-            standalone_paths: HashSet::new(),
-            compilation_cache: CompilationCache::default(),
+            tracked_standalone_paths: HashSet::new(),
+            workspace_snapshot: AnalysisSnapshot::default(),
             cached_fixes: HashMap::new(),
             overlays: HashMap::new(),
-            standalone: HashMap::new(),
+            standalone_snapshots: HashMap::new(),
             generation: 0,
             missing_roots: BTreeSet::new(),
             reported_missing_roots: BTreeSet::new(),
@@ -4298,9 +4301,9 @@ mod tests {
     fn diagnostics_include_codes_and_supported_tags() {
         let mut server = server();
         let root = PathBuf::from("C:/scripts");
-        server.workspaces.insert(
+        server.workspace_folders.insert(
             root.clone(),
-            WorkspaceDir {
+            WorkspaceConfig {
                 roots: vec![root.clone()],
                 format_settings: FormatSettings::default(),
                 format_indent: None,
@@ -4447,9 +4450,9 @@ mod tests {
     fn publishing_replaces_diagnostics_without_clearing_first() {
         let mut server = server();
         let root = PathBuf::from("C:/scripts");
-        server.workspaces.insert(
+        server.workspace_folders.insert(
             root.clone(),
-            WorkspaceDir {
+            WorkspaceConfig {
                 roots: vec![root.clone()],
                 format_settings: FormatSettings::default(),
                 format_indent: None,
@@ -4496,9 +4499,9 @@ mod tests {
     fn publications_are_sorted_by_path_and_diagnostics_by_span_code_message() {
         let mut server = server();
         let root = PathBuf::from("C:/scripts");
-        server.workspaces.insert(
+        server.workspace_folders.insert(
             root.clone(),
-            WorkspaceDir {
+            WorkspaceConfig {
                 roots: vec![root.clone()],
                 format_settings: FormatSettings::default(),
                 format_indent: None,
@@ -4580,7 +4583,7 @@ mod tests {
         let id = sources.push_back("test.reds", "let s = \"😀\"; error");
         let file = sources.get(id).unwrap();
         let start = file.source().find("error").unwrap() as u32;
-        let range = range(Span::new(start, start + 5, id), file).unwrap();
+        let range = span_range(Span::new(start, start + 5, id), file).unwrap();
         assert_eq!(range.start, lsp::Position::new(0, 14));
         assert_eq!(range.end, lsp::Position::new(0, 19));
     }
@@ -4907,12 +4910,7 @@ mod tests {
             for kind in [kinds[0], kinds[0], kinds[1]] {
                 let action = lsp::CodeAction {
                     data: Some(
-                        serde_json::to_value(FixRequest::FixAll(
-                            kind,
-                            server.generation,
-                            scope.clone(),
-                        ))
-                        .unwrap(),
+                        serde_json::to_value(FixRequest::FixAll(kind, scope.clone())).unwrap(),
                     ),
                     ..Default::default()
                 };
@@ -4992,7 +4990,6 @@ mod tests {
             data: Some(
                 serde_json::to_value(FixRequest::FixAll(
                     FixKind::MakeFieldPublic,
-                    0,
                     FixScope::Standalone(path_a),
                 ))
                 .unwrap(),
@@ -5015,9 +5012,9 @@ mod tests {
         let root_a = tempdir();
         let root_b = tempdir();
         for root in [root_a.path(), root_b.path()] {
-            server.workspaces.insert(
+            server.workspace_folders.insert(
                 root.to_path_buf(),
-                WorkspaceDir {
+                WorkspaceConfig {
                     roots: vec![root.to_path_buf()],
                     format_settings: FormatSettings::default(),
                     format_indent: None,
@@ -5032,11 +5029,11 @@ mod tests {
         insert_cached_fix(&mut server, path_a.clone(), uri_a.clone(), text);
         insert_cached_fix(&mut server, path_b.clone(), uri_b.clone(), text);
         assert_eq!(
-            server.workspace_root_for(&path_a),
+            server.workspace_folder_for(&path_a),
             Some(root_a.path().to_path_buf())
         );
         assert_eq!(
-            server.workspace_root_for(&path_b),
+            server.workspace_folder_for(&path_b),
             Some(root_b.path().to_path_buf())
         );
 
@@ -5044,7 +5041,6 @@ mod tests {
             data: Some(
                 serde_json::to_value(FixRequest::FixAll(
                     FixKind::MakeFieldPublic,
-                    0,
                     FixScope::Workspace(root_a.path().to_path_buf()),
                 ))
                 .unwrap(),
@@ -5071,7 +5067,7 @@ mod tests {
         let path_b = dialect::identity(&crate::server::path_from_uri(&uri_b).unwrap());
         insert_cached_fix(&mut server, path_a.clone(), uri_a.clone(), text);
         let fix = make_public_fix(uri_a, text);
-        assert!(server.valid_fix(&fix));
+        assert!(server.is_valid_fix(&fix));
 
         // Simulate editing another file and rebuilding; the cached fix for the
         // untouched file A must survive because validity is content-based.
@@ -5084,7 +5080,7 @@ mod tests {
         );
         server.invalidate();
 
-        assert!(server.valid_fix(&fix));
+        assert!(server.is_valid_fix(&fix));
         assert!(server.cached_fixes.contains_key(&path_a));
         let action = lsp::CodeAction {
             data: Some(serde_json::to_value(FixRequest::FixOne(Box::new(fix))).unwrap()),
@@ -5156,7 +5152,6 @@ mod tests {
             data: Some(
                 serde_json::to_value(FixRequest::FixAll(
                     FixKind::MakeFieldPublic,
-                    0,
                     FixScope::Standalone(path),
                 ))
                 .unwrap(),
@@ -5187,7 +5182,7 @@ mod tests {
         );
         assert!(
             server
-                .standalone
+                .standalone_snapshots
                 .contains_key(&dialect::identity(&standalone_path))
         );
         assert_eq!(
@@ -5213,7 +5208,7 @@ mod tests {
 
         let forced = |server: &RedscriptLanguageServer, path: &Path| {
             server
-                .standalone
+                .standalone_snapshots
                 .get(&dialect::identity(path))
                 .expect("standalone cache present")
                 .analysis_is_forced()
@@ -5254,7 +5249,7 @@ mod tests {
 
         let server = RedscriptLanguageServer::embedded([dir.path()]).unwrap();
         server
-            .check_workspace(|_, symbols, diagnostics, _| {
+            .with_workspace_analysis(|_, symbols, diagnostics, _| {
                 assert!(
                     diagnostics.is_empty(),
                     "unexpected diagnostics: {diagnostics:?}"
@@ -5348,10 +5343,10 @@ mod tests {
         // Startup with broken .redscript still succeeds using default roots.
         let mut server =
             RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
-        server.log_missing_roots(&ctx);
+        server.report_workspace_warnings(&ctx);
         server.publish_all_diagnostics(&ctx).unwrap();
         server
-            .check_workspace(|_, symbols, _, _| {
+            .with_workspace_analysis(|_, symbols, _, _| {
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "LocalType"));
                 Ok(())
             })
@@ -5400,7 +5395,7 @@ mod tests {
                             && p.message.contains("REDSCRIPT_IDE_UNSET_TEST_VAR")))
         }));
         server
-            .check_workspace(|_, symbols, _, _| {
+            .with_workspace_analysis(|_, symbols, _, _| {
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "ExternalType"));
                 Ok(())
             })
@@ -5410,7 +5405,7 @@ mod tests {
         fs::write(&dotfile, "source_roots = 123\n").unwrap();
         check_and_publish(&mut server, dotfile, &ctx);
         server
-            .check_workspace(|_, symbols, _, _| {
+            .with_workspace_analysis(|_, symbols, _, _| {
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "ExternalType"));
                 Ok(())
             })
@@ -5445,10 +5440,10 @@ mod tests {
 
         let mut server =
             RedscriptLanguageServer::new(&temp.path().join("cache.bin"), [temp.path()]).unwrap();
-        server.log_missing_roots(&ctx);
+        server.report_workspace_warnings(&ctx);
         server.publish_all_diagnostics(&ctx).unwrap();
         server
-            .check_workspace(|_, symbols, _, _| {
+            .with_workspace_analysis(|_, symbols, _, _| {
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "Healthy"));
                 Ok(())
             })
@@ -5520,7 +5515,7 @@ mod tests {
         assert_eq!(cleared.len(), 1);
         assert!(cleared[0].diagnostics.is_empty());
         server
-            .check_workspace(|_, symbols, _, _| {
+            .with_workspace_analysis(|_, symbols, _, _| {
                 assert!(symbols.types().any(|(id, _)| id.as_str() == "Recovered"));
                 Ok(())
             })
@@ -5710,12 +5705,12 @@ mod tests {
             let changes = action.edit.as_ref().unwrap().changes.as_ref().unwrap();
             if let Some(edits) = changes.get(&owner_uri) {
                 for edit in edits {
-                    assert!(owner_buf.update_range(edit.range, edit.new_text.clone()));
+                    assert!(owner_buf.apply_edit(edit.range, edit.new_text.clone()));
                 }
             }
             if let Some(edits) = changes.get(&caller_uri) {
                 for edit in edits {
-                    assert!(caller_buf.update_range(edit.range, edit.new_text.clone()));
+                    assert!(caller_buf.apply_edit(edit.range, edit.new_text.clone()));
                 }
             }
         }

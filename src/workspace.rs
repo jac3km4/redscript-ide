@@ -16,8 +16,11 @@ pub(crate) struct Overlay {
     pub(crate) version: i32,
 }
 
+/// Loaded configuration for one LSP workspace folder: its `.redscript` source
+/// roots and formatter settings.
 #[derive(Debug, Clone)]
-pub(crate) struct WorkspaceDir {
+pub(crate) struct WorkspaceConfig {
+    /// The `source_roots` declared in `.redscript`, resolved to absolute paths.
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) format_settings: FormatSettings,
     /// Explicit `format.indent` from `.redscript`, if configured.
@@ -26,13 +29,13 @@ pub(crate) struct WorkspaceDir {
 
 #[derive(Clone)]
 pub(crate) struct LoadedWorkspace {
-    pub(crate) workspace: WorkspaceDir,
+    pub(crate) workspace: WorkspaceConfig,
     pub(crate) dotfile_path: PathBuf,
     pub(crate) diagnostic: Option<lsp::Diagnostic>,
     pub(crate) warnings: Vec<String>,
 }
 
-impl WorkspaceDir {
+impl WorkspaceConfig {
     pub(crate) fn from_dotfile(dir: &Path, dotfile: &Dotfile) -> Self {
         let roots = dotfile
             .expanded_source_roots()
@@ -303,12 +306,12 @@ pub(crate) fn inspect_source_root_templates(roots: &[String], dotfile_path: &Pat
 
 #[derive(Debug)]
 pub(crate) enum FileResolution<'a> {
-    Workspace(&'a WorkspaceDir),
+    Workspace(&'a WorkspaceConfig),
     NonWorkspace,
 }
 
 impl FileResolution<'_> {
-    pub fn as_workspace(&self) -> Option<&WorkspaceDir> {
+    pub fn as_workspace(&self) -> Option<&WorkspaceConfig> {
         match self {
             Self::Workspace(ws) => Some(ws),
             Self::NonWorkspace => None,

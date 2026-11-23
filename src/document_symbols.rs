@@ -20,11 +20,11 @@ pub(super) fn document_symbols(path: &Path, text: String) -> Vec<lsp::DocumentSy
         .modules
         .iter()
         .find(|(file_id, _)| *file_id == id)
-        .map(|(_, module)| items(&module.module().items, false, file))
+        .map(|(_, module)| collect_symbols(&module.module().items, false, file))
         .unwrap_or_default()
 }
 
-fn items(
+fn collect_symbols(
     declarations: &[(ast::SourceItemDecl<'_>, Span)],
     in_aggregate: bool,
     file: &ast::File,
@@ -41,7 +41,7 @@ fn items(
                     } else {
                         lsp::SymbolKind::CLASS
                     },
-                    Some(items(&aggregate.items, true, file)),
+                    Some(collect_symbols(&aggregate.items, true, file)),
                 ),
                 ast::Item::Function(function) => (
                     function.name.0,
@@ -65,7 +65,7 @@ fn items(
                                 span.start.checked_add(variant.name.len() as u32)?,
                                 span.file,
                             );
-                            symbol(
+                            build_symbol(
                                 variant.name,
                                 lsp::SymbolKind::ENUM_MEMBER,
                                 *span,
@@ -84,12 +84,12 @@ fn items(
                 }
                 ast::Item::Import(_) | ast::Item::Default(_) => return None,
             };
-            symbol(name, kind, *span, name_span, children, file)
+            build_symbol(name, kind, *span, name_span, children, file)
         })
         .collect()
 }
 
-fn symbol(
+fn build_symbol(
     name: &str,
     kind: lsp::SymbolKind,
     span: Span,
@@ -107,8 +107,8 @@ fn symbol(
         kind,
         tags: None,
         deprecated: None,
-        range: crate::diagnostics::range(span, file)?,
-        selection_range: crate::diagnostics::range(name_span, file)?,
+        range: crate::positions::span_range(span, file)?,
+        selection_range: crate::positions::span_range(name_span, file)?,
         children,
     })
 }

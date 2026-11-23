@@ -9,8 +9,8 @@ use redscript_compiler_api::ast::Span;
 use redscript_compiler_api::{Diagnostic, LowerError, LoweredCompilationUnit, Symbols, ast};
 use serde::{Deserialize, Serialize};
 
-use crate::diagnostics::range;
 use crate::dialect::Dialect;
+use crate::positions::span_range;
 use crate::server::LspContext;
 use crate::workspace::content_hash;
 
@@ -80,11 +80,11 @@ pub(crate) fn generate_fix<'ctx>(
     if Dialect::of(file.path()) != Some(Dialect::Community) {
         return None;
     }
-    let edit_range = range(Span::new(edit.start as _, edit.end as _, edit.file), file)?;
+    let edit_range = span_range(Span::new(edit.start as _, edit.end as _, edit.file), file)?;
     Some(Fix {
         kind: FixKind::from(&code_edit),
         target_name,
-        diagnostic_range: range(diag.span(), diag_file),
+        diagnostic_range: span_range(diag.span(), diag_file),
         diagnostic_code: Some(diag.code().into()),
         uri: ctx.uri(file.path()).ok()?,
         edit: lsp::TextEdit::new(edit_range, edit.content.to_string()),
@@ -201,11 +201,11 @@ fn generate_ide_fix<'ctx>(
         }
         _ => return None,
     };
-    let edit_range = range(edit_span, diag_file)?;
+    let edit_range = span_range(edit_span, diag_file)?;
     Some(Fix {
         kind,
         target_name,
-        diagnostic_range: range(diag.span(), diag_file),
+        diagnostic_range: span_range(diag.span(), diag_file),
         diagnostic_code: Some(diag.code().into()),
         uri: ctx.uri(diag_file.path()).ok()?,
         edit: lsp::TextEdit::new(edit_range, replacement),
@@ -230,7 +230,7 @@ pub(crate) enum FixScope {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum FixRequest {
     FixOne(Box<Fix>),
-    FixAll(FixKind, u64, FixScope),
+    FixAll(FixKind, FixScope),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

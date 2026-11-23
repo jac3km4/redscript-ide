@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use lsp_types as lsp;
-use redscript_compiler_api::{Diagnostic, LowerError, ast};
+use redscript_compiler_api::{Diagnostic, LowerError};
 
 use crate::server::LspContext;
 
@@ -26,8 +26,8 @@ use crate::server::LspContext;
 #[derive(Clone)]
 pub(crate) struct DiagnosticBatch {
     pub(crate) compiler: BTreeMap<PathBuf, Vec<lsp::Diagnostic>>,
-    pub(crate) reads: BTreeMap<PathBuf, lsp::Diagnostic>,
-    pub(crate) configs: BTreeMap<PathBuf, lsp::Diagnostic>,
+    pub(crate) read_diagnostics: BTreeMap<PathBuf, lsp::Diagnostic>,
+    pub(crate) config_diagnostics: BTreeMap<PathBuf, lsp::Diagnostic>,
     /// Overlay document versions captured at the analyzed snapshot, used as the
     /// `version` field of each published notification.
     pub(crate) versions: HashMap<PathBuf, i32>,
@@ -37,18 +37,18 @@ pub(crate) struct DiagnosticBatch {
 /// the files whose diagnostics are currently published.
 ///
 /// The lifecycle is: rebuild produces new per-source maps, [`set_compiler`],
-/// [`set_reads`], and [`set_configs`] replace the corresponding partitions,
+/// [`set_read_diagnostics`], and [`set_config_diagnostics`] replace the corresponding partitions,
 /// and [`flush`] merges everything and emits the LSP notifications.
 ///
 /// [`set_compiler`]: DiagnosticTracker::set_compiler
-/// [`set_reads`]: DiagnosticTracker::set_reads
-/// [`set_configs`]: DiagnosticTracker::set_configs
+/// [`set_read_diagnostics`]: DiagnosticTracker::set_read_diagnostics
+/// [`set_config_diagnostics`]: DiagnosticTracker::set_config_diagnostics
 /// [`flush`]: DiagnosticTracker::flush
 #[derive(Default)]
 pub(crate) struct DiagnosticTracker {
     compiler: BTreeMap<PathBuf, Vec<lsp::Diagnostic>>,
-    reads: BTreeMap<PathBuf, lsp::Diagnostic>,
-    configs: BTreeMap<PathBuf, lsp::Diagnostic>,
+    read_diagnostics: BTreeMap<PathBuf, lsp::Diagnostic>,
+    config_diagnostics: BTreeMap<PathBuf, lsp::Diagnostic>,
     published: BTreeSet<PathBuf>,
 }
 
@@ -60,18 +60,21 @@ impl DiagnosticTracker {
     }
 
     /// Replaces the source read/UTF-8 diagnostics.
-    pub(crate) fn set_reads(&mut self, diagnostics: BTreeMap<PathBuf, lsp::Diagnostic>) {
-        self.reads = diagnostics;
+    pub(crate) fn set_read_diagnostics(&mut self, diagnostics: BTreeMap<PathBuf, lsp::Diagnostic>) {
+        self.read_diagnostics = diagnostics;
     }
 
     /// Replaces the `.redscript` configuration diagnostics.
-    pub(crate) fn set_configs(&mut self, diagnostics: BTreeMap<PathBuf, lsp::Diagnostic>) {
-        self.configs = diagnostics;
+    pub(crate) fn set_config_diagnostics(
+        &mut self,
+        diagnostics: BTreeMap<PathBuf, lsp::Diagnostic>,
+    ) {
+        self.config_diagnostics = diagnostics;
     }
 
     /// The current source read/UTF-8 diagnostics.
-    pub(crate) fn reads(&self) -> &BTreeMap<PathBuf, lsp::Diagnostic> {
-        &self.reads
+    pub(crate) fn read_diagnostics(&self) -> &BTreeMap<PathBuf, lsp::Diagnostic> {
+        &self.read_diagnostics
     }
 
     /// Merges the active diagnostics and publishes the diff against what was
@@ -90,8 +93,8 @@ impl DiagnosticTracker {
         let active: BTreeSet<PathBuf> = self
             .compiler
             .keys()
-            .chain(self.reads.keys())
-            .chain(self.configs.keys())
+            .chain(self.read_diagnostics.keys())
+            .chain(self.config_diagnostics.keys())
             .cloned()
             .collect();
 
@@ -105,13 +108,13 @@ impl DiagnosticTracker {
                 .expect("active path missing")
                 .extend(diagnostics.iter().cloned());
         }
-        for (path, diagnostic) in &self.reads {
+        for (path, diagnostic) in &self.read_diagnostics {
             emissions
                 .get_mut(path)
                 .expect("active path missing")
                 .push(diagnostic.clone());
         }
-        for (path, diagnostic) in &self.configs {
+        for (path, diagnostic) in &self.config_diagnostics {
             emissions
                 .get_mut(path)
                 .expect("active path missing")
@@ -145,13 +148,13 @@ impl DiagnosticTracker {
     ) -> anyhow::Result<()> {
         let DiagnosticBatch {
             compiler,
-            reads,
-            configs,
+            read_diagnostics,
+            config_diagnostics,
             versions,
         } = batch;
         self.set_compiler(compiler);
-        self.set_reads(reads);
-        self.set_configs(configs);
+        self.set_read_diagnostics(read_diagnostics);
+        self.set_config_diagnostics(config_diagnostics);
         self.flush(ctx, |path| versions.get(path).copied())
     }
 
@@ -171,8 +174,8 @@ impl DiagnosticTracker {
     ) -> DiagnosticBatch {
         DiagnosticBatch {
             compiler,
-            reads: self.reads.clone(),
-            configs: self.configs.clone(),
+            read_diagnostics: self.read_diagnostics.clone(),
+            config_diagnostics: self.config_diagnostics.clone(),
             versions,
         }
     }
@@ -207,25 +210,6 @@ pub(crate) fn diagnostic_tags(
         _ => return None,
     };
     ctx.supports_diagnostic_tag(&tag).then(|| vec![tag])
-}
-
-pub(crate) fn location(
-    span: ast::Span,
-    sources: &ast::SourceMap,
-    ctx: &LspContext,
-) -> Option<lsp::Location> {
-    let file = sources.get(span.file)?;
-    Some(lsp::Location {
-        uri: ctx.uri(file.path()).ok()?,
-        range: range(span, file)?,
-    })
-}
-
-pub(crate) fn range(span: ast::Span, file: &ast::File) -> Option<lsp::Range> {
-    Some(lsp::Range {
-        start: crate::positions::file_position(file, span.start)?,
-        end: crate::positions::file_position(file, span.end)?,
-    })
 }
 
 #[cfg(test)]
@@ -268,7 +252,7 @@ mod tests {
         let uri = ctx.uri(&path).unwrap();
         let mut tracker = DiagnosticTracker::default();
 
-        tracker.set_reads(BTreeMap::from([(path.clone(), diagnostic("read"))]));
+        tracker.set_read_diagnostics(BTreeMap::from([(path.clone(), diagnostic("read"))]));
         tracker.flush(&ctx, |_| None).unwrap();
         let published = publications(&receiver);
         assert_eq!(published.len(), 1);
@@ -277,7 +261,7 @@ mod tests {
 
         // The read error is replaced by compiler diagnostics in a single
         // notification rather than a clear followed by a publish.
-        tracker.set_reads(BTreeMap::new());
+        tracker.set_read_diagnostics(BTreeMap::new());
         tracker.set_compiler(BTreeMap::from([(path.clone(), vec![diagnostic("syntax")])]));
         tracker.flush(&ctx, |_| None).unwrap();
         let published = publications(&receiver);
@@ -303,14 +287,14 @@ mod tests {
         let uri = ctx.uri(&dotfile).unwrap();
         let mut tracker = DiagnosticTracker::default();
 
-        tracker.set_configs(BTreeMap::from([(dotfile.clone(), diagnostic("invalid"))]));
+        tracker.set_config_diagnostics(BTreeMap::from([(dotfile.clone(), diagnostic("invalid"))]));
         tracker.flush(&ctx, |_| None).unwrap();
         let published = publications(&receiver);
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].uri, uri);
         assert_eq!(published[0].diagnostics, vec![diagnostic("invalid")]);
 
-        tracker.set_configs(BTreeMap::new());
+        tracker.set_config_diagnostics(BTreeMap::new());
         tracker.flush(&ctx, |_| None).unwrap();
         let published = publications(&receiver);
         assert_eq!(published.len(), 1);

@@ -6,13 +6,13 @@ use redscript_compiler_api::{Field, FunctionType, PolyType, Symbols, TypeId, Typ
 
 use crate::dialect::Dialect;
 use crate::display::{DocDisplay, FunctionTypeDisplay, SnippetDisplay};
-use crate::query::{AtContext, ExprAt, ReceiverTypeEnvs};
+use crate::query::{ExprAt, ReceiverTypeEnvs};
 
 /// How many members to format between cooperative cancellation checks while
 /// building a completion response.
 const CANCELLATION_INTERVAL: usize = 64;
 
-pub fn method<'ctx>(
+pub fn static_method<'ctx>(
     name: &'ctx str,
     typ: &FunctionType<'ctx>,
     doc: &[&'ctx str],
@@ -32,7 +32,7 @@ pub fn instance_method<'ctx>(
     envs: &ReceiverTypeEnvs<'ctx, '_>,
     doc: &[&'ctx str],
 ) -> lsp_types::CompletionItem {
-    let specialized = envs.function_type(declaring_type, typ, &[]);
+    let specialized = envs.method_type(declaring_type, typ, &[]);
     let detail = FunctionTypeDisplay::maybe_specialized(typ, specialized.as_ref()).to_string();
     let snippet_display = SnippetDisplay::new(name, typ).to_string();
     method_with_signature(name, detail, snippet_display, doc)
@@ -306,12 +306,12 @@ pub(crate) struct CompletionResolveData {
 pub(crate) fn generate_completions(
     at: ExprAt<'_, '_>,
     dialect: Option<Dialect>,
-    resolve: Option<u64>,
+    resolve_generation: Option<u64>,
 ) -> Result<GeneratedCompletions, anyhow::Error> {
     let mut completions = vec![];
 
-    if let Some(typ) = at.type_()
-        && matches!(at.context(), Some(AtContext::Expr))
+    if let Some(typ) = at.named_type()
+        && at.is_expr_position()
         && let Some(def) = at.symbols().get_type(typ)
     {
         match def.schema() {
@@ -320,7 +320,7 @@ pub(crate) fn generate_completions(
                     .symbols()
                     .query_methods(typ)
                     .filter(|m| m.func().flags().is_static())
-                    .map(|e| method(e.name(), e.func().type_(), e.func().doc()));
+                    .map(|e| static_method(e.name(), e.func().type_(), e.func().doc()));
                 completions.extend(methods);
             }
             TypeSchema::Enum(enum_) => {
@@ -387,7 +387,7 @@ pub(crate) fn generate_completions(
     // A client that resolves documentation lazily gets it omitted here and
     // looked up from the cache on `completionItem/resolve`.
     let mut docs = Vec::new();
-    let items = match resolve {
+    let items = match resolve_generation {
         Some(generation) => completions
             .into_iter()
             .map(|mut item| {
