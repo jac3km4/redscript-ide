@@ -34,7 +34,7 @@ mod document_symbols;
 
 const EMBEDDED_CACHE: &[u8] = include_bytes!("../assets/api.redscripts.zlib");
 const REDMOD_SUBSET_DOCS_URL: &str =
-    "https://github.com/jac3km4/redscript/blob/ab77364/crates/compiler/redmod/adapter/README.md";
+    "https://github.com/jac3km4/redscript/blob/1800a8d/crates/compiler/redmod/adapter/README.md";
 /// Disabled-action reason shared by stale single fixes and fix-all actions.
 const STALE_FIX_REASON: &str =
     "This fix is stale because workspace files changed; save to refresh diagnostics";
