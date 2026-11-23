@@ -19,15 +19,15 @@ lsp-server = "0.10"
 lsp-types = "0.97"
 tempfile = "3"
 rayon = "1"
-redscript-io = { git = "https://github.com/jac3km4/redscript", rev = "d255d63" }
-redscript-redmod-formatter = { git = "https://github.com/jac3km4/redscript", rev = "d255d63" }
-redscript-redmod-adapter = { git = "https://github.com/jac3km4/redscript", rev = "d255d63", features = ["parallel"] }
-redscript-community-formatter = { git = "https://github.com/jac3km4/redscript", rev = "d255d63" }
-redscript-community-parser = { git = "https://github.com/jac3km4/redscript", rev = "d255d63", features = ["parallel"] }
-redscript-compiler-api = { git = "https://github.com/jac3km4/redscript", rev = "d255d63", features = ["parallel"] }
-redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "d255d63", features = ["parallel"] }
-redscript-dotfile = { git = "https://github.com/jac3km4/redscript", rev = "d255d63" }
-redscript-code-edit = { git = "https://github.com/jac3km4/redscript", rev = "d255d63" }
+redscript-io = { git = "https://github.com/jac3km4/redscript", rev = "5bb19b91" }
+redscript-redmod-formatter = { git = "https://github.com/jac3km4/redscript", rev = "5bb19b91" }
+redscript-redmod-adapter = { git = "https://github.com/jac3km4/redscript", rev = "5bb19b91", features = ["parallel"] }
+redscript-community-formatter = { git = "https://github.com/jac3km4/redscript", rev = "5bb19b91" }
+redscript-community-parser = { git = "https://github.com/jac3km4/redscript", rev = "5bb19b91", features = ["parallel"] }
+redscript-compiler-api = { git = "https://github.com/jac3km4/redscript", rev = "5bb19b91", features = ["parallel"] }
+redscript-compiler-frontend = { git = "https://github.com/jac3km4/redscript", rev = "5bb19b91", features = ["parallel"] }
+redscript-dotfile = { git = "https://github.com/jac3km4/redscript", rev = "5bb19b91" }
+redscript-code-edit = { git = "https://github.com/jac3km4/redscript", rev = "5bb19b91" }
 
 [workspace.metadata.release]
 pre-release-commit-message = "chore: release {{version}}"
